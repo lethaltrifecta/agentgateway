@@ -1202,13 +1202,8 @@ pub struct ExecutorSerde {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub response: Option<ResponseRefSerde>,
 
-	/// `env` contains selected process environment attributes exposed to CEL.
-	/// This does NOT expose raw environment variables, but rather a subset of well-known variables.
-	//  TODO: in the future we can, but we should add an allow-list of vars to avoid security issues.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub env: Option<EnvContext>,
-
-	/// `jwt` contains the claims from a verified JWT token. This is only present if the JWT policy is enabled.
+	/// `jwt` contains claims from a verified JWT token or OAuth2/OIDC `id_token`.
+	/// This is present when either the JWT or OAuth2 policy injects claims.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub jwt: Option<jwt::Claims>,
 

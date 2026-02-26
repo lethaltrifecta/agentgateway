@@ -14,17 +14,44 @@ use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{McpAuthentication, McpIDP};
 
+const OAUTH_PROTECTED_RESOURCE_PREFIX: &str = "/.well-known/oauth-protected-resource";
+const OAUTH_AUTHORIZATION_SERVER_PREFIX: &str = "/.well-known/oauth-authorization-server";
+const CLIENT_REGISTRATION_SEGMENT: &str = "client-registration";
+
 pub(super) fn is_well_known_endpoint(path: &str) -> bool {
-	path.starts_with("/.well-known/oauth-protected-resource")
-		|| path.starts_with("/.well-known/oauth-authorization-server")
+	path.starts_with(OAUTH_PROTECTED_RESOURCE_PREFIX)
+		|| path.starts_with(OAUTH_AUTHORIZATION_SERVER_PREFIX)
+}
+
+fn has_authorization_server_prefix(path: &str) -> bool {
+	path
+		.strip_prefix(OAUTH_AUTHORIZATION_SERVER_PREFIX)
+		.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+fn is_client_registration_endpoint(path: &str) -> bool {
+	has_authorization_server_prefix(path)
+		&& path
+			.rsplit('/')
+			.next()
+			.is_some_and(|segment| segment == CLIENT_REGISTRATION_SEGMENT)
+}
+
+fn request_path(req: &Request) -> &str {
+	req
+		.extensions()
+		.get::<filters::OriginalUrl>()
+		.map(|u| u.0.path())
+		.unwrap_or_else(|| req.uri().path())
 }
 
 pub(super) async fn apply_token_validation(
 	req: &mut Request,
 	auth: &McpAuthentication,
+	_client: &PolicyClient,
 ) -> Result<(), ProxyError> {
 	// skip well-known OAuth endpoints for authn
-	if is_well_known_endpoint(req.uri().path()) {
+	if is_well_known_endpoint(request_path(req)) {
 		return Ok(());
 	}
 	let has_claims = req.extensions().get::<Claims>().is_some();
@@ -54,13 +81,14 @@ pub(super) async fn enforce_authentication(
 	client: &PolicyClient,
 ) -> Result<Option<Response>, ProxyError> {
 	// skip well-known OAuth endpoints for authn
-	if !is_well_known_endpoint(req.uri().path()) {
-		apply_token_validation(req, auth).await?;
+	let path = request_path(req).to_string();
+	if !is_well_known_endpoint(path.as_str()) {
+		apply_token_validation(req, auth, client).await?;
 	}
 
-	match req.uri().path() {
+	match path.as_str() {
 		// TODO: indicate this is a DirectResponse
-		path if path.ends_with("client-registration") => Ok(Some(
+		path if is_client_registration_endpoint(path) => Ok(Some(
 			client_registration(req, auth, client.clone())
 				.await
 				.map_err(|e| {
@@ -69,10 +97,10 @@ pub(super) async fn enforce_authentication(
 				})
 				.into_response(),
 		)),
-		path if path.starts_with("/.well-known/oauth-protected-resource") => Ok(Some(
+		path if path.starts_with(OAUTH_PROTECTED_RESOURCE_PREFIX) => Ok(Some(
 			protected_resource_metadata(req, auth).await.into_response(),
 		)),
-		path if path.starts_with("/.well-known/oauth-authorization-server") => Ok(Some(
+		path if path.starts_with(OAUTH_AUTHORIZATION_SERVER_PREFIX) => Ok(Some(
 			authorization_server_metadata(req, auth, client.clone())
 				.await
 				.map_err(|e| {
@@ -93,7 +121,7 @@ pub(super) fn create_auth_required_response(
 	req: &Request,
 	auth: &McpAuthentication,
 ) -> ProxyError {
-	let request_path = req.uri().path();
+	let request_path = request_path(req);
 	// If the `resource` is explicitly configured, use that as the base. otherwise, derive it from the
 	// the request URL
 	let proxy_url = auth
@@ -173,10 +201,9 @@ fn strip_oauth_protected_resource_prefix(req: &Request) -> String {
 		.unwrap_or_else(|| req.uri().clone());
 
 	let path = uri.path();
-	const OAUTH_PREFIX: &str = "/.well-known/oauth-protected-resource";
 
 	// Remove the oauth-protected-resource prefix and keep the remaining path
-	if let Some(remaining_path) = path.strip_prefix(OAUTH_PREFIX) {
+	if let Some(remaining_path) = path.strip_prefix(OAUTH_PROTECTED_RESOURCE_PREFIX) {
 		uri.to_string().replace(path, remaining_path)
 	} else {
 		// If the prefix is not found, return the original URI
@@ -189,12 +216,9 @@ pub(super) async fn authorization_server_metadata(
 	auth: &McpAuthentication,
 	client: PolicyClient,
 ) -> Result<Response, ProxyError> {
-	// RFC 8414 URL for standard AS metadata. Keycloak does not implement RFC 8414; it only
-	// exposes OpenID Provider Metadata at {issuer}/.well-known/openid-configuration (OIDC Discovery).
-	let metadata_uri = match &auth.provider {
-		Some(McpIDP::Keycloak { .. }) => openid_configuration_metadata_url(&auth.issuer),
-		_ => rfc8414_metadata_url(&auth.issuer),
-	};
+	// Construct the metadata URL per RFC 8414 Section 3:
+	// For path-based issuers, the well-known suffix is inserted between the origin and path.
+	let metadata_uri = rfc8414_metadata_url(&auth.issuer);
 	let ureq = ::http::Request::builder()
 		.uri(metadata_uri)
 		.body(Body::empty())?;
@@ -291,21 +315,7 @@ pub(super) async fn client_registration(
 /// Construct the OAuth Authorization Server Metadata URL per RFC 8414 Section 3.
 ///
 /// For issuers with a path component, the well-known suffix is inserted between
-/// the origin and the path:
-///   issuer: https://idp.example.com/application/o/myapp
-///   result: https://idp.example.com/.well-known/oauth-authorization-server/application/o/myapp
-///
-/// For root issuers (no path), this produces the same result as before:
-///   issuer: https://idp.example.com
-///   result: https://idp.example.com/.well-known/oauth-authorization-server
-/// OpenID Connect Discovery 1.0 metadata document URL.
-fn openid_configuration_metadata_url(issuer: &str) -> String {
-	format!(
-		"{}/.well-known/openid-configuration",
-		issuer.trim_end_matches('/')
-	)
-}
-
+/// the origin and the path.
 fn rfc8414_metadata_url(issuer: &str) -> String {
 	match url::Url::parse(issuer) {
 		Ok(parsed) => {
@@ -317,7 +327,6 @@ fn rfc8414_metadata_url(issuer: &str) -> String {
 				format!("{origin}/.well-known/oauth-authorization-server{path}")
 			}
 		},
-		// Fallback to previous behavior if URL parsing fails, normalizing trailing slashes
 		Err(_) => {
 			let normalized = issuer.trim_end_matches('/');
 			format!("{normalized}/.well-known/oauth-authorization-server")
@@ -330,19 +339,24 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn test_openid_configuration_metadata_url_keycloak_realm() {
-		assert_eq!(
-			openid_configuration_metadata_url("http://keycloak:8080/realms/test"),
-			"http://keycloak:8080/realms/test/.well-known/openid-configuration"
-		);
-	}
+	fn client_registration_endpoint_requires_expected_prefix_and_segment_suffix() {
+		assert!(is_client_registration_endpoint(
+			"/.well-known/oauth-authorization-server/mcp/client-registration"
+		));
+		assert!(is_client_registration_endpoint(
+			"/.well-known/oauth-authorization-server/client-registration"
+		));
 
-	#[test]
-	fn test_openid_configuration_metadata_url_trailing_slash() {
-		assert_eq!(
-			openid_configuration_metadata_url("http://keycloak:8080/realms/mcp/"),
-			"http://keycloak:8080/realms/mcp/.well-known/openid-configuration"
-		);
+		assert!(!is_client_registration_endpoint(
+			"/.well-known/oauth-authorization-server/mcp/client-registration-extra"
+		));
+		assert!(!is_client_registration_endpoint(
+			"/.well-known/oauth-authorization-serverevil/mcp/client-registration"
+		));
+		assert!(!is_client_registration_endpoint("/mcp/client-registration"));
+		assert!(!is_client_registration_endpoint(
+			"/.well-known/oauth-authorization-server/mcp/client-registration/"
+		));
 	}
 
 	#[test]
