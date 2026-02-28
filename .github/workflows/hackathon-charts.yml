@@ -32,7 +32,10 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | ./tools/helm registry login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
 
       - name: Push hackathon charts (includes CRDs)
-        run: make -C controller release-charts
+        run: |
+          make -C controller package-agentgateway-charts HELM=./tools/helm
+          ./tools/helm push "controller/_test/agentgateway-${CHART_VERSION}.tgz" "oci://${CHART_REGISTRY_IMAGE_BASE}/charts"
+          ./tools/helm push "controller/_test/agentgateway-crds-${CHART_VERSION}.tgz" "oci://${CHART_REGISTRY_IMAGE_BASE}/charts"
         env:
           IMAGE_REGISTRY: ${{ env.CHART_REGISTRY_IMAGE_BASE }}
           VERSION: ${{ env.CHART_VERSION }}
@@ -41,7 +44,7 @@ jobs:
         run: |
           {
             echo "## Hackathon Charts"
-            echo "- Version: \`${CHART_VERSION}\` and \`v${CHART_VERSION}\`"
+            echo "- Version: \`${CHART_VERSION}\`"
             echo "- OCI chart: \`oci://${CHART_REGISTRY_IMAGE_BASE}/charts/agentgateway\`"
             echo "- OCI chart: \`oci://${CHART_REGISTRY_IMAGE_BASE}/charts/agentgateway-crds\`"
           } >> "${GITHUB_STEP_SUMMARY}"
