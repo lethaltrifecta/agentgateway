@@ -62,7 +62,22 @@ jobs:
           git branch -f _hackathon_integration "origin/${BASE_BRANCH}"
           git switch _hackathon_integration
           git merge --no-ff --no-edit "${MIRROR_878_BRANCH}"
-          git merge --no-ff --no-edit "${MIRROR_925_BRANCH}"
+          if ! git merge --no-ff --no-edit "${MIRROR_925_BRANCH}"; then
+            mapfile -t unresolved < <(git diff --name-only --diff-filter=U)
+            if [[ "${#unresolved[@]}" -eq 1 ]] && [[ "${unresolved[0]}" == "crates/agentgateway/tests/tests/mod.rs" ]]; then
+              git checkout --ours crates/agentgateway/tests/tests/mod.rs
+              grep -q '^mod mcp;$' crates/agentgateway/tests/tests/mod.rs \
+                || sed -i '/^mod smoke;$/i mod mcp;' crates/agentgateway/tests/tests/mod.rs
+              grep -q '^pub mod oauth2;$' crates/agentgateway/tests/tests/mod.rs \
+                || sed -i '/^mod smoke;$/i pub mod oauth2;' crates/agentgateway/tests/tests/mod.rs
+              git add crates/agentgateway/tests/tests/mod.rs
+              git commit --no-edit
+            else
+              echo "Unhandled merge conflicts:"
+              printf '%s\n' "${unresolved[@]}"
+              exit 1
+            fi
+          fi
 
           new_hackathon_sha="$(git rev-parse HEAD)"
           old_hackathon_sha="$(git ls-remote --heads origin "${HACKATHON_BRANCH}" | awk '{print $1}')"
