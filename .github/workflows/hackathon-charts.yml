@@ -26,7 +26,7 @@ jobs:
       - name: Set chart version
         run: |
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-          echo "CHART_VERSION=0.0.0-hackathon.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "CHART_VERSION=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       - name: Helm login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | ./tools/helm registry login ghcr.io -u "${{ github.repository_owner }}" --password-stdin

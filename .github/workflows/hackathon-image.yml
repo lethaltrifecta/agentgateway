@@ -24,8 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set short SHA
-        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Set version tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "VERSION_TAG=0.0.0-${SHORT_SHA}" >> "$GITHUB_ENV"
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -45,7 +48,7 @@ jobs:
           platforms: linux/arm64
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHORT_SHA }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION_TAG }}
           build-args: |
-            VERSION=${{ env.SHORT_SHA }}
+            VERSION=${{ env.VERSION_TAG }}
             GIT_REVISION=${{ github.sha }}
