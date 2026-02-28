@@ -33,7 +33,7 @@ jobs:
 
       - name: Push hackathon charts (includes CRDs)
         run: |
-          make -C controller package-agentgateway-charts HELM=./tools/helm
+          make -C controller package-agentgateway-charts HELM=../tools/helm
           ./tools/helm push "controller/_test/agentgateway-${CHART_VERSION}.tgz" "oci://${CHART_REGISTRY_IMAGE_BASE}/charts"
           ./tools/helm push "controller/_test/agentgateway-crds-${CHART_VERSION}.tgz" "oci://${CHART_REGISTRY_IMAGE_BASE}/charts"
         env:
