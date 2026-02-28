@@ -1,0 +1,47 @@
+name: Hackathon Charts
+
+on:
+  push:
+    branches:
+      - "hackathon"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CHART_REGISTRY_IMAGE_BASE: ghcr.io/${{ github.repository_owner }}
+
+concurrency:
+  group: hackathon-charts-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  push-charts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set chart version
+        run: |
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "CHART_VERSION=0.0.0-hackathon.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Helm login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | ./tools/helm registry login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Push hackathon charts (includes CRDs)
+        run: make -C controller release-charts
+        env:
+          IMAGE_REGISTRY: ${{ env.CHART_REGISTRY_IMAGE_BASE }}
+          VERSION: ${{ env.CHART_VERSION }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## Hackathon Charts"
+            echo "- Version: \`${CHART_VERSION}\` and \`v${CHART_VERSION}\`"
+            echo "- OCI chart: \`oci://${CHART_REGISTRY_IMAGE_BASE}/charts/agentgateway\`"
+            echo "- OCI chart: \`oci://${CHART_REGISTRY_IMAGE_BASE}/charts/agentgateway-crds\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
