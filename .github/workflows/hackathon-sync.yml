@@ -1,0 +1,83 @@
+name: Hackathon Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hackathon-sync
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/agentgateway/agentgateway.git
+  BASE_BRANCH: main
+  HACKATHON_BRANCH: hackathon
+  PR_878_REF: refs/pull/878/head
+  PR_925_REF: refs/pull/925/head
+  MIRROR_878_BRANCH: mirror/pr-878
+  MIRROR_925_BRANCH: mirror/pr-925
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync Mirrors and Rebuild Hackathon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "${UPSTREAM_REPO}"
+          else
+            git remote add upstream "${UPSTREAM_REPO}"
+          fi
+
+          git fetch --prune origin "${BASE_BRANCH}" "${HACKATHON_BRANCH}" || git fetch --prune origin "${BASE_BRANCH}"
+          git fetch --prune upstream \
+            "${PR_878_REF}:${MIRROR_878_BRANCH}" \
+            "${PR_925_REF}:${MIRROR_925_BRANCH}"
+
+          mirror_878_sha="$(git rev-parse "${MIRROR_878_BRANCH}")"
+          mirror_925_sha="$(git rev-parse "${MIRROR_925_BRANCH}")"
+
+          git push --force-with-lease origin \
+            "${MIRROR_878_BRANCH}:refs/heads/${MIRROR_878_BRANCH}" \
+            "${MIRROR_925_BRANCH}:refs/heads/${MIRROR_925_BRANCH}"
+
+          git switch --detach "origin/${BASE_BRANCH}"
+          git branch -f _hackathon_integration "origin/${BASE_BRANCH}"
+          git switch _hackathon_integration
+          git merge --no-ff --no-edit "${MIRROR_878_BRANCH}"
+          git merge --no-ff --no-edit "${MIRROR_925_BRANCH}"
+
+          new_hackathon_sha="$(git rev-parse HEAD)"
+          old_hackathon_sha="$(git ls-remote --heads origin "${HACKATHON_BRANCH}" | awk '{print $1}')"
+
+          if [[ -n "${old_hackathon_sha}" ]]; then
+            git push --force-with-lease="refs/heads/${HACKATHON_BRANCH}:${old_hackathon_sha}" \
+              origin "HEAD:refs/heads/${HACKATHON_BRANCH}"
+          else
+            git push origin "HEAD:refs/heads/${HACKATHON_BRANCH}"
+          fi
+
+          {
+            echo "## Hackathon Sync"
+            echo "- Base branch: \`${BASE_BRANCH}\`"
+            echo "- mirror/pr-878: \`${mirror_878_sha}\`"
+            echo "- mirror/pr-925: \`${mirror_925_sha}\`"
+            echo "- hackathon: \`${new_hackathon_sha}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
