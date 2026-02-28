@@ -12,7 +12,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/agentgateway-hackathon
+  IMAGE_NAME: ${{ github.repository_owner }}/agentgateway
 
 concurrency:
   group: hackathon-image-${{ github.ref_name }}

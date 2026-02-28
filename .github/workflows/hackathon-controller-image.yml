@@ -12,7 +12,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/controller-hackathon
+  IMAGE_NAME: ${{ github.repository_owner }}/controller
 
 concurrency:
   group: hackathon-controller-image-${{ github.ref_name }}
