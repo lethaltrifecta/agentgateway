@@ -63,8 +63,9 @@ jobs:
           git switch _hackathon_integration
           git merge --no-ff --no-edit "${MIRROR_878_BRANCH}"
           if ! git merge --no-ff --no-edit "${MIRROR_925_BRANCH}"; then
-            mapfile -t unresolved < <(git diff --name-only --diff-filter=U)
-            if [[ "${#unresolved[@]}" -eq 1 ]] && [[ "${unresolved[0]}" == "crates/agentgateway/tests/tests/mod.rs" ]]; then
+            unresolved_count="$(git diff --name-only --diff-filter=U | wc -l | tr -d ' ')"
+            unresolved_file="$(git diff --name-only --diff-filter=U | head -n 1)"
+            if [[ "${unresolved_count}" -eq 1 ]] && [[ "${unresolved_file}" == "crates/agentgateway/tests/tests/mod.rs" ]]; then
               git checkout --ours crates/agentgateway/tests/tests/mod.rs
               grep -q '^mod mcp;$' crates/agentgateway/tests/tests/mod.rs \
                 || sed -i '/^mod smoke;$/i mod mcp;' crates/agentgateway/tests/tests/mod.rs
@@ -74,7 +75,7 @@ jobs:
               git commit --no-edit
             else
               echo "Unhandled merge conflicts:"
-              printf '%s\n' "${unresolved[@]}"
+              git diff --name-only --diff-filter=U
               exit 1
             fi
           fi
