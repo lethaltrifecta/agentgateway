@@ -37,8 +37,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: controller/go.mod
-          cache-dependency-path: controller/**/*.sum
+          go-version-file: go.mod
+          cache-dependency-path: |
+            **/*.sum
 
       - name: Build controller binary
         run: |
