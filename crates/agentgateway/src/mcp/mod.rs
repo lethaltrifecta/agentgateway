@@ -117,6 +117,7 @@ pub enum MCPOperation {
 	Prompt,
 	Resource,
 	ResourceTemplates,
+	Task,
 }
 
 impl EncodeLabelValue for MCPOperation {
@@ -132,6 +133,7 @@ impl Display for MCPOperation {
 			MCPOperation::Prompt => write!(f, "prompt"),
 			MCPOperation::Resource => write!(f, "resource"),
 			MCPOperation::ResourceTemplates => write!(f, "templates"),
+			MCPOperation::Task => write!(f, "task"),
 		}
 	}
 }
