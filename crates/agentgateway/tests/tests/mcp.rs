@@ -12,7 +12,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::common::gateway::AgentGateway;
 use crate::common::mcp::{
 	ComprehensiveClient, MockMcpServer, multiplex_config, multiplex_transport_matrix_config,
-	setup_comprehensive_client, start_mock_legacy_sse_server, start_mock_mcp_server,
+	setup_comprehensive_client, simple_multiplex_config, start_mock_legacy_sse_server,
+	start_mock_mcp_meta_server, start_mock_mcp_server,
 };
 
 struct MultiplexTestFixture {
@@ -166,6 +167,7 @@ binds:
           pathPrefix: /mcp
       backends:
       - mcp:
+          allowDegraded: true
           targets:
 "#,
 	);
@@ -191,6 +193,11 @@ binds:
 	config
 }
 
+async fn setup_client_without_updates(gw: &AgentGateway) -> anyhow::Result<ComprehensiveClient> {
+	let mcp_url = format!("http://localhost:{}/mcp", gw.port());
+	setup_comprehensive_client(&mcp_url, Arc::new(AtomicUsize::new(0))).await
+}
+
 fn assert_prefixed_by(name: &str, target: &str) {
 	assert!(
 		name.starts_with(&format!("{target}__")),
@@ -203,6 +210,25 @@ fn assert_wrapped_uri_for_target(uri: &str, target: &str) {
 		uri.starts_with(&format!("agw://{target}/")),
 		"expected URI '{uri}' to be wrapped for target '{target}'"
 	);
+}
+
+fn call_tool_params(
+	name: impl Into<std::borrow::Cow<'static, str>>,
+	arguments: Option<JsonObject>,
+	task: Option<JsonObject>,
+) -> CallToolRequestParams {
+	let mut params = CallToolRequestParams::new(name);
+	if let Some(arguments) = arguments {
+		params = params.with_arguments(arguments);
+	}
+	if let Some(task) = task {
+		params = params.with_task(task);
+	}
+	params
+}
+
+fn unsubscribe_request_params(uri: impl Into<String>) -> UnsubscribeRequestParams {
+	serde_json::from_value(json!({ "uri": uri.into() })).expect("unsubscribe params should be valid")
 }
 
 #[tokio::test]
@@ -227,12 +253,11 @@ async fn test_tools_aggregation_and_rbac_filtering() -> anyhow::Result<()> {
 	);
 
 	let tool_resp = client
-		.call_tool(CallToolRequestParams {
-			name: "s1__echo".into(),
-			arguments: Some(json!({"val": "hello"}).as_object().unwrap().clone()),
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params(
+			"s1__echo",
+			Some(json!({"val": "hello"}).as_object().unwrap().clone()),
+			None,
+		))
 		.await?;
 
 	let tool_val = serde_json::to_value(&tool_resp.content[0])?;
@@ -240,6 +265,41 @@ async fn test_tools_aggregation_and_rbac_filtering() -> anyhow::Result<()> {
 		tool_val.get("text").and_then(|v| v.as_str()),
 		Some("s1: hello")
 	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn test_tools_multiplex_preserves_upstream_meta_labels() -> anyhow::Result<()> {
+	agent_core::telemetry::testing::setup_test_logging();
+	let left = start_mock_mcp_meta_server("mcp", true).await;
+	let right = start_mock_mcp_meta_server("sse", true).await;
+	let gw = AgentGateway::new(simple_multiplex_config(
+		"meta-gateway",
+		&[
+			("mcp".to_string(), left.addr),
+			("sse".to_string(), right.addr),
+		],
+	))
+	.await?;
+	let client = setup_client_without_updates(&gw).await?;
+
+	let tools = client.list_tools(None).await?;
+	let meta = tools.meta.expect("merged meta should be present");
+	let upstreams = meta
+		.0
+		.get("upstreams")
+		.and_then(|v| v.as_object())
+		.expect("meta.upstreams");
+	let mcp_label = upstreams
+		.get("mcp")
+		.and_then(|v| v.get("label"))
+		.and_then(|v| v.as_str());
+	let sse_label = upstreams
+		.get("sse")
+		.and_then(|v| v.get("label"))
+		.and_then(|v| v.as_str());
+	assert_eq!(mcp_label, Some("mcp"));
+	assert_eq!(sse_label, Some("sse"));
 	Ok(())
 }
 
@@ -269,16 +329,13 @@ async fn test_tasks_lifecycle_multiplex() -> anyhow::Result<()> {
 	let client = &fixture.client;
 
 	let task_call = client
-		.send_request(ClientRequest::CallToolRequest(CallToolRequest {
-			method: Default::default(),
-			params: CallToolRequestParams {
-				meta: None,
-				task: json!({}).as_object().cloned(),
-				name: "s1__echo".into(),
-				arguments: Some(json!({"val": "task-hello"}).as_object().unwrap().clone()),
-			},
-			extensions: Default::default(),
-		}))
+		.send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+			call_tool_params(
+				"s1__echo",
+				Some(json!({"val": "task-hello"}).as_object().unwrap().clone()),
+				Some(JsonObject::default()),
+			),
+		)))
 		.await?;
 	let task_id = match task_call {
 		ServerResult::CreateTaskResult(result) => result.task.task_id,
@@ -289,10 +346,7 @@ async fn test_tasks_lifecycle_multiplex() -> anyhow::Result<()> {
 	let listed_tasks = client
 		.send_request(ClientRequest::ListTasksRequest(ListTasksRequest {
 			method: Default::default(),
-			params: Some(PaginatedRequestParams {
-				meta: None,
-				cursor: None,
-			}),
+			params: Some(PaginatedRequestParams::default()),
 			extensions: Default::default(),
 		}))
 		.await?;
@@ -309,14 +363,12 @@ async fn test_tasks_lifecycle_multiplex() -> anyhow::Result<()> {
 	);
 
 	let task_info = client
-		.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest {
-			method: Default::default(),
-			params: GetTaskInfoParams {
+		.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+			GetTaskInfoParams {
 				meta: None,
 				task_id: task_id.clone(),
 			},
-			extensions: Default::default(),
-		}))
+		)))
 		.await?;
 	let task_info = match task_info {
 		ServerResult::GetTaskResult(result) => result.task,
@@ -326,14 +378,12 @@ async fn test_tasks_lifecycle_multiplex() -> anyhow::Result<()> {
 	assert_eq!(task_info.status, TaskStatus::Completed);
 
 	let task_payload = client
-		.send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest {
-			method: Default::default(),
-			params: GetTaskResultParams {
+		.send_request(ClientRequest::GetTaskResultRequest(
+			GetTaskResultRequest::new(GetTaskResultParams {
 				meta: None,
 				task_id: task_id.clone(),
-			},
-			extensions: Default::default(),
-		}))
+			}),
+		))
 		.await?;
 	let task_payload = match task_payload {
 		ServerResult::CustomResult(result) => result.0,
@@ -352,14 +402,12 @@ async fn test_tasks_lifecycle_multiplex() -> anyhow::Result<()> {
 	);
 
 	let task_cancel = client
-		.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest {
-			method: Default::default(),
-			params: CancelTaskParams {
+		.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+			CancelTaskParams {
 				meta: None,
 				task_id: task_id.clone(),
 			},
-			extensions: Default::default(),
-		}))
+		)))
 		.await?;
 	let task_cancel = match task_cancel {
 		ServerResult::GetTaskResult(result) => result.task,
@@ -367,6 +415,48 @@ async fn test_tasks_lifecycle_multiplex() -> anyhow::Result<()> {
 	};
 	assert_eq!(task_cancel.task_id, task_id);
 	assert_eq!(task_cancel.status, TaskStatus::Cancelled);
+	Ok(())
+}
+
+#[tokio::test]
+async fn test_prompts_list_errors_when_all_targeted_upstreams_fail() -> anyhow::Result<()> {
+	agent_core::telemetry::testing::setup_test_logging();
+	let meta = start_mock_mcp_meta_server("meta", true).await;
+	let dead_addr = {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+		let addr = listener.local_addr()?;
+		drop(listener);
+		addr
+	};
+
+	let gw = AgentGateway::new(simple_multiplex_config(
+		"prompt-fail-gateway",
+		&[
+			("meta".to_string(), meta.addr),
+			("dead".to_string(), dead_addr),
+		],
+	))
+	.await?;
+	let client = setup_client_without_updates(&gw).await?;
+
+	let err = client
+		.list_prompts(None)
+		.await
+		.expect_err("expected all targeted upstreams to fail");
+	match err {
+		rmcp::ServiceError::McpError(mcp_error) => {
+			assert_eq!(mcp_error.code.0, -32600);
+			assert!(
+				mcp_error
+					.message
+					.contains("all eligible backends failed for method prompts/list"),
+				"unexpected error message: {}",
+				mcp_error.message
+			);
+		},
+		other => panic!("Expected ServiceError::McpError, got: {:?}", other),
+	}
+
 	Ok(())
 }
 
@@ -379,11 +469,10 @@ async fn test_prompts_multiplex_roundtrip() -> anyhow::Result<()> {
 	assert!(prompts.prompts.iter().any(|p| p.name == "s1__test_prompt"));
 
 	let prompt_resp = client
-		.get_prompt(GetPromptRequestParams {
-			name: "s1__test_prompt".into(),
-			arguments: Some(json!({"val": "world"}).as_object().unwrap().clone()),
-			meta: None,
-		})
+		.get_prompt(
+			GetPromptRequestParams::new("s1__test_prompt")
+				.with_arguments(json!({"val": "world"}).as_object().unwrap().clone()),
+		)
 		.await?;
 
 	let prompt_val = serde_json::to_value(&prompt_resp.messages[0].content)?;
@@ -420,10 +509,7 @@ async fn test_resources_multiplex_uri_wrapping_and_read_roundtrip() -> anyhow::R
 
 	// Verify Reading through Wrapped URI
 	let r_resp = client
-		.read_resource(ReadResourceRequestParams {
-			uri: s1_res.uri.clone(),
-			meta: None,
-		})
+		.read_resource(ReadResourceRequestParams::new(s1_res.uri.clone()))
 		.await?;
 
 	let resource_val = serde_json::to_value(&r_resp.contents[0])?;
@@ -440,17 +526,52 @@ async fn test_elicitation_roundtrip_multiplex() -> anyhow::Result<()> {
 	let client = &fixture.client;
 
 	let e_resp = client
-		.call_tool(CallToolRequestParams {
-			name: "s1__elicitation".into(),
-			arguments: None,
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params("s1__elicitation", None, None))
 		.await?;
 	assert_eq!(
 		e_resp.structured_content.unwrap().get("color").unwrap(),
 		"diamond"
 	);
+	Ok(())
+}
+
+#[tokio::test]
+async fn test_url_elicitation_error_passthrough_in_multiplex() -> anyhow::Result<()> {
+	let fixture = MultiplexTestFixture::setup().await?;
+	let client = &fixture.client;
+
+	let err = client
+		.call_tool(call_tool_params(
+			"s1__test_url_elicitation_required",
+			None,
+			None,
+		))
+		.await
+		.expect_err("Expected URL elicitation error");
+
+	match err {
+		rmcp::ServiceError::McpError(mcp_error) => {
+			assert_eq!(mcp_error.code, ErrorCode::URL_ELICITATION_REQUIRED);
+			assert_eq!(
+				mcp_error.message.as_ref(),
+				"This request requires more information."
+			);
+			let data = mcp_error.data.expect("error data should be present");
+			let elicitations = data
+				.get("elicitations")
+				.and_then(|v| v.as_array())
+				.expect("elicitations array should be present");
+			assert_eq!(elicitations.len(), 1);
+			let first = elicitations[0].as_object().expect("elicitation object");
+			assert_eq!(first.get("mode").and_then(|v| v.as_str()), Some("url"));
+			assert_eq!(
+				first.get("elicitationId").and_then(|v| v.as_str()),
+				Some("elicit-1")
+			);
+		},
+		other => panic!("Expected ServiceError::McpError, got: {:?}", other),
+	}
+
 	Ok(())
 }
 
@@ -467,19 +588,11 @@ async fn test_resource_update_notification_after_subscribe() -> anyhow::Result<(
 		.expect("s1__res missing");
 
 	client
-		.subscribe(SubscribeRequestParams {
-			uri: s1_res.uri.clone(),
-			meta: None,
-		})
+		.subscribe(SubscribeRequestParams::new(s1_res.uri.clone()))
 		.await?;
 
 	client
-		.call_tool(CallToolRequestParams {
-			name: "s1__trigger_update".into(),
-			arguments: None,
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params("s1__trigger_update", None, None))
 		.await?;
 
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -515,12 +628,11 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	);
 
 	let tool_resp = client
-		.call_tool(CallToolRequestParams {
-			name: "s1__echo".into(),
-			arguments: Some(json!({"val": "full-flow"}).as_object().unwrap().clone()),
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params(
+			"s1__echo",
+			Some(json!({"val": "full-flow"}).as_object().unwrap().clone()),
+			None,
+		))
 		.await?;
 	let tool_val = serde_json::to_value(&tool_resp.content[0])?;
 	assert_eq!(
@@ -531,11 +643,10 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	let prompts = client.list_prompts(None).await?;
 	assert!(prompts.prompts.iter().any(|p| p.name == "s1__test_prompt"));
 	let prompt_resp = client
-		.get_prompt(GetPromptRequestParams {
-			name: "s1__test_prompt".into(),
-			arguments: Some(json!({"val": "world"}).as_object().unwrap().clone()),
-			meta: None,
-		})
+		.get_prompt(
+			GetPromptRequestParams::new("s1__test_prompt")
+				.with_arguments(json!({"val": "world"}).as_object().unwrap().clone()),
+		)
 		.await?;
 	let prompt_val = serde_json::to_value(&prompt_resp.messages[0].content)?;
 	assert_eq!(
@@ -573,10 +684,7 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	);
 
 	let resource_read = client
-		.read_resource(ReadResourceRequestParams {
-			uri: s1_data.uri.clone(),
-			meta: None,
-		})
+		.read_resource(ReadResourceRequestParams::new(s1_data.uri.clone()))
 		.await?;
 	let resource_val = serde_json::to_value(&resource_read.contents[0])?;
 	assert_eq!(
@@ -609,15 +717,13 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	);
 
 	let prompt_completion = client
-		.complete(CompleteRequestParams {
-			meta: None,
-			r#ref: Reference::for_prompt("s1__test_prompt"),
-			argument: ArgumentInfo {
+		.complete(CompleteRequestParams::new(
+			Reference::for_prompt("s1__test_prompt"),
+			ArgumentInfo {
 				name: "val".to_string(),
 				value: "dial".to_string(),
 			},
-			context: None,
-		})
+		))
 		.await?;
 	assert_eq!(
 		prompt_completion.completion.values,
@@ -625,15 +731,13 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	);
 
 	let resource_completion = client
-		.complete(CompleteRequestParams {
-			meta: None,
-			r#ref: Reference::for_resource(s1_data.uri.clone()),
-			argument: ArgumentInfo {
+		.complete(CompleteRequestParams::new(
+			Reference::for_resource(s1_data.uri.clone()),
+			ArgumentInfo {
 				name: "id".to_string(),
 				value: "abc".to_string(),
 			},
-			context: None,
-		})
+		))
 		.await?;
 	assert_eq!(
 		resource_completion.completion.values,
@@ -641,16 +745,13 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	);
 
 	let task_call = client
-		.send_request(ClientRequest::CallToolRequest(CallToolRequest {
-			method: Default::default(),
-			params: CallToolRequestParams {
-				meta: None,
-				task: json!({}).as_object().cloned(),
-				name: "s1__echo".into(),
-				arguments: Some(json!({"val": "task-hello"}).as_object().unwrap().clone()),
-			},
-			extensions: Default::default(),
-		}))
+		.send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+			call_tool_params(
+				"s1__echo",
+				Some(json!({"val": "task-hello"}).as_object().unwrap().clone()),
+				Some(JsonObject::default()),
+			),
+		)))
 		.await?;
 	let task_id = match task_call {
 		ServerResult::CreateTaskResult(result) => result.task.task_id,
@@ -660,10 +761,7 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	let listed_tasks = client
 		.send_request(ClientRequest::ListTasksRequest(ListTasksRequest {
 			method: Default::default(),
-			params: Some(PaginatedRequestParams {
-				meta: None,
-				cursor: None,
-			}),
+			params: Some(PaginatedRequestParams::default()),
 			extensions: Default::default(),
 		}))
 		.await?;
@@ -679,14 +777,12 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 		"Task not returned in list/tasks response"
 	);
 	let task_info = client
-		.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest {
-			method: Default::default(),
-			params: GetTaskInfoParams {
+		.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+			GetTaskInfoParams {
 				meta: None,
 				task_id: task_id.clone(),
 			},
-			extensions: Default::default(),
-		}))
+		)))
 		.await?;
 	let task_info = match task_info {
 		ServerResult::GetTaskResult(result) => result.task,
@@ -695,14 +791,12 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	assert_eq!(task_info.task_id, task_id);
 	assert_eq!(task_info.status, TaskStatus::Completed);
 	let task_payload = client
-		.send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest {
-			method: Default::default(),
-			params: GetTaskResultParams {
+		.send_request(ClientRequest::GetTaskResultRequest(
+			GetTaskResultRequest::new(GetTaskResultParams {
 				meta: None,
 				task_id: task_id.clone(),
-			},
-			extensions: Default::default(),
-		}))
+			}),
+		))
 		.await?;
 	let task_payload = match task_payload {
 		ServerResult::CustomResult(result) => result.0,
@@ -720,14 +814,12 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 		Some("task-hello")
 	);
 	let task_cancel = client
-		.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest {
-			method: Default::default(),
-			params: CancelTaskParams {
+		.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+			CancelTaskParams {
 				meta: None,
 				task_id: task_id.clone(),
 			},
-			extensions: Default::default(),
-		}))
+		)))
 		.await?;
 	let task_cancel = match task_cancel {
 		ServerResult::GetTaskResult(result) => result.task,
@@ -737,12 +829,7 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	assert_eq!(task_cancel.status, TaskStatus::Cancelled);
 
 	let e_resp = client
-		.call_tool(CallToolRequestParams {
-			name: "s1__elicitation".into(),
-			arguments: None,
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params("s1__elicitation", None, None))
 		.await?;
 	assert_eq!(
 		e_resp.structured_content.unwrap().get("color").unwrap(),
@@ -750,18 +837,10 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 	);
 
 	client
-		.subscribe(SubscribeRequestParams {
-			uri: s1_data.uri.clone(),
-			meta: None,
-		})
+		.subscribe(SubscribeRequestParams::new(s1_data.uri.clone()))
 		.await?;
 	client
-		.call_tool(CallToolRequestParams {
-			name: "s1__trigger_update".into(),
-			arguments: None,
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params("s1__trigger_update", None, None))
 		.await?;
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 	while fixture.update_count.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
@@ -772,10 +851,7 @@ async fn test_multiplex_full_surface_all_supported_operations() -> anyhow::Resul
 		"expected at least one resources/updated notification after subscribe"
 	);
 	client
-		.unsubscribe(UnsubscribeRequestParams {
-			uri: s1_data.uri.clone(),
-			meta: None,
-		})
+		.unsubscribe(unsubscribe_request_params(s1_data.uri.clone()))
 		.await?;
 
 	Ok(())
@@ -797,12 +873,11 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	);
 
 	let stream_echo = client
-		.call_tool(CallToolRequestParams {
-			name: "stream__echo".into(),
-			arguments: Some(json!({"val": "hello-stream"}).as_object().unwrap().clone()),
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params(
+			"stream__echo",
+			Some(json!({"val": "hello-stream"}).as_object().unwrap().clone()),
+			None,
+		))
 		.await?;
 	let stream_echo_val = serde_json::to_value(&stream_echo.content[0])?;
 	assert_eq!(
@@ -811,12 +886,11 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	);
 
 	let sse_echo = client
-		.call_tool(CallToolRequestParams {
-			name: "sse__echo".into(),
-			arguments: Some(json!({"val": "hello-sse"}).as_object().unwrap().clone()),
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params(
+			"sse__echo",
+			Some(json!({"val": "hello-sse"}).as_object().unwrap().clone()),
+			None,
+		))
 		.await?;
 	let sse_echo_val = serde_json::to_value(&sse_echo.content[0])?;
 	assert_eq!(
@@ -826,12 +900,7 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 
 	let stream_elicitation = tokio::time::timeout(
 		Duration::from_secs(10),
-		client.call_tool(CallToolRequestParams {
-			name: "stream__elicitation".into(),
-			arguments: None,
-			meta: None,
-			task: None,
-		}),
+		client.call_tool(call_tool_params("stream__elicitation", None, None)),
 	)
 	.await
 	.map_err(|_| anyhow::anyhow!("timed out waiting for stream elicitation roundtrip"))??;
@@ -854,11 +923,10 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	assert!(prompts.prompts.iter().any(|p| p.name == "sse__test_prompt"));
 
 	let stream_prompt = client
-		.get_prompt(GetPromptRequestParams {
-			name: "stream__test_prompt".into(),
-			arguments: Some(json!({"val": "world"}).as_object().unwrap().clone()),
-			meta: None,
-		})
+		.get_prompt(
+			GetPromptRequestParams::new("stream__test_prompt")
+				.with_arguments(json!({"val": "world"}).as_object().unwrap().clone()),
+		)
 		.await?;
 	let stream_prompt_val = serde_json::to_value(&stream_prompt.messages[0].content)?;
 	assert_eq!(
@@ -867,11 +935,10 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	);
 
 	let sse_prompt = client
-		.get_prompt(GetPromptRequestParams {
-			name: "sse__test_prompt".into(),
-			arguments: Some(json!({"val": "world"}).as_object().unwrap().clone()),
-			meta: None,
-		})
+		.get_prompt(
+			GetPromptRequestParams::new("sse__test_prompt")
+				.with_arguments(json!({"val": "world"}).as_object().unwrap().clone()),
+		)
 		.await?;
 	let sse_prompt_val = serde_json::to_value(&sse_prompt.messages[0].content)?;
 	assert_eq!(
@@ -894,10 +961,7 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	assert_wrapped_uri_for_target(&sse_res.uri, "sse");
 
 	let stream_read = client
-		.read_resource(ReadResourceRequestParams {
-			uri: stream_res.uri.clone(),
-			meta: None,
-		})
+		.read_resource(ReadResourceRequestParams::new(stream_res.uri.clone()))
 		.await?;
 	let stream_read_val = serde_json::to_value(&stream_read.contents[0])?;
 	assert_eq!(
@@ -906,10 +970,7 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	);
 
 	let sse_read = client
-		.read_resource(ReadResourceRequestParams {
-			uri: sse_res.uri.clone(),
-			meta: None,
-		})
+		.read_resource(ReadResourceRequestParams::new(sse_res.uri.clone()))
 		.await?;
 	let sse_read_val = serde_json::to_value(&sse_read.contents[0])?;
 	assert_eq!(
@@ -934,15 +995,13 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	assert!(sse_template.uri_template.contains("{id}"));
 
 	let stream_prompt_completion = client
-		.complete(CompleteRequestParams {
-			meta: None,
-			r#ref: Reference::for_prompt("stream__test_prompt"),
-			argument: ArgumentInfo {
+		.complete(CompleteRequestParams::new(
+			Reference::for_prompt("stream__test_prompt"),
+			ArgumentInfo {
 				name: "val".to_string(),
 				value: "dial".to_string(),
 			},
-			context: None,
-		})
+		))
 		.await?;
 	assert_eq!(
 		stream_prompt_completion.completion.values,
@@ -950,15 +1009,13 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	);
 
 	let stream_resource_completion = client
-		.complete(CompleteRequestParams {
-			meta: None,
-			r#ref: Reference::for_resource(stream_res.uri.clone()),
-			argument: ArgumentInfo {
+		.complete(CompleteRequestParams::new(
+			Reference::for_resource(stream_res.uri.clone()),
+			ArgumentInfo {
 				name: "id".to_string(),
 				value: "abc".to_string(),
 			},
-			context: None,
-		})
+		))
 		.await?;
 	assert_eq!(
 		stream_resource_completion.completion.values,
@@ -966,16 +1023,13 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	);
 
 	let task_call = client
-		.send_request(ClientRequest::CallToolRequest(CallToolRequest {
-			method: Default::default(),
-			params: CallToolRequestParams {
-				meta: None,
-				task: json!({}).as_object().cloned(),
-				name: "stream__echo".into(),
-				arguments: Some(json!({"val": "task-hello"}).as_object().unwrap().clone()),
-			},
-			extensions: Default::default(),
-		}))
+		.send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+			call_tool_params(
+				"stream__echo",
+				Some(json!({"val": "task-hello"}).as_object().unwrap().clone()),
+				Some(JsonObject::default()),
+			),
+		)))
 		.await?;
 	let task_id = match task_call {
 		ServerResult::CreateTaskResult(result) => result.task.task_id,
@@ -984,14 +1038,12 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	assert_prefixed_by(&task_id, "stream");
 
 	let task_info = client
-		.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest {
-			method: Default::default(),
-			params: GetTaskInfoParams {
+		.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+			GetTaskInfoParams {
 				meta: None,
 				task_id: task_id.clone(),
 			},
-			extensions: Default::default(),
-		}))
+		)))
 		.await?;
 	let task_info = match task_info {
 		ServerResult::GetTaskResult(result) => result.task,
@@ -1001,14 +1053,12 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	assert_eq!(task_info.status, TaskStatus::Completed);
 
 	let task_payload = client
-		.send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest {
-			method: Default::default(),
-			params: GetTaskResultParams {
+		.send_request(ClientRequest::GetTaskResultRequest(
+			GetTaskResultRequest::new(GetTaskResultParams {
 				meta: None,
 				task_id: task_id.clone(),
-			},
-			extensions: Default::default(),
-		}))
+			}),
+		))
 		.await?;
 	let task_payload = match task_payload {
 		ServerResult::CustomResult(result) => result.0,
@@ -1020,14 +1070,12 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	);
 
 	let task_cancel = client
-		.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest {
-			method: Default::default(),
-			params: CancelTaskParams {
+		.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+			CancelTaskParams {
 				meta: None,
 				task_id: task_id.clone(),
 			},
-			extensions: Default::default(),
-		}))
+		)))
 		.await?;
 	let task_cancel = match task_cancel {
 		ServerResult::GetTaskResult(result) => result.task,
@@ -1037,18 +1085,10 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 	assert_eq!(task_cancel.status, TaskStatus::Cancelled);
 
 	client
-		.subscribe(SubscribeRequestParams {
-			uri: stream_res.uri.clone(),
-			meta: None,
-		})
+		.subscribe(SubscribeRequestParams::new(stream_res.uri.clone()))
 		.await?;
 	client
-		.call_tool(CallToolRequestParams {
-			name: "stream__trigger_update".into(),
-			arguments: None,
-			meta: None,
-			task: None,
-		})
+		.call_tool(call_tool_params("stream__trigger_update", None, None))
 		.await?;
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 	while fixture.update_count.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
@@ -1059,17 +1099,14 @@ async fn test_multiplex_transport_matrix_end_to_end() -> anyhow::Result<()> {
 		"expected at least one resources/updated notification after subscribe"
 	);
 	client
-		.unsubscribe(UnsubscribeRequestParams {
-			uri: stream_res.uri.clone(),
-			meta: None,
-		})
+		.unsubscribe(unsubscribe_request_params(stream_res.uri.clone()))
 		.await?;
 
 	Ok(())
 }
 
 #[tokio::test]
-#[ignore = "enterprise load test; run manually with RUST_MIN_STACK=8388608"]
+#[ignore = "enterprise load test; run manually"]
 async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Result<()> {
 	const TARGETS: usize = 20;
 	const WORKERS: usize = 40;
@@ -1102,12 +1139,11 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 						// tools/call
 						0 => {
 							let resp = client
-								.call_tool(CallToolRequestParams {
-									name: format!("{target}__echo").into(),
-									arguments: Some(json!({"val": input}).as_object().unwrap().clone()),
-									meta: None,
-									task: None,
-								})
+								.call_tool(call_tool_params(
+									format!("{target}__echo"),
+									Some(json!({"val": input}).as_object().unwrap().clone()),
+									None,
+								))
 								.await?;
 							let value = serde_json::to_value(&resp.content[0])?;
 							assert_eq!(
@@ -1126,11 +1162,10 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 								"missing prompt for target {target}"
 							);
 							let prompt = client
-								.get_prompt(GetPromptRequestParams {
-									name: format!("{target}__test_prompt"),
-									arguments: Some(json!({"val": input}).as_object().unwrap().clone()),
-									meta: None,
-								})
+								.get_prompt(
+									GetPromptRequestParams::new(format!("{target}__test_prompt"))
+										.with_arguments(json!({"val": input}).as_object().unwrap().clone()),
+								)
 								.await?;
 							let value = serde_json::to_value(&prompt.messages[0].content)?;
 							assert_eq!(
@@ -1147,10 +1182,7 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 								.find(|r| r.name == format!("{target}__data"))
 								.expect("target resource should exist");
 							let read = client
-								.read_resource(ReadResourceRequestParams {
-									uri: resource.uri.clone(),
-									meta: None,
-								})
+								.read_resource(ReadResourceRequestParams::new(resource.uri.clone()))
 								.await?;
 							let value = serde_json::to_value(&read.contents[0])?;
 							assert_eq!(
@@ -1172,15 +1204,13 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 						// completion on prompt
 						4 => {
 							let completion = client
-								.complete(CompleteRequestParams {
-									meta: None,
-									r#ref: Reference::for_prompt(format!("{target}__test_prompt")),
-									argument: ArgumentInfo {
+								.complete(CompleteRequestParams::new(
+									Reference::for_prompt(format!("{target}__test_prompt")),
+									ArgumentInfo {
 										name: "val".to_string(),
 										value: input.clone(),
 									},
-									context: None,
-								})
+								))
 								.await?;
 							assert_eq!(
 								completion.completion.values,
@@ -1196,15 +1226,13 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 								.find(|r| r.name == format!("{target}__data"))
 								.expect("target resource should exist");
 							let completion = client
-								.complete(CompleteRequestParams {
-									meta: None,
-									r#ref: Reference::for_resource(resource.uri.clone()),
-									argument: ArgumentInfo {
+								.complete(CompleteRequestParams::new(
+									Reference::for_resource(resource.uri.clone()),
+									ArgumentInfo {
 										name: "id".to_string(),
 										value: input.clone(),
 									},
-									context: None,
-								})
+								))
 								.await?;
 							assert_eq!(
 								completion.completion.values,
@@ -1214,16 +1242,13 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 						// task lifecycle
 						6 => {
 							let task_call = client
-								.send_request(ClientRequest::CallToolRequest(CallToolRequest {
-									method: Default::default(),
-									params: CallToolRequestParams {
-										meta: None,
-										task: json!({}).as_object().cloned(),
-										name: format!("{target}__echo").into(),
-										arguments: Some(json!({"val": input}).as_object().unwrap().clone()),
-									},
-									extensions: Default::default(),
-								}))
+								.send_request(ClientRequest::CallToolRequest(CallToolRequest::new(
+									call_tool_params(
+										format!("{target}__echo"),
+										Some(json!({"val": input}).as_object().unwrap().clone()),
+										Some(JsonObject::default()),
+									),
+								)))
 								.await?;
 							let task_id = match task_call {
 								ServerResult::CreateTaskResult(result) => result.task.task_id,
@@ -1232,14 +1257,12 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 							assert_prefixed_by(&task_id, &target);
 
 							let task_info = client
-								.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest {
-									method: Default::default(),
-									params: GetTaskInfoParams {
+								.send_request(ClientRequest::GetTaskInfoRequest(GetTaskInfoRequest::new(
+									GetTaskInfoParams {
 										meta: None,
 										task_id: task_id.clone(),
 									},
-									extensions: Default::default(),
-								}))
+								)))
 								.await?;
 							let task_info = match task_info {
 								ServerResult::GetTaskResult(result) => result.task,
@@ -1248,14 +1271,12 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 							assert_eq!(task_info.task_id, task_id);
 
 							let task_result = client
-								.send_request(ClientRequest::GetTaskResultRequest(GetTaskResultRequest {
-									method: Default::default(),
-									params: GetTaskResultParams {
+								.send_request(ClientRequest::GetTaskResultRequest(
+									GetTaskResultRequest::new(GetTaskResultParams {
 										meta: None,
 										task_id: task_id.clone(),
-									},
-									extensions: Default::default(),
-								}))
+									}),
+								))
 								.await?;
 							let payload = match task_result {
 								ServerResult::CustomResult(result) => result.0,
@@ -1264,14 +1285,12 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 							assert_eq!(payload.get("tool").and_then(|v| v.as_str()), Some("echo"));
 
 							let cancel = client
-								.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest {
-									method: Default::default(),
-									params: CancelTaskParams {
+								.send_request(ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
+									CancelTaskParams {
 										meta: None,
 										task_id: task_id.clone(),
 									},
-									extensions: Default::default(),
-								}))
+								)))
 								.await?;
 							let cancelled = match cancel {
 								ServerResult::GetTaskResult(result) => result.task,
@@ -1303,7 +1322,7 @@ async fn test_enterprise_multiplex_concurrent_load_20_upstreams() -> anyhow::Res
 }
 
 #[tokio::test]
-#[ignore = "enterprise interactive load test; run manually with RUST_MIN_STACK=8388608"]
+#[ignore = "enterprise interactive load test; run manually"]
 async fn test_enterprise_multiplex_interactive_load_20_upstreams() -> anyhow::Result<()> {
 	const TARGETS: usize = 20;
 	const WORKERS: usize = 12;
@@ -1329,12 +1348,11 @@ async fn test_enterprise_multiplex_interactive_load_20_upstreams() -> anyhow::Re
 						// elicitation
 						0 => {
 							let resp = client
-								.call_tool(CallToolRequestParams {
-									name: format!("{target}__elicitation").into(),
-									arguments: None,
-									meta: None,
-									task: None,
-								})
+								.call_tool(call_tool_params(
+									format!("{target}__elicitation"),
+									None,
+									None,
+								))
 								.await?;
 							assert_eq!(
 								resp
@@ -1355,18 +1373,14 @@ async fn test_enterprise_multiplex_interactive_load_20_upstreams() -> anyhow::Re
 								.expect("target resource should exist");
 							let before_updates = update_count.load(Ordering::SeqCst);
 							client
-								.subscribe(SubscribeRequestParams {
-									uri: resource.uri.clone(),
-									meta: None,
-								})
+								.subscribe(SubscribeRequestParams::new(resource.uri.clone()))
 								.await?;
 							client
-								.call_tool(CallToolRequestParams {
-									name: format!("{target}__trigger_update").into(),
-									arguments: None,
-									meta: None,
-									task: None,
-								})
+								.call_tool(call_tool_params(
+									format!("{target}__trigger_update"),
+									None,
+									None,
+								))
 								.await?;
 							let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 							while update_count.load(Ordering::SeqCst) == before_updates
@@ -1379,10 +1393,7 @@ async fn test_enterprise_multiplex_interactive_load_20_upstreams() -> anyhow::Re
 								"expected at least one resources/updated notification for {target}"
 							);
 							client
-								.unsubscribe(UnsubscribeRequestParams {
-									uri: resource.uri.clone(),
-									meta: None,
-								})
+								.unsubscribe(unsubscribe_request_params(resource.uri.clone()))
 								.await?;
 						},
 					}

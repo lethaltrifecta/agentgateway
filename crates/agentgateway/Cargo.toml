@@ -100,12 +100,9 @@ rand.workspace = true
 libc.workspace = true
 rcgen.workspace = true
 regex.workspace = true
-rmcp = { version = "0.17", features = [
-    "macros",
-    "base64",
-    "elicitation",
-    "server",
+rmcp = { version = "1.1.0", default-features = false, features = [
     "client",
+    "server",
     "transport-child-process",
 ] }
 rustls-native-certs.workspace = true
@@ -170,26 +167,22 @@ rstest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 which.workspace = true
-rmcp = { version = "0.17", features = [
+rmcp = { version = "1.1.0", default-features = false, features = [
     "macros",
-    "base64",
-    "elicitation",
+    "client",
     "server",
-    "transport-child-process",
     "transport-streamable-http-server",
-    "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
-    "reqwest",
-    "auth",
 ] }
 # We need SSE client for testing but they removed it for some reason :-(
 # https://github.com/modelcontextprotocol/rust-sdk/pull/562
-legacy-rmcp = { package = "rmcp", version = "0.10.0", features = [
+legacy-rmcp = { package = "rmcp", version = "0.10.0", default-features = false, features = [
+    "base64",
+    "macros",
+    "server",
     "transport-sse-server",
-    "transport-sse-client",
     "transport-sse-client-reqwest",
     "client",
-    "reqwest"
 ] }
 reqwest.workspace = true
 

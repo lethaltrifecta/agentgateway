@@ -1,11 +1,28 @@
-use rmcp::model::*;
-use rmcp::service::*;
+use anyhow::Context;
+use rmcp::model::{
+	AnnotateAble, Annotated, CallToolRequestParams, CallToolResult, CancelTaskParams,
+	CancelTaskResult, ClientCapabilities, ClientInfo, ClientResult, CompleteRequestParams,
+	CompleteResult, CompletionInfo, CreateElicitationRequest, CreateElicitationRequestParams,
+	CreateElicitationResult, CreateTaskResult, ElicitationAction, ElicitationCapability,
+	ElicitationSchema, ErrorCode, ErrorData, FormElicitationCapability, GetPromptRequestParams,
+	GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult, GetTaskResultParams,
+	Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+	ListTasksResult, ListToolsResult, Meta, PaginatedRequestParams, PromptMessage, PromptMessageRole,
+	ProtocolVersion, RawContent, RawResource, RawResourceTemplate, ReadResourceRequestParams,
+	ReadResourceResult, Reference, ResourceContents, ResourceUpdatedNotification,
+	ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, ServerNotification,
+	ServerRequest, SubscribeRequestParams, TaskStatus, TasksCapability, UnsubscribeRequestParams,
+	UrlElicitationCapability,
+};
+use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
 use rmcp::{RoleServer, ServerHandler, ServiceExt, prompt_router, tool_handler, tool_router};
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
+
+use super::task_store::TaskStore;
 
 pub(crate) type ComprehensiveClient = RunningService<RoleClient, ComprehensiveClientHandler>;
 
@@ -16,13 +33,13 @@ pub(crate) async fn setup_comprehensive_client(
 	use rmcp::transport::StreamableHttpClientTransport;
 	let transport = StreamableHttpClientTransport::with_client(
 		reqwest::Client::new(),
-		rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.to_string()),
+		rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+			url.to_string(),
+		),
 	);
 
-	let client_info = ClientInfo {
-		meta: None,
-		protocol_version: Default::default(),
-		capabilities: ClientCapabilities::builder()
+	let client_info = ClientInfo::new(
+		ClientCapabilities::builder()
 			.enable_tasks_with(TasksCapability::client_default())
 			.enable_elicitation_with(ElicitationCapability {
 				form: Some(FormElicitationCapability {
@@ -31,15 +48,8 @@ pub(crate) async fn setup_comprehensive_client(
 				url: Some(UrlElicitationCapability::default()),
 			})
 			.build(),
-		client_info: Implementation {
-			name: "comprehensive-client".to_string(),
-			version: "1.0.0".to_string(),
-			title: None,
-			description: None,
-			website_url: None,
-			icons: None,
-		},
-	};
+		Implementation::new("comprehensive-client", "1.0.0"),
+	);
 
 	let client = ComprehensiveClientHandler {
 		info: client_info,
@@ -47,7 +57,7 @@ pub(crate) async fn setup_comprehensive_client(
 	}
 	.serve(transport)
 	.await
-	.map_err(|e| anyhow::anyhow!("failed to serve: {:?}", e))?;
+	.context("failed to start comprehensive client service")?;
 
 	Ok(client)
 }
@@ -65,18 +75,18 @@ impl rmcp::ClientHandler for ComprehensiveClientHandler {
 	fn create_elicitation(
 		&self,
 		_req: CreateElicitationRequestParams,
-		_: RequestContext<rmcp::RoleClient>,
+		_: RequestContext<RoleClient>,
 	) -> impl std::future::Future<Output = Result<CreateElicitationResult, ErrorData>> + Send + '_ {
-		std::future::ready(Ok(CreateElicitationResult {
-			action: ElicitationAction::Accept,
-			content: Some(json!({"color": "diamond"})),
-		}))
+		std::future::ready(Ok(
+			CreateElicitationResult::new(ElicitationAction::Accept)
+				.with_content(json!({"color": "diamond"})),
+		))
 	}
 
 	fn on_resource_updated(
 		&self,
 		_req: ResourceUpdatedNotificationParam,
-		_: NotificationContext<rmcp::RoleClient>,
+		_: NotificationContext<RoleClient>,
 	) -> impl std::future::Future<Output = ()> + Send + '_ {
 		self.update_count.fetch_add(1, Ordering::SeqCst);
 		std::future::ready(())
@@ -87,6 +97,25 @@ pub(crate) async fn start_mock_mcp_server(
 	label: impl Into<String>,
 	stateful: bool,
 ) -> MockMcpServer {
+	start_streamable_mock_server(label, stateful, RobustHandler::new).await
+}
+
+pub(crate) async fn start_mock_mcp_meta_server(
+	label: impl Into<String>,
+	stateful: bool,
+) -> MockMcpServer {
+	start_streamable_mock_server(label, stateful, MetaOnlyHandler::new).await
+}
+
+async fn start_streamable_mock_server<H, F>(
+	label: impl Into<String>,
+	stateful: bool,
+	make_handler: F,
+) -> MockMcpServer
+where
+	H: ServerHandler + Clone + Send + Sync + 'static,
+	F: Fn(Arc<str>) -> H + Send + Sync + 'static,
+{
 	use rmcp::transport::StreamableHttpServerConfig;
 	use rmcp::transport::streamable_http_server::StreamableHttpService;
 	use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -95,7 +124,7 @@ pub(crate) async fn start_mock_mcp_server(
 	let service = StreamableHttpService::new(
 		{
 			let label = label.clone();
-			move || Ok(RobustHandler::new(label.clone()))
+			move || Ok(make_handler(label.clone()))
 		},
 		LocalSessionManager::default().into(),
 		StreamableHttpServerConfig {
@@ -104,47 +133,56 @@ pub(crate) async fn start_mock_mcp_server(
 		},
 	);
 
-	let (tx, rx) = tokio::sync::oneshot::channel();
+	let (shutdown_tx, shutdown_rx) = oneshot::channel();
 	let router = axum::Router::new().nest_service("/mcp", service);
-	let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = tcp_listener.local_addr().unwrap();
-	tokio::spawn(async move {
-		let _ = axum::serve(tcp_listener, router)
-			.with_graceful_shutdown(async {
-				let _ = rx.await;
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let server_task = tokio::spawn(async move {
+		let _ = axum::serve(listener, router)
+			.with_graceful_shutdown(async move {
+				let _ = shutdown_rx.await;
 			})
 			.await;
 	});
-	MockMcpServer { addr, _cancel: tx }
+	MockMcpServer {
+		addr,
+		shutdown_tx: Some(shutdown_tx),
+		server_task: Some(server_task),
+	}
 }
 
 pub(crate) async fn start_mock_legacy_sse_server() -> MockMcpServer {
 	use legacy_rmcp::transport::sse_server::{SseServer, SseServerConfig};
 	use tokio_util::sync::CancellationToken;
 
-	let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = tcp_listener.local_addr().unwrap();
-	let ct = CancellationToken::new();
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let cancellation = CancellationToken::new();
 	let (sse_server, service) = SseServer::new(SseServerConfig {
 		bind: addr,
 		sse_path: "/sse".to_string(),
 		post_path: "/message".to_string(),
-		ct: ct.child_token(),
+		ct: cancellation.child_token(),
 		sse_keep_alive: None,
 	});
 
-	let (tx, rx) = tokio::sync::oneshot::channel();
-	let ct2 = sse_server.with_service_directly(legacy_sse_mock::LegacyRobustHandler::new);
-	tokio::spawn(async move {
-		let _ = axum::serve(tcp_listener, service)
+	let (shutdown_tx, shutdown_rx) = oneshot::channel();
+	let service_cancellation =
+		sse_server.with_service_directly(legacy_sse_mock::LegacyRobustHandler::new);
+	let server_task = tokio::spawn(async move {
+		let _ = axum::serve(listener, service)
 			.with_graceful_shutdown(async move {
-				let _ = rx.await;
-				ct.cancel();
-				ct2.cancel();
+				let _ = shutdown_rx.await;
+				cancellation.cancel();
+				service_cancellation.cancel();
 			})
 			.await;
 	});
-	MockMcpServer { addr, _cancel: tx }
+	MockMcpServer {
+		addr,
+		shutdown_tx: Some(shutdown_tx),
+		server_task: Some(server_task),
+	}
 }
 
 pub(crate) fn multiplex_config(
@@ -165,6 +203,7 @@ binds:
           pathPrefix: /mcp
       backends:
       - mcp:
+          allowDegraded: true
           targets:
           - name: s1
             mcp:
@@ -203,6 +242,7 @@ binds:
           pathPrefix: /mcp
       backends:
       - mcp:
+          allowDegraded: true
           targets:
           - name: stream
             mcp:
@@ -222,9 +262,51 @@ binds:
 	)
 }
 
+pub(crate) fn simple_multiplex_config(
+	listener_name: &str,
+	targets: &[(String, std::net::SocketAddr)],
+) -> String {
+	let mut config = format!(
+		r#"config: {{}}
+binds:
+- port: $PORT
+  listeners:
+  - name: {listener_name}
+    routes:
+    - matches:
+      - path:
+          pathPrefix: /mcp
+      backends:
+      - mcp:
+          allowDegraded: true
+          targets:
+"#
+	);
+
+	for (name, addr) in targets {
+		config.push_str(&format!(
+			"          - name: {name}\n            mcp:\n              host: http://{addr}/mcp\n"
+		));
+	}
+
+	config
+}
+
 pub(crate) struct MockMcpServer {
 	pub(crate) addr: std::net::SocketAddr,
-	_cancel: tokio::sync::oneshot::Sender<()>,
+	shutdown_tx: Option<oneshot::Sender<()>>,
+	server_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MockMcpServer {
+	fn drop(&mut self) {
+		if let Some(tx) = self.shutdown_tx.take() {
+			let _ = tx.send(());
+		}
+		if let Some(task) = self.server_task.take() {
+			task.abort();
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -275,23 +357,17 @@ impl RobustHandler {
 				.build()
 				.unwrap(),
 		};
-		let req = CreateElicitationRequest {
-			method: Default::default(),
-			params,
-			extensions: Default::default(),
-		};
+		let req = CreateElicitationRequest::new(params);
 		let resp = ctx
 			.peer
 			.send_request(ServerRequest::CreateElicitationRequest(req))
 			.await
 			.map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 		if let ClientResult::CreateElicitationResult(res) = resp {
-			Ok(CallToolResult {
-				content: vec![Annotated::new(RawContent::text("accepted"), None)],
-				structured_content: res.content,
-				is_error: Some(false),
-				meta: None,
-			})
+			let mut result =
+				CallToolResult::success(vec![Annotated::new(RawContent::text("accepted"), None)]);
+			result.structured_content = res.content;
+			Ok(result)
 		} else {
 			Err(ErrorData::internal_error("Unexpected response", None))
 		}
@@ -302,13 +378,8 @@ impl RobustHandler {
 		&self,
 		ctx: RequestContext<RoleServer>,
 	) -> Result<CallToolResult, ErrorData> {
-		let notif = ResourceUpdatedNotification {
-			method: Default::default(),
-			params: ResourceUpdatedNotificationParam {
-				uri: "memo://data".to_string(),
-			},
-			extensions: Default::default(),
-		};
+		let notif =
+			ResourceUpdatedNotification::new(ResourceUpdatedNotificationParam::new("memo://data"));
 		ctx
 			.peer
 			.send_notification(ServerNotification::ResourceUpdatedNotification(notif))
@@ -318,6 +389,24 @@ impl RobustHandler {
 			RawContent::text("notified"),
 			None,
 		)]))
+	}
+
+	#[rmcp::tool(description = "Return URL elicitation required error for testing")]
+	fn test_url_elicitation_required(&self) -> Result<CallToolResult, ErrorData> {
+		Err(ErrorData::new(
+			ErrorCode::URL_ELICITATION_REQUIRED,
+			"This request requires more information.",
+			Some(json!({
+				"elicitations": [
+					{
+						"mode": "url",
+						"message": "Authenticate to continue",
+						"elicitationId": "elicit-1",
+						"url": "https://example.com/auth"
+					}
+				]
+			})),
+		))
 	}
 }
 
@@ -331,15 +420,10 @@ impl RobustHandler {
 		>,
 	) -> Result<GetPromptResult, ErrorData> {
 		let msg = val.get("val").and_then(|v| v.as_str()).unwrap_or("none");
-		Ok(GetPromptResult {
-			description: None,
-			messages: vec![PromptMessage {
-				role: PromptMessageRole::User,
-				content: PromptMessageContent::Text {
-					text: format!("val: {}", msg),
-				},
-			}],
-		})
+		Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+			PromptMessageRole::User,
+			format!("val: {}", msg),
+		)]))
 	}
 }
 
@@ -347,18 +431,17 @@ impl RobustHandler {
 #[rmcp::prompt_handler]
 impl ServerHandler for RobustHandler {
 	fn get_info(&self) -> ServerInfo {
-		ServerInfo {
-			protocol_version: ProtocolVersion::V_2025_06_18,
-			capabilities: ServerCapabilities::builder()
+		ServerInfo::new(
+			ServerCapabilities::builder()
 				.enable_completions()
 				.enable_tools()
 				.enable_resources()
 				.enable_prompts()
 				.enable_tasks_with(TasksCapability::server_default())
 				.build(),
-			server_info: Implementation::from_build_env(),
-			instructions: None,
-		}
+		)
+		.with_protocol_version(ProtocolVersion::V_2025_06_18)
+		.with_server_info(Implementation::from_build_env())
 	}
 
 	fn list_resources(
@@ -366,14 +449,10 @@ impl ServerHandler for RobustHandler {
 		_: Option<PaginatedRequestParams>,
 		_: RequestContext<RoleServer>,
 	) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send {
-		std::future::ready(Ok(ListResourcesResult {
-			resources: vec![
-				RawResource::new("memo://data", "data").no_annotation(),
-				RawResource::new("memo://{id}", "template").no_annotation(),
-			],
-			next_cursor: None,
-			meta: None,
-		}))
+		std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
+			RawResource::new("memo://data", "data").no_annotation(),
+			RawResource::new("memo://{id}", "template").no_annotation(),
+		])))
 	}
 
 	fn read_resource(
@@ -381,14 +460,9 @@ impl ServerHandler for RobustHandler {
 		params: ReadResourceRequestParams,
 		_: RequestContext<RoleServer>,
 	) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send {
-		std::future::ready(Ok(ReadResourceResult {
-			contents: vec![ResourceContents::TextResourceContents {
-				uri: params.uri,
-				mime_type: Some("text/plain".to_string()),
-				text: "server-data".to_string(),
-				meta: None,
-			}],
-		}))
+		std::future::ready(Ok(ReadResourceResult::new(vec![
+			ResourceContents::text("server-data", params.uri).with_mime_type("text/plain"),
+		])))
 	}
 
 	fn list_resource_templates(
@@ -396,21 +470,9 @@ impl ServerHandler for RobustHandler {
 		_: Option<PaginatedRequestParams>,
 		_: RequestContext<RoleServer>,
 	) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send {
-		std::future::ready(Ok(ListResourceTemplatesResult {
-			next_cursor: None,
-			resource_templates: vec![
-				RawResourceTemplate {
-					uri_template: "memo://{id}".to_string(),
-					name: "template".to_string(),
-					title: None,
-					description: None,
-					mime_type: None,
-					icons: None,
-				}
-				.no_annotation(),
-			],
-			meta: None,
-		}))
+		std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
+			RawResourceTemplate::new("memo://{id}", "template").no_annotation(),
+		])))
 	}
 
 	fn complete(
@@ -426,8 +488,8 @@ impl ServerHandler for RobustHandler {
 			"{0}:{kind}:{1}",
 			self.label, request.argument.value
 		)])
-		.expect("completion values should be valid");
-		std::future::ready(Ok(CompleteResult { completion }))
+		.map_err(|e| ErrorData::internal_error(e, None));
+		std::future::ready(completion.map(CompleteResult::new))
 	}
 
 	fn subscribe(
@@ -457,7 +519,7 @@ impl ServerHandler for RobustHandler {
 			"arguments": request.arguments,
 		});
 		let task = tasks.create_task(result);
-		Ok(CreateTaskResult { task })
+		Ok(CreateTaskResult::new(task))
 	}
 
 	async fn list_tasks(
@@ -466,15 +528,9 @@ impl ServerHandler for RobustHandler {
 		_: RequestContext<RoleServer>,
 	) -> Result<ListTasksResult, ErrorData> {
 		let tasks = self.tasks.lock().await;
-		Ok(ListTasksResult {
-			tasks: tasks
-				.tasks
-				.values()
-				.map(|entry| entry.task.clone())
-				.collect(),
-			next_cursor: None,
-			total: None,
-		})
+		Ok(ListTasksResult::new(
+			tasks.iter_tasks().cloned().collect::<Vec<_>>(),
+		))
 	}
 
 	async fn get_task_info(
@@ -483,7 +539,7 @@ impl ServerHandler for RobustHandler {
 		_: RequestContext<RoleServer>,
 	) -> Result<GetTaskResult, ErrorData> {
 		let mut tasks = self.tasks.lock().await;
-		if let Some(entry) = tasks.tasks.get_mut(&request.task_id) {
+		if let Some(entry) = tasks.get_mut(&request.task_id) {
 			if entry.task.status == TaskStatus::Working && entry.result.is_some() {
 				entry.task.status = TaskStatus::Completed;
 				entry.task.status_message = Some("completed".to_string());
@@ -507,7 +563,7 @@ impl ServerHandler for RobustHandler {
 		_: RequestContext<RoleServer>,
 	) -> Result<GetTaskPayloadResult, ErrorData> {
 		let mut tasks = self.tasks.lock().await;
-		let entry = tasks.tasks.get_mut(&request.task_id);
+		let entry = tasks.get_mut(&request.task_id);
 		let Some(entry) = entry else {
 			return Err(ErrorData::invalid_params(
 				"task not found".to_string(),
@@ -518,7 +574,7 @@ impl ServerHandler for RobustHandler {
 			entry.task.status = TaskStatus::Completed;
 			entry.task.status_message = Some("completed".to_string());
 			entry.task.last_updated_at = entry.task.created_at.clone();
-			return Ok(GetTaskPayloadResult(result));
+			return Ok(GetTaskPayloadResult::new(result));
 		}
 		Err(ErrorData::invalid_params(
 			"task not ready".to_string(),
@@ -532,7 +588,7 @@ impl ServerHandler for RobustHandler {
 		_: RequestContext<RoleServer>,
 	) -> Result<CancelTaskResult, ErrorData> {
 		let mut tasks = self.tasks.lock().await;
-		if let Some(entry) = tasks.tasks.get_mut(&request.task_id) {
+		if let Some(entry) = tasks.get_mut(&request.task_id) {
 			entry.task.status = TaskStatus::Cancelled;
 			entry.task.status_message = Some("cancelled".to_string());
 			entry.task.last_updated_at = entry.task.created_at.clone();
@@ -549,47 +605,72 @@ impl ServerHandler for RobustHandler {
 	}
 }
 
-#[derive(Debug, Default)]
-struct TaskStore {
-	next_id: u64,
-	tasks: HashMap<String, TaskEntry>,
+#[derive(Clone)]
+struct MetaOnlyHandler {
+	label: Arc<str>,
 }
 
-#[derive(Debug)]
-struct TaskEntry {
-	task: Task,
-	result: Option<serde_json::Value>,
+impl MetaOnlyHandler {
+	fn new(label: Arc<str>) -> Self {
+		Self { label }
+	}
 }
 
-impl TaskStore {
-	fn create_task(&mut self, result: serde_json::Value) -> Task {
-		let task_id = format!("task-{}", self.next_id);
-		self.next_id += 1;
-		let created_at = "2026-01-01T00:00:00Z".to_string();
-		let task = Task {
-			task_id: task_id.clone(),
-			status: TaskStatus::Working,
-			status_message: Some("queued".to_string()),
-			created_at: created_at.clone(),
-			last_updated_at: created_at,
-			ttl: None,
-			poll_interval: Some(10),
+impl ServerHandler for MetaOnlyHandler {
+	fn get_info(&self) -> ServerInfo {
+		ServerInfo::new(
+			ServerCapabilities::builder()
+				.enable_completions()
+				.enable_tools()
+				.build(),
+		)
+		.with_protocol_version(ProtocolVersion::V_2025_06_18)
+		.with_server_info(Implementation::from_build_env())
+	}
+
+	fn complete(
+		&self,
+		request: CompleteRequestParams,
+		_: RequestContext<RoleServer>,
+	) -> impl std::future::Future<Output = Result<CompleteResult, ErrorData>> + Send {
+		let kind = match request.r#ref {
+			Reference::Prompt(_) => "prompt",
+			Reference::Resource(_) => "resource",
 		};
-		self.tasks.insert(
-			task_id,
-			TaskEntry {
-				task: task.clone(),
-				result: Some(result),
-			},
+		let value = format!("meta-{kind}-{}", request.argument.value);
+		std::future::ready(
+			CompletionInfo::with_all_values(vec![value])
+				.map(CompleteResult::new)
+				.map_err(|e| ErrorData::internal_error(e, None)),
+		)
+	}
+
+	fn list_tools(
+		&self,
+		_: Option<PaginatedRequestParams>,
+		_: RequestContext<RoleServer>,
+	) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send {
+		let mut meta = Meta::new();
+		meta.0.insert(
+			"label".to_string(),
+			serde_json::Value::String(self.label.to_string()),
 		);
-		task
+		let mut result = ListToolsResult::with_all_items(Vec::new());
+		result.meta = Some(meta);
+		std::future::ready(Ok(result))
 	}
 }
 
 mod legacy_sse_mock {
 	use legacy_rmcp as rmcp;
 	use rmcp::handler::server::wrapper::Parameters;
-	use rmcp::model::*;
+	use rmcp::model::{
+		AnnotateAble, CallToolResult, Content, GetPromptRequestParam, GetPromptResult, Implementation,
+		ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParam,
+		Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole,
+		ProtocolVersion, RawResource, RawResourceTemplate, ReadResourceRequestParam,
+		ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+	};
 	use rmcp::service::RequestContext;
 	use rmcp::{ErrorData, RoleServer, ServerHandler, tool_handler, tool_router};
 	use serde_json::Value;

@@ -5950,8 +5950,10 @@ type MCPBackend struct {
 	// to mix stateful and stateless targets in the same backend.
 	StatefulMode MCPBackend_StatefulMode `protobuf:"varint,3,opt,name=stateful_mode,json=statefulMode,proto3,enum=agentgateway.dev.resource.MCPBackend_StatefulMode" json:"stateful_mode,omitempty"`
 	// Whether to always prefix the tool name using the target name
-	PrefixMode    MCPBackend_PrefixMode  `protobuf:"varint,4,opt,name=prefix_mode,json=prefixMode,proto3,enum=agentgateway.dev.resource.MCPBackend_PrefixMode" json:"prefix_mode,omitempty"`
-	FailureMode   MCPBackend_FailureMode `protobuf:"varint,5,opt,name=failure_mode,json=failureMode,proto3,enum=agentgateway.dev.resource.MCPBackend_FailureMode" json:"failure_mode,omitempty"`
+	PrefixMode MCPBackend_PrefixMode `protobuf:"varint,4,opt,name=prefix_mode,json=prefixMode,proto3,enum=agentgateway.dev.resource.MCPBackend_PrefixMode" json:"prefix_mode,omitempty"`
+	// Allow backend group initialization and runtime fanout to continue when
+	// some MCP targets fail.
+	AllowDegraded bool `protobuf:"varint,5,opt,name=allow_degraded,json=allowDegraded,proto3" json:"allow_degraded,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6007,11 +6009,11 @@ func (x *MCPBackend) GetPrefixMode() MCPBackend_PrefixMode {
 	return MCPBackend_CONDITIONAL
 }
 
-func (x *MCPBackend) GetFailureMode() MCPBackend_FailureMode {
+func (x *MCPBackend) GetAllowDegraded() bool {
 	if x != nil {
-		return x.FailureMode
+		return x.AllowDegraded
 	}
-	return MCPBackend_FAIL_CLOSED
+	return false
 }
 
 type MCPTarget struct {
@@ -11884,14 +11886,14 @@ const file_resource_proto_rawDesc = "" +
 	"\bproviderB\x10\n" +
 	"\x0e_path_override\x1a\\\n" +
 	"\rProviderGroup\x12K\n" +
-	"\tproviders\x18\x01 \x03(\v2-.agentgateway.dev.resource.AIBackend.ProviderR\tproviders\"\xd5\x03\n" +
+	"\tproviders\x18\x01 \x03(\v2-.agentgateway.dev.resource.AIBackend.ProviderR\tproviders\"\xf7\x02\n" +
 	"\n" +
 	"MCPBackend\x12>\n" +
 	"\atargets\x18\x02 \x03(\v2$.agentgateway.dev.resource.MCPTargetR\atargets\x12W\n" +
 	"\rstateful_mode\x18\x03 \x01(\x0e22.agentgateway.dev.resource.MCPBackend.StatefulModeR\fstatefulMode\x12Q\n" +
 	"\vprefix_mode\x18\x04 \x01(\x0e20.agentgateway.dev.resource.MCPBackend.PrefixModeR\n" +
-	"prefixMode\x12T\n" +
-	"\ffailure_mode\x18\x05 \x01(\x0e21.agentgateway.dev.resource.MCPBackend.FailureModeR\vfailureMode\"+\n" +
+	"prefixMode\x12%\n" +
+	"\x0eallow_degraded\x18\x05 \x01(\bR\rallowDegraded\"+\n" +
 	"\fStatefulMode\x12\f\n" +
 	"\bSTATEFUL\x10\x00\x12\r\n" +
 	"\tSTATELESS\x10\x01\")\n" +

@@ -4043,16 +4043,9 @@
             }
           ]
         },
-        "failureMode": {
-          "description": "Behavior when one or more MCP targets fail to initialize or fail during fanout.\nDefaults to `failClosed`.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FailureMode4"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "allowDegraded": {
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
@@ -6203,16 +6196,9 @@
             }
           ]
         },
-        "failureMode": {
-          "description": "Behavior when one or more MCP targets fail to initialize or fail during fanout.\nDefaults to `failClosed`.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FailureMode4"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "allowDegraded": {
+          "type": "boolean",
+          "default": false
         },
         "policies": {
           "anyOf": [

@@ -123,8 +123,8 @@ func (s *testingSuite) testUnauthorizedToolsListWithSession(sessionID string, ex
 
 	var toolsResp ToolsListResponse
 	s.Require().NoError(json.Unmarshal([]byte(payload), &toolsResp), "tools/list unmarshal failed")
-	if toolsResp.Error != nil && strings.Contains(toolsResp.Error.Message, "Session not found") {
-		// Re-init and retry once
+	if toolsResp.Error != nil && isRetryableToolsListError(toolsResp.Error.Message) {
+		// Re-init and retry once on retryable transient errors.
 		s.T().Log("Session expired; re-initializing and retrying tools/list")
 		newID := s.initializeAndGetSessionID(extraHeaders)
 		s.testToolsListWithSession(newID, extraHeaders)
@@ -210,11 +210,10 @@ func (s *testingSuite) sendMCP(match *testmatchers.HttpResponse, headers map[str
 }
 
 func (s *testingSuite) mcpCurlOptions(headers map[string]string, body string, extraArgs ...string) []curl.Option {
-	return mcpCurlOptionsWithPort(80, headers, body, extraArgs...)
+	return mcpCurlOptionsForGateway(headers, body, extraArgs...)
 }
 
-func mcpCurlOptionsWithPort(port int, headers map[string]string, body string, extraArgs ...string) []curl.Option {
-	_ = port
+func mcpCurlOptionsForGateway(headers map[string]string, body string, extraArgs ...string) []curl.Option {
 	timeoutSec := parseMaxTimeSeconds(extraArgs, 10)
 
 	opts := []curl.Option{
@@ -387,16 +386,36 @@ func (s *testingSuite) mustListTools(sessionID, label string, routeHeaders map[s
 	return names
 }
 
+var (
+	retryableToolsListSubstrings = []string{
+		"session not found",
+		"start sse client",
+	}
+	retryableInitializeSubstrings = []string{
+		"start sse client",
+		"all upstreams failed to respond to fanout",
+	}
+)
+
+func containsAnySubstring(message string, substrings []string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	if normalized == "" {
+		return false
+	}
+	for _, substring := range substrings {
+		if strings.Contains(normalized, substring) {
+			return true
+		}
+	}
+	return false
+}
+
 func isRetryableToolsListError(message string) bool {
-	lower := strings.ToLower(message)
-	return strings.Contains(lower, "session not found") ||
-		strings.Contains(lower, "start sse client")
+	return containsAnySubstring(message, retryableToolsListSubstrings)
 }
 
 func isRetryableInitializeError(message string) bool {
-	lower := strings.ToLower(message)
-	return strings.Contains(lower, "start sse client") ||
-		strings.Contains(lower, "all upstreams failed to respond to fanout")
+	return containsAnySubstring(message, retryableInitializeSubstrings)
 }
 
 func (s *testingSuite) notifyInitializedWithHeaders(sessionID string, routeHeaders map[string]string) {
@@ -410,7 +429,7 @@ func (s *testingSuite) notifyInitializedWithHeaders(sessionID string, routeHeade
 
 func (s *testingSuite) initializeSession(initBody string, hdr map[string]string, label string) string {
 	// One deterministic probe with retry to ensure the endpoint is ready
-	s.waitForMCP200(8080, hdr, initBody, label)
+	s.waitForMCP200(hdr, initBody, label)
 
 	backoffs := []time.Duration{
 		100 * time.Millisecond,
@@ -452,14 +471,13 @@ func (s *testingSuite) initializeSession(initBody string, hdr map[string]string,
 }
 
 func (s *testingSuite) waitForMCP200(
-	port int,
 	headers map[string]string,
 	body string,
 	label string,
 ) {
 	opts := append(
 		common.GatewayAddressOptions(common.BaseGateway.ResolvedAddress()),
-		mcpCurlOptionsWithPort(port, headers, body, "--max-time", "10")...,
+		mcpCurlOptionsForGateway(headers, body, "--max-time", "10")...,
 	)
 	common.BaseGateway.Send(s.T(), &testmatchers.HttpResponse{StatusCode: httpOKCode}, opts...)
 	s.T().Logf("%s init ready (status=%d)", label, httpOKCode)

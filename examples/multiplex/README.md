@@ -49,7 +49,7 @@ PORT=4201 npx -y @modelcontextprotocol/server-everything sse &
 In a second terminal:
 
 ```bash
-RUST_MIN_STACK=8388608 cargo run -- -f examples/multiplex/feature-test.yaml
+cargo run -- -f examples/multiplex/feature-test.yaml
 ```
 
 Then connect MCP Inspector to:

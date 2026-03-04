@@ -100,7 +100,7 @@ impl App {
 			McpBackendGroup {
 				targets: nt,
 				stateful: backend.stateful,
-				failure_mode: backend.failure_mode,
+				allow_degraded: backend.allow_degraded,
 			}
 		};
 		let sm = self.session.clone();
@@ -168,12 +168,11 @@ impl App {
 		}
 	}
 }
-
 #[derive(Debug, Clone)]
 pub struct McpBackendGroup {
 	pub targets: Vec<Arc<McpTarget>>,
 	pub stateful: bool,
-	pub failure_mode: FailureMode,
+	pub allow_degraded: bool,
 }
 
 #[derive(Debug)]

@@ -1191,9 +1191,7 @@ pub struct McpBackend {
 	pub targets: Vec<Arc<McpTarget>>,
 	pub stateful: bool,
 	pub always_use_prefix: bool,
-	/// Behavior when one or more MCP targets fail to initialize or fail during fanout.
-	/// Defaults to `failClosed`.
-	pub failure_mode: FailureMode,
+	pub allow_degraded: bool,
 }
 
 impl McpBackend {

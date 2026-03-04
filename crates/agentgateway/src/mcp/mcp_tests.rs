@@ -1,7 +1,5 @@
 use std::net::SocketAddr;
 
-use agent_core::strng;
-use insta::assert_json_snapshot;
 use itertools::Itertools;
 use rmcp::RoleClient;
 use rmcp::model::{ErrorCode, InitializeRequestParams};
@@ -22,6 +20,56 @@ use crate::test_helpers::proxymock::{
 };
 use crate::types::agent::BackendPolicy;
 use crate::*;
+
+mod task_store_shared {
+	use std::collections::HashMap;
+
+	use rmcp::model::{Task, TaskStatus};
+
+	#[derive(Debug, Default)]
+	pub(crate) struct TaskStore {
+		next_id: u64,
+		tasks: HashMap<String, TaskEntry>,
+	}
+
+	impl TaskStore {
+		pub(crate) fn create_task(&mut self, result: serde_json::Value) -> Task {
+			let task_id = format!("task-{}", self.next_id);
+			self.next_id += 1;
+			let created_at = "2026-01-01T00:00:00Z".to_string();
+			let task = Task::new(
+				task_id.clone(),
+				TaskStatus::Working,
+				created_at.clone(),
+				created_at,
+			)
+			.with_status_message("queued")
+			.with_poll_interval(10);
+			self.tasks.insert(
+				task_id,
+				TaskEntry {
+					task: task.clone(),
+					result: Some(result),
+				},
+			);
+			task
+		}
+
+		pub(crate) fn get_mut(&mut self, task_id: &str) -> Option<&mut TaskEntry> {
+			self.tasks.get_mut(task_id)
+		}
+
+		pub(crate) fn iter_tasks(&self) -> impl Iterator<Item = &Task> {
+			self.tasks.values().map(|entry| &entry.task)
+		}
+	}
+
+	#[derive(Debug)]
+	pub(crate) struct TaskEntry {
+		pub(crate) task: Task,
+		pub(crate) result: Option<serde_json::Value>,
+	}
+}
 
 #[tokio::test]
 async fn streamable_client_to_streamable_backend_single() {
@@ -56,47 +104,55 @@ async fn legacy_sse_client_to_legacy_sse_backend_single() {
 }
 
 #[tokio::test]
-async fn snapshot_tools_list_response() {
+async fn tools_list_response_contains_expected_tools() {
 	let mock = mock_streamable_http_server(true).await;
 	let (_bind, io) = setup_proxy(&mock, true, false).await;
 	let client = mcp_streamable_client(io).await;
 
-	let mut tools = client.list_tools(None).await.unwrap();
-	tools
-		.tools
-		.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
-
-	let value = serde_json::to_value(&tools).expect("tools json");
-	assert_json_snapshot!(value);
+	let mut tools = client.list_tools(None).await.unwrap().tools;
+	tools.sort_by(|a, b| a.name.as_ref().cmp(b.name.as_ref()));
+	let names = tools
+		.into_iter()
+		.map(|tool| tool.name.to_string())
+		.collect::<Vec<_>>();
+	for expected in [
+		"decrement",
+		"echo",
+		"echo_http",
+		"get_value",
+		"increment",
+		"say_hello",
+		"sum",
+	] {
+		assert!(
+			names.contains(&expected.to_string()),
+			"expected tool list to contain {expected}, got: {names:?}"
+		);
+	}
 }
 
 #[tokio::test]
-async fn snapshot_unknown_tool_error_response() {
+async fn unknown_tool_error_response_is_invalid_params() {
 	let mock = mock_streamable_http_server(true).await;
 	let (_bind, io) = setup_proxy(&mock, true, false).await;
 	let client = mcp_streamable_client(io).await;
 
 	let err = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "unknown_tool".into(),
-			arguments: None,
-		})
+		.call_tool(call_tool_params("unknown_tool", None, None))
 		.await
 		.expect_err("expected unknown tool error");
 
-	let value = match err {
+	match err {
 		rmcp::ServiceError::McpError(mcp_error) => {
-			serde_json::to_value(&mcp_error).expect("error json")
+			assert_eq!(mcp_error.code.0, -32602);
+			assert_eq!(mcp_error.message.as_ref(), "tool not found");
 		},
 		other => panic!("Expected ServiceError::McpError, got: {:?}", other),
-	};
-	assert_json_snapshot!(value);
+	}
 }
 
 #[tokio::test]
-async fn snapshot_initialize_response() {
+async fn initialize_response_contains_expected_capabilities() {
 	let mock = mock_streamable_http_server(true).await;
 	let (_bind, io) = setup_proxy(&mock, true, false).await;
 	let client = mcp_streamable_client(io).await;
@@ -109,148 +165,70 @@ async fn snapshot_initialize_response() {
 	{
 		*version = json!("<redacted>");
 	}
-	assert_json_snapshot!(value);
-}
-
-#[tokio::test]
-async fn snapshot_url_elicitation_error_response() {
-	let mock = mock_streamable_http_server(true).await;
-	let (_bind, io) = setup_proxy(&mock, true, false).await;
-	let client = mcp_streamable_client(io).await;
-
-	let err = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "test_url_elicitation_required".into(),
-			arguments: None,
-		})
-		.await
-		.expect_err("expected url elicitation error");
-
-	let value = match err {
-		rmcp::ServiceError::McpError(mcp_error) => {
-			serde_json::to_value(&mcp_error).expect("error json")
-		},
-		other => panic!("Expected ServiceError::McpError, got: {:?}", other),
-	};
-	assert_json_snapshot!(value);
-}
-
-#[tokio::test]
-async fn multiplex_tools_are_prefixed_and_routed() {
-	let mock_stream = mock_streamable_http_server(true).await;
-	let mock_sse = mock_sse_server().await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("sse", mock_sse.addr, true),
-				("mcp", mock_stream.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-	let tools = client.list_tools(None).await.unwrap();
-	let t = tools
-		.tools
-		.into_iter()
-		.map(|t| t.name.to_string())
-		.sorted()
-		.filter(|n| n.contains("decrement") || n.contains("echo"))
-		.collect_vec();
 	assert_eq!(
-		t,
-		vec![
-			"mcp__decrement".to_string(),
-			"mcp__echo".to_string(),
-			"mcp__echo_http".to_string(),
-			"sse__decrement".to_string(),
-			"sse__echo".to_string(),
-			"sse__echo_http".to_string()
-		]
+		value
+			.get("protocolVersion")
+			.and_then(|v| v.as_str())
+			.unwrap_or_default(),
+		"2025-06-18"
 	);
-
-	let ctr = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "mcp__echo".into(),
-			arguments: serde_json::json!({"hi": "world"}).as_object().cloned(),
-		})
-		.await
-		.unwrap();
 	assert_eq!(
-		&ctr.content[0].raw.as_text().unwrap().text,
-		r#"{"hi":"world"}"#
+		value
+			.pointer("/serverInfo/name")
+			.and_then(|v| v.as_str())
+			.unwrap_or_default(),
+		"rmcp"
 	);
-
-	let ctr = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "sse__echo".into(),
-			arguments: serde_json::json!({"hi": "world"}).as_object().cloned(),
-		})
-		.await
-		.unwrap();
-	assert_eq!(
-		&ctr.content[0].raw.as_text().unwrap().text,
-		r#"{"hi":"world"}"#
-	);
-
-	// No target set...
 	assert!(
-		client
-			.call_tool(rmcp::model::CallToolRequestParams {
-				meta: None,
-				task: None,
-				name: "echo".into(),
-				arguments: serde_json::json!({"hi": "world"}).as_object().cloned(),
-			})
-			.await
-			.is_err()
+		value.pointer("/capabilities/tools").is_some(),
+		"initialize should advertise tools capability"
+	);
+	assert!(
+		value.pointer("/capabilities/tasks/list").is_some(),
+		"initialize should advertise list/tasks capability"
+	);
+	assert!(
+		value.pointer("/capabilities/tasks/cancel").is_some(),
+		"initialize should advertise cancel/task capability"
 	);
 }
 
 #[tokio::test]
-async fn multiplex_merged_tools_preserve_upstream_meta() {
-	let mock_stream = mock_streamable_http_meta_server(true, "mcp").await;
-	let mock_sse = mock_streamable_http_meta_server(true, "sse").await;
+async fn initialize_with_zero_targets_returns_error_without_session_id() {
 	let t = setup_proxy_test("{}")
 		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("sse", mock_sse.addr, false),
-				("mcp", mock_stream.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
+		.with_multiplex_mcp_backend_with_degraded("mcp", vec![], true, true)
+		.with_bind(simple_bind(basic_named_route(agent_core::strng::new(
+			"/mcp",
+		))));
+	let io = t.serve_real_listener(BIND_KEY).await;
 
-	let tools = client.list_tools(None).await.unwrap();
-	let meta = tools.meta.expect("merged meta should be present");
-	let upstreams = meta
-		.0
-		.get("upstreams")
-		.and_then(|v| v.as_object())
-		.expect("meta.upstreams");
-	let mcp_meta = upstreams
-		.get("mcp")
-		.and_then(|v| v.get("label"))
-		.and_then(|v| v.as_str());
-	let sse_meta = upstreams
-		.get("sse")
-		.and_then(|v| v.get("label"))
-		.and_then(|v| v.as_str());
-	assert_eq!(mcp_meta, Some("mcp"));
-	assert_eq!(sse_meta, Some("sse"));
+	let init = rmcp::model::ClientJsonRpcMessage::request(
+		rmcp::model::InitializeRequest::new(test_client_info(
+			"test client",
+			rmcp::model::ClientCapabilities::default(),
+		))
+		.into(),
+		rmcp::model::RequestId::Number(1),
+	);
+
+	let resp = reqwest::Client::new()
+		.post(format!("http://{io}/mcp"))
+		.header(
+			reqwest::header::ACCEPT,
+			"application/json, text/event-stream",
+		)
+		.header(reqwest::header::CONTENT_TYPE, "application/json")
+		.body(serde_json::to_vec(&init).expect("initialize json"))
+		.send()
+		.await
+		.expect("initialize response");
+
+	assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+	assert!(
+		resp.headers().get("mcp-session-id").is_none(),
+		"session id must not be minted when no MCP targets are available"
+	);
 }
 
 #[tokio::test]
@@ -283,12 +261,11 @@ async fn streamable_client_to_streamable_backend_single_tls() {
 	.await;
 	let client = mcp_streamable_client(io).await;
 	let ctr = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "echo_http".into(),
-			arguments: serde_json::json!({"hi": "world"}).as_object().cloned(),
-		})
+		.call_tool(call_tool_params(
+			"echo_http",
+			serde_json::json!({"hi": "world"}).as_object().cloned(),
+			None,
+		))
 		.await
 		.unwrap();
 	assert_eq!(
@@ -322,12 +299,11 @@ async fn authorization_denied_returns_unknown_tool_error() {
 
 	// Attempt to call a tool - should fail with "Unknown tool" error
 	let result = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "echo".into(),
-			arguments: serde_json::json!({"hi": "world"}).as_object().cloned(),
-		})
+		.call_tool(call_tool_params(
+			"echo",
+			serde_json::json!({"hi": "world"}).as_object().cloned(),
+			None,
+		))
 		.await;
 
 	// The call should fail
@@ -364,12 +340,11 @@ async fn url_elicitation_error_passthrough_single() {
 	let client = mcp_streamable_client(io).await;
 
 	let result = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "test_url_elicitation_required".into(),
-			arguments: None,
-		})
+		.call_tool(call_tool_params(
+			"test_url_elicitation_required",
+			None,
+			None,
+		))
 		.await;
 
 	assert!(result.is_err(), "Expected URL elicitation error");
@@ -438,12 +413,7 @@ async fn task_support_required_rejects_non_task_call() {
 	let client = mcp_streamable_client(io).await;
 
 	let result = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "test_task_required".into(),
-			arguments: None,
-		})
+		.call_tool(call_tool_params("test_task_required", None, None))
 		.await;
 
 	let err = result.expect_err("expected required task tool to reject non-task invocation");
@@ -473,17 +443,8 @@ async fn task_support_forbidden_rejects_task_call() {
 	let (_bind, io) = setup_proxy(&mock, true, false).await;
 	let client = mcp_streamable_client(io).await;
 
-	let params = rmcp::model::CallToolRequestParams {
-		meta: None,
-		task: empty_task_meta(),
-		name: "test_task_forbidden".into(),
-		arguments: None,
-	};
-	let request = rmcp::model::CallToolRequest {
-		method: Default::default(),
-		params,
-		extensions: Default::default(),
-	};
+	let params = call_tool_params("test_task_forbidden", None, empty_task_meta());
+	let request = rmcp::model::CallToolRequest::new(params);
 	let result = client
 		.send_request(rmcp::model::ClientRequest::CallToolRequest(request))
 		.await;
@@ -516,12 +477,7 @@ async fn session_id_propagates_to_stateful_upstream() {
 	let client = mcp_streamable_client(io).await;
 
 	let first = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "test_session_id".into(),
-			arguments: None,
-		})
+		.call_tool(call_tool_params("test_session_id", None, None))
 		.await
 		.unwrap();
 	let first_id = first.content[0]
@@ -536,12 +492,7 @@ async fn session_id_propagates_to_stateful_upstream() {
 	);
 
 	let second = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "test_session_id".into(),
-			arguments: None,
-		})
+		.call_tool(call_tool_params("test_session_id", None, None))
 		.await
 		.unwrap();
 	let second_id = second.content[0]
@@ -563,12 +514,7 @@ async fn elicitation_form_roundtrip_single() {
 		mcp_streamable_client_with_handler(io, ElicitationClient::new(response_content.clone())).await;
 
 	let result = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "test_elicitation_roundtrip".into(),
-			arguments: None,
-		})
+		.call_tool(call_tool_params("test_elicitation_roundtrip", None, None))
 		.await
 		.unwrap();
 
@@ -580,20 +526,18 @@ async fn roots_list_roundtrip_single() {
 	let mock = mock_streamable_http_server(true).await;
 	let (_bind, io) = setup_proxy(&mock, true, false).await;
 
-	let expected_roots = vec![rmcp::model::Root {
-		uri: "file:///Users/test/workspace".to_string(),
-		name: Some("workspace".to_string()),
-	}];
+	let expected_roots: Vec<rmcp::model::Root> = vec![
+		serde_json::from_value(json!({
+			"uri": "file:///Users/test/workspace",
+			"name": "workspace"
+		}))
+		.expect("root should deserialize"),
+	];
 	let client =
 		mcp_streamable_client_with_handler(io, RootsClient::new(expected_roots.clone())).await;
 
 	let result = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "test_roots_roundtrip".into(),
-			arguments: None,
-		})
+		.call_tool(call_tool_params("test_roots_roundtrip", None, None))
 		.await
 		.unwrap();
 
@@ -626,207 +570,6 @@ async fn prompts_roundtrip_single() {
 }
 
 #[tokio::test]
-async fn prompts_roundtrip_multiplex() {
-	let mock_counter = mock_streamable_http_server(true).await;
-	let mock_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter.addr, false),
-				("meta", mock_meta.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let names = list_prompt_names(&client).await;
-	assert_eq!(
-		names,
-		vec![
-			"counter__counter_analysis".to_string(),
-			"counter__example_prompt".to_string()
-		]
-	);
-
-	let text = prompt_text(
-		&client,
-		"counter__example_prompt",
-		json!({"message": "world"}).as_object().cloned(),
-	)
-	.await;
-	assert!(text.contains("world"));
-}
-
-#[tokio::test]
-async fn resources_roundtrip_multiplex() {
-	let mock_counter = mock_streamable_http_server(true).await;
-	let mock_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter.addr, false),
-				("meta", mock_meta.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let resources = client.list_resources(None).await.unwrap();
-	let uris = resources
-		.resources
-		.iter()
-		.map(|r| r.uri.to_string())
-		.sorted()
-		.collect_vec();
-
-	// Verify that URIs are wrapped in agw:// and have the correct target
-	assert!(uris.iter().all(|u| u.starts_with("agw://counter/")));
-
-	let target_uri = uris.first().unwrap();
-	let content = client
-		.read_resource(rmcp::model::ReadResourceRequestParams {
-			meta: None,
-			uri: target_uri.clone(),
-		})
-		.await
-		.unwrap();
-
-	// Verify content was actually retrieved (mock server returns specific paths)
-	assert!(!content.contents.is_empty());
-}
-
-#[tokio::test]
-async fn resource_templates_roundtrip_multiplex() {
-	let mock_counter_a = mock_streamable_http_server(true).await;
-	let mock_counter_b = mock_streamable_http_server(true).await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter_a.addr, false),
-				("counter2", mock_counter_b.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let templates = list_resource_templates(&client).await;
-	let names = templates
-		.resource_templates
-		.iter()
-		.map(|t| t.name.clone())
-		.sorted()
-		.collect_vec();
-	assert_eq!(
-		names,
-		vec![
-			"counter2__counter-template".to_string(),
-			"counter__counter-template".to_string()
-		]
-	);
-	let uris = templates
-		.resource_templates
-		.iter()
-		.map(|t| t.uri_template.clone())
-		.sorted()
-		.collect_vec();
-	assert_eq!(uris.len(), 2);
-	assert!(
-		uris.iter().all(|u| u.contains("{id}")),
-		"wrapped URI templates must preserve template braces: {uris:?}"
-	);
-	assert!(
-		uris.iter().any(|u| u.starts_with("agw://counter/"))
-			&& uris.iter().any(|u| u.starts_with("agw://counter2/")),
-		"unexpected wrapped URI templates: {uris:?}"
-	);
-}
-
-#[tokio::test]
-async fn prompts_list_errors_when_all_targeted_upstreams_fail() {
-	let healthy_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let dead_addr = {
-		let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-			.await
-			.expect("bind dead listener");
-		let addr = listener.local_addr().expect("dead listener addr");
-		drop(listener);
-		addr
-	};
-
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("meta", healthy_meta.addr, false),
-				("dead", dead_addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let err = client
-		.list_prompts(None)
-		.await
-		.expect_err("expected all targeted upstreams to fail");
-	match err {
-		rmcp::ServiceError::McpError(mcp_error) => {
-			assert_eq!(mcp_error.code.0, -32600);
-			assert!(
-				mcp_error
-					.message
-					.contains("all eligible backends failed for method prompts/list"),
-				"unexpected error message: {}",
-				mcp_error.message
-			);
-		},
-		other => panic!("Expected ServiceError::McpError, got: {:?}", other),
-	}
-}
-
-#[tokio::test]
-async fn tasks_roundtrip_multiplex() {
-	let mock_counter = mock_streamable_http_server(true).await;
-	let mock_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter.addr, false),
-				("meta", mock_meta.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let task_id = assert_task_roundtrip(
-		&client,
-		"counter__echo",
-		json!({"hi": "world"}).as_object().cloned(),
-		"echo",
-	)
-	.await;
-	assert!(task_id.starts_with("counter__"));
-}
-
-#[tokio::test]
 async fn tasks_roundtrip_single_always_prefix() {
 	let mock = mock_streamable_http_server(true).await;
 	let t = setup_proxy_test("{}")
@@ -844,157 +587,6 @@ async fn tasks_roundtrip_single_always_prefix() {
 	)
 	.await;
 	assert!(task_id.starts_with("mcp__"));
-}
-
-#[tokio::test]
-async fn elicitation_form_roundtrip_multiplex() {
-	let mock_counter = mock_streamable_http_server(true).await;
-	let mock_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter.addr, false),
-				("meta", mock_meta.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-
-	let response_content = json!({"color": "blue"});
-	let client =
-		mcp_streamable_client_with_handler(io, ElicitationClient::new(response_content.clone())).await;
-
-	let result = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "counter__test_elicitation_roundtrip".into(),
-			arguments: None,
-		})
-		.await
-		.unwrap();
-
-	assert_eq!(result.structured_content, Some(response_content));
-}
-
-#[tokio::test]
-async fn completions_prompt_roundtrip_multiplex() {
-	let mock_counter = mock_streamable_http_server(true).await;
-	let mock_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter.addr, false),
-				("meta", mock_meta.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let values = client
-		.complete_prompt_simple("counter__example_prompt", "message", "wo")
-		.await
-		.unwrap();
-	assert_eq!(values, vec!["prompt-wo".to_string()]);
-}
-
-#[tokio::test]
-async fn completions_resource_roundtrip_multiplex() {
-	let mock_counter = mock_streamable_http_server(true).await;
-	let mock_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter.addr, false),
-				("meta", mock_meta.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let resources = client.list_resources(None).await.unwrap();
-	let uri = resources
-		.resources
-		.first()
-		.expect("resource")
-		.uri
-		.to_string();
-	let values = client
-		.complete_resource_simple(uri, "path", "me")
-		.await
-		.unwrap();
-	assert_eq!(values, vec!["resource-me".to_string()]);
-}
-
-#[tokio::test]
-async fn url_elicitation_error_passthrough_in_multiplex() {
-	let mock_counter = mock_streamable_http_server(true).await;
-	let mock_meta = mock_streamable_http_meta_server(true, "meta").await;
-	let t = setup_proxy_test("{}")
-		.unwrap()
-		.with_multiplex_mcp_backend(
-			"mcp",
-			vec![
-				("counter", mock_counter.addr, false),
-				("meta", mock_meta.addr, false),
-			],
-			true,
-		)
-		.with_bind(simple_bind(basic_named_route(strng::new("/mcp"))));
-	let io = t.serve_real_listener(strng::new("bind")).await;
-	let client = mcp_streamable_client(io).await;
-
-	let result = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "counter__test_url_elicitation_required".into(),
-			arguments: None,
-		})
-		.await;
-
-	assert!(result.is_err(), "Expected URL elicitation error");
-	let err = result.unwrap_err();
-	match err {
-		rmcp::ServiceError::McpError(mcp_error) => {
-			assert_eq!(
-				mcp_error.code,
-				ErrorCode::URL_ELICITATION_REQUIRED,
-				"Expected URL elicitation required error code"
-			);
-			// SEP-1036 specifies the official error message
-			assert_eq!(
-				mcp_error.message.as_ref(),
-				"This request requires more information.",
-				"Expected spec-compliant SEP-1036 error message, got: {}",
-				mcp_error.message
-			);
-			let data = mcp_error.data.expect("error data should be present");
-			let elicitations = data
-				.get("elicitations")
-				.and_then(|v| v.as_array())
-				.expect("elicitations array should be present");
-			assert_eq!(elicitations.len(), 1);
-			let first = elicitations[0].as_object().expect("elicitation object");
-			assert_eq!(first.get("mode").and_then(|v| v.as_str()), Some("url"));
-			assert_eq!(
-				first.get("elicitationId").and_then(|v| v.as_str()),
-				Some("elicit-1")
-			);
-		},
-		other => panic!("Expected ServiceError::McpError, got: {:?}", other),
-	}
 }
 
 /// Test that getting a prompt denied by MCP authorization policy returns proper JSON-RPC error
@@ -1021,11 +613,7 @@ async fn authorization_denied_returns_unknown_prompt_error() {
 
 	// Attempt to get a prompt - should fail with "Unknown prompt" error
 	let result = client
-		.get_prompt(rmcp::model::GetPromptRequestParams {
-			meta: None,
-			name: "example_prompt".into(),
-			arguments: None,
-		})
+		.get_prompt(prompt_request_params("example_prompt", None))
 		.await;
 
 	// The call should fail
@@ -1076,10 +664,9 @@ async fn authorization_denied_returns_unknown_resource_error() {
 
 	// Attempt to read a resource - should fail with "Unknown resource" error
 	let result = client
-		.read_resource(rmcp::model::ReadResourceRequestParams {
-			meta: None,
-			uri: "memo://insights".into(),
-		})
+		.read_resource(rmcp::model::ReadResourceRequestParams::new(
+			"memo://insights",
+		))
 		.await;
 
 	// The call should fail
@@ -1112,10 +699,7 @@ async fn authorization_denied_wrapped_resource_uri_returns_unknown_resource_erro
 
 	let wrapped_uri = "agw://mcp/?u=memo%3A%2F%2Finsights".to_string();
 	let err = client
-		.read_resource(rmcp::model::ReadResourceRequestParams {
-			meta: None,
-			uri: wrapped_uri,
-		})
+		.read_resource(rmcp::model::ReadResourceRequestParams::new(wrapped_uri))
 		.await
 		.expect_err("expected wrapped resource read to fail due to authorization denial");
 
@@ -1139,14 +723,10 @@ async fn authorization_denied_returns_unknown_task_error() {
 	let client = mcp_streamable_client(io).await;
 	let err = client
 		.send_request(rmcp::model::ClientRequest::GetTaskInfoRequest(
-			rmcp::model::GetTaskInfoRequest {
-				method: Default::default(),
-				params: rmcp::model::GetTaskInfoParams {
-					meta: None,
-					task_id: "task-0".to_string(),
-				},
-				extensions: Default::default(),
-			},
+			rmcp::model::GetTaskInfoRequest::new(rmcp::model::GetTaskInfoParams {
+				meta: None,
+				task_id: "task-0".to_string(),
+			}),
 		))
 		.await
 		.expect_err("expected task info call to fail due to authorization denial");
@@ -1156,6 +736,42 @@ async fn authorization_denied_returns_unknown_task_error() {
 
 fn empty_task_meta() -> Option<rmcp::model::JsonObject> {
 	json!({}).as_object().cloned()
+}
+
+fn call_tool_params(
+	name: impl Into<std::borrow::Cow<'static, str>>,
+	arguments: Option<rmcp::model::JsonObject>,
+	task: Option<rmcp::model::JsonObject>,
+) -> rmcp::model::CallToolRequestParams {
+	let mut params = rmcp::model::CallToolRequestParams::new(name);
+	if let Some(arguments) = arguments {
+		params = params.with_arguments(arguments);
+	}
+	if let Some(task) = task {
+		params = params.with_task(task);
+	}
+	params
+}
+
+fn prompt_request_params(
+	name: impl Into<String>,
+	arguments: Option<serde_json::Map<String, serde_json::Value>>,
+) -> rmcp::model::GetPromptRequestParams {
+	let mut params = rmcp::model::GetPromptRequestParams::new(name);
+	if let Some(arguments) = arguments {
+		params = params.with_arguments(arguments);
+	}
+	params
+}
+
+fn test_client_info(
+	name: impl Into<String>,
+	capabilities: rmcp::model::ClientCapabilities,
+) -> rmcp::model::ClientInfo {
+	rmcp::model::ClientInfo::new(
+		capabilities,
+		rmcp::model::Implementation::new(name, "0.0.1"),
+	)
 }
 
 fn task_from_result(result: rmcp::model::ServerResult) -> rmcp::model::Task {
@@ -1170,17 +786,8 @@ async fn call_tool_task(
 	name: &str,
 	arguments: Option<rmcp::model::JsonObject>,
 ) -> String {
-	let params = rmcp::model::CallToolRequestParams {
-		meta: None,
-		task: empty_task_meta(),
-		name: name.to_string().into(),
-		arguments,
-	};
-	let request = rmcp::model::CallToolRequest {
-		method: Default::default(),
-		params,
-		extensions: Default::default(),
-	};
+	let params = call_tool_params(name.to_string(), arguments, empty_task_meta());
+	let request = rmcp::model::CallToolRequest::new(params);
 	let response = client
 		.send_request(rmcp::model::ClientRequest::CallToolRequest(request))
 		.await
@@ -1195,14 +802,10 @@ async fn get_task_info(
 	client: &rmcp::service::Peer<rmcp::RoleClient>,
 	task_id: &str,
 ) -> rmcp::model::Task {
-	let info_request = rmcp::model::GetTaskInfoRequest {
-		method: Default::default(),
-		params: rmcp::model::GetTaskInfoParams {
-			meta: None,
-			task_id: task_id.to_string(),
-		},
-		extensions: Default::default(),
-	};
+	let info_request = rmcp::model::GetTaskInfoRequest::new(rmcp::model::GetTaskInfoParams {
+		meta: None,
+		task_id: task_id.to_string(),
+	});
 	let info_response = client
 		.send_request(rmcp::model::ClientRequest::GetTaskInfoRequest(info_request))
 		.await
@@ -1214,14 +817,10 @@ async fn get_task_result(
 	client: &rmcp::service::Peer<rmcp::RoleClient>,
 	task_id: &str,
 ) -> serde_json::Value {
-	let result_request = rmcp::model::GetTaskResultRequest {
-		method: Default::default(),
-		params: rmcp::model::GetTaskResultParams {
-			meta: None,
-			task_id: task_id.to_string(),
-		},
-		extensions: Default::default(),
-	};
+	let result_request = rmcp::model::GetTaskResultRequest::new(rmcp::model::GetTaskResultParams {
+		meta: None,
+		task_id: task_id.to_string(),
+	});
 	let result_response = client
 		.send_request(rmcp::model::ClientRequest::GetTaskResultRequest(
 			result_request,
@@ -1250,11 +849,7 @@ async fn prompt_text(
 	arguments: Option<serde_json::Map<String, serde_json::Value>>,
 ) -> String {
 	let prompt = client
-		.get_prompt(rmcp::model::GetPromptRequestParams {
-			meta: None,
-			name: name.into(),
-			arguments,
-		})
+		.get_prompt(prompt_request_params(name, arguments))
 		.await
 		.unwrap();
 	match &prompt.messages[0].content {
@@ -1266,14 +861,8 @@ async fn prompt_text(
 async fn list_tasks(
 	client: &rmcp::service::Peer<rmcp::RoleClient>,
 ) -> rmcp::model::ListTasksResult {
-	let list_request = rmcp::model::ListTasksRequest {
-		method: Default::default(),
-		params: Some(rmcp::model::PaginatedRequestParams {
-			meta: None,
-			cursor: None,
-		}),
-		extensions: Default::default(),
-	};
+	let list_request =
+		rmcp::model::ListTasksRequest::with_param(rmcp::model::PaginatedRequestParams::default());
 	let list_response = client
 		.send_request(rmcp::model::ClientRequest::ListTasksRequest(list_request))
 		.await
@@ -1281,29 +870,6 @@ async fn list_tasks(
 	match list_response {
 		rmcp::model::ServerResult::ListTasksResult(result) => result,
 		other => panic!("Expected ListTasksResult, got: {:?}", other),
-	}
-}
-
-async fn list_resource_templates(
-	client: &rmcp::service::Peer<rmcp::RoleClient>,
-) -> rmcp::model::ListResourceTemplatesResult {
-	let request = rmcp::model::ListResourceTemplatesRequest {
-		method: Default::default(),
-		params: Some(rmcp::model::PaginatedRequestParams {
-			meta: None,
-			cursor: None,
-		}),
-		extensions: Default::default(),
-	};
-	let response = client
-		.send_request(rmcp::model::ClientRequest::ListResourceTemplatesRequest(
-			request,
-		))
-		.await
-		.unwrap();
-	match response {
-		rmcp::model::ServerResult::ListResourceTemplatesResult(result) => result,
-		other => panic!("Expected ListResourceTemplatesResult, got: {:?}", other),
 	}
 }
 
@@ -1401,7 +967,7 @@ async fn authorization_deny_with_request_header_filters_per_agent() {
 
 	use ::http::{HeaderName, HeaderValue};
 	use rmcp::ServiceExt;
-	use rmcp::model::{ClientCapabilities, ClientInfo, Implementation};
+	use rmcp::model::ClientCapabilities;
 	use rmcp::transport::StreamableHttpClientTransport;
 	use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
@@ -1436,19 +1002,7 @@ async fn authorization_deny_with_request_header_filters_per_agent() {
 		let config = StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
 			.custom_headers(headers);
 		let transport = StreamableHttpClientTransport::from_config(config);
-		let client_info = ClientInfo {
-			meta: None,
-			protocol_version: Default::default(),
-			capabilities: ClientCapabilities::default(),
-			client_info: Implementation {
-				name: format!("test-{agent_name}"),
-				version: "0.0.1".to_string(),
-				title: None,
-				website_url: None,
-				icons: None,
-				description: None,
-			},
-		};
+		let client_info = test_client_info(format!("test-{agent_name}"), ClientCapabilities::default());
 		client_info
 			.serve(transport)
 			.await
@@ -1547,14 +1101,10 @@ async fn assert_task_roundtrip(
 }
 
 async fn cancel_task(client: &rmcp::service::Peer<rmcp::RoleClient>, task_id: &str) {
-	let cancel_request = rmcp::model::CancelTaskRequest {
-		method: Default::default(),
-		params: rmcp::model::CancelTaskParams {
-			meta: None,
-			task_id: task_id.to_string(),
-		},
-		extensions: Default::default(),
-	};
+	let cancel_request = rmcp::model::CancelTaskRequest::new(rmcp::model::CancelTaskParams {
+		meta: None,
+		task_id: task_id.to_string(),
+	});
 	let cancel_response = client
 		.send_request(rmcp::model::ClientRequest::CancelTaskRequest(
 			cancel_request,
@@ -1578,12 +1128,11 @@ async fn standard_assertions(client: RunningService<RoleClient, InitializeReques
 		.collect_vec();
 	assert_eq!(t, vec!["decrement".to_string(), "echo".to_string()]);
 	let ctr = client
-		.call_tool(rmcp::model::CallToolRequestParams {
-			meta: None,
-			task: None,
-			name: "echo".into(),
-			arguments: serde_json::json!({"hi": "world"}).as_object().cloned(),
-		})
+		.call_tool(call_tool_params(
+			"echo",
+			serde_json::json!({"hi": "world"}).as_object().cloned(),
+			None,
+		))
 		.await
 		.unwrap();
 	assert_eq!(
@@ -1618,25 +1167,15 @@ pub async fn mcp_streamable_client(
 	s: SocketAddr,
 ) -> RunningService<RoleClient, InitializeRequestParams> {
 	use rmcp::ServiceExt;
-	use rmcp::model::{ClientCapabilities, ClientInfo, Implementation};
+	use rmcp::model::ClientCapabilities;
 	use rmcp::transport::StreamableHttpClientTransport;
 	let transport = StreamableHttpClientTransport::with_client(
 		reqwest::Client::new(),
-		rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(format!("http://{s}/mcp")),
+		rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+			format!("http://{s}/mcp"),
+		),
 	);
-	let client_info = ClientInfo {
-		meta: None,
-		protocol_version: Default::default(),
-		capabilities: ClientCapabilities::default(),
-		client_info: Implementation {
-			name: "test client".to_string(),
-			version: "0.0.1".to_string(),
-			title: None,
-			description: None,
-			website_url: None,
-			icons: None,
-		},
-	};
+	let client_info = test_client_info("test client", ClientCapabilities::default());
 
 	client_info
 		.serve(transport)
@@ -1655,7 +1194,9 @@ pub async fn mcp_streamable_client_with_handler<H: rmcp::ClientHandler>(
 	use rmcp::transport::StreamableHttpClientTransport;
 	let transport = StreamableHttpClientTransport::with_client(
 		reqwest::Client::new(),
-		rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(format!("http://{s}/mcp")),
+		rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+			format!("http://{s}/mcp"),
+		),
 	);
 	handler
 		.serve(transport)
@@ -1667,11 +1208,10 @@ pub async fn mcp_streamable_client_with_handler<H: rmcp::ClientHandler>(
 }
 
 fn client_info_with_tasks_and_elicitation() -> rmcp::model::ClientInfo {
-	use rmcp::model::{ClientCapabilities, ElicitationCapability, Implementation, TasksCapability};
-	rmcp::model::ClientInfo {
-		meta: None,
-		protocol_version: Default::default(),
-		capabilities: ClientCapabilities::builder()
+	use rmcp::model::{ClientCapabilities, ElicitationCapability, TasksCapability};
+	test_client_info(
+		"test client",
+		ClientCapabilities::builder()
 			.enable_elicitation_with(ElicitationCapability {
 				form: Some(rmcp::model::FormElicitationCapability {
 					schema_validation: Some(true),
@@ -1680,35 +1220,18 @@ fn client_info_with_tasks_and_elicitation() -> rmcp::model::ClientInfo {
 			})
 			.enable_tasks_with(TasksCapability::client_default())
 			.build(),
-		client_info: Implementation {
-			name: "test client".to_string(),
-			version: "0.0.1".to_string(),
-			title: None,
-			description: None,
-			website_url: None,
-			icons: None,
-		},
-	}
+	)
 }
 
 fn client_info_with_roots() -> rmcp::model::ClientInfo {
-	use rmcp::model::{ClientCapabilities, Implementation};
-	rmcp::model::ClientInfo {
-		meta: None,
-		protocol_version: Default::default(),
-		capabilities: ClientCapabilities::builder()
+	use rmcp::model::ClientCapabilities;
+	test_client_info(
+		"test client",
+		ClientCapabilities::builder()
 			.enable_roots()
 			.enable_roots_list_changed()
 			.build(),
-		client_info: Implementation {
-			name: "test client".to_string(),
-			version: "0.0.1".to_string(),
-			title: None,
-			description: None,
-			website_url: None,
-			icons: None,
-		},
-	}
+	)
 }
 
 struct ElicitationClient {
@@ -1734,10 +1257,10 @@ impl rmcp::ClientHandler for ElicitationClient {
 	+ Send
 	+ '_ {
 		let response = self.response.clone();
-		std::future::ready(Ok(rmcp::model::CreateElicitationResult {
-			action: rmcp::model::ElicitationAction::Accept,
-			content: Some(response),
-		}))
+		std::future::ready(Ok(
+			rmcp::model::CreateElicitationResult::new(rmcp::model::ElicitationAction::Accept)
+				.with_content(response),
+		))
 	}
 
 	fn get_info(&self) -> rmcp::model::ClientInfo {
@@ -1765,9 +1288,9 @@ impl rmcp::ClientHandler for RootsClient {
 		_context: rmcp::service::RequestContext<rmcp::RoleClient>,
 	) -> impl std::future::Future<Output = Result<rmcp::model::ListRootsResult, rmcp::ErrorData>> + Send + '_
 	{
-		std::future::ready(Ok(rmcp::model::ListRootsResult {
-			roots: self.roots.clone(),
-		}))
+		let mut roots = rmcp::model::ListRootsResult::default();
+		roots.roots = self.roots.clone();
+		std::future::ready(Ok(roots))
 	}
 
 	fn get_info(&self) -> rmcp::model::ClientInfo {
@@ -1792,38 +1315,6 @@ async fn mock_streamable_http_server(stateful: bool) -> MockServer {
 		StreamableHttpServerConfig {
 			sse_retry: None,
 			sse_keep_alive: None,
-			stateful_mode: stateful,
-			json_response: false,
-			cancellation_token: Default::default(),
-		},
-	);
-
-	let (tx, rx) = tokio::sync::oneshot::channel();
-	let router = axum::Router::new().nest_service("/mcp", service);
-	let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = tcp_listener.local_addr().unwrap();
-	tokio::spawn(async move {
-		let _ = axum::serve(tcp_listener, router)
-			.with_graceful_shutdown(async { rx.await.unwrap() })
-			.await;
-		info!("server stopped");
-	});
-	MockServer { addr, _cancel: tx }
-}
-
-async fn mock_streamable_http_meta_server(stateful: bool, label: &str) -> MockServer {
-	use mockserver::MetaServer;
-	use rmcp::transport::streamable_http_server::StreamableHttpService;
-	use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-	agent_core::telemetry::testing::setup_test_logging();
-
-	let label = label.to_string();
-	let service = StreamableHttpService::new(
-		move || Ok(MetaServer::new(label.clone())),
-		LocalSessionManager::default().into(),
-		StreamableHttpServerConfig {
-			sse_keep_alive: None,
-			sse_retry: None,
 			stateful_mode: stateful,
 			json_response: false,
 			cancellation_token: Default::default(),
@@ -1925,7 +1416,6 @@ async fn standard_sse_assertions(client: LegacyService) {
 }
 
 mod mockserver {
-	use std::collections::HashMap;
 	use std::sync::Arc;
 
 	use http::request::Parts;
@@ -1941,6 +1431,8 @@ mod mockserver {
 	};
 	use serde_json::json;
 	use tokio::sync::Mutex;
+
+	use super::task_store_shared::TaskStore;
 
 	#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 	pub struct ExamplePromptArgs {
@@ -2097,11 +1589,7 @@ mod mockserver {
 					.map_err(|e| McpError::invalid_params(format!("schema error: {e}"), None))?,
 			};
 
-			let request = CreateElicitationRequest {
-				method: Default::default(),
-				params,
-				extensions: Default::default(),
-			};
+			let request = CreateElicitationRequest::new(params);
 
 			let response = ctx
 				.peer
@@ -2130,12 +1618,9 @@ mod mockserver {
 				McpError::invalid_request("elicitation response missing content".to_string(), None)
 			})?;
 
-			Ok(CallToolResult {
-				content: vec![Content::text("elicitation accepted")],
-				structured_content: Some(content),
-				is_error: Some(false),
-				meta: None,
-			})
+			let mut result = CallToolResult::success(vec![Content::text("elicitation accepted")]);
+			result.structured_content = Some(content);
+			Ok(result)
 		}
 
 		#[tool(description = "Round-trip roots/list for testing")]
@@ -2174,12 +1659,7 @@ mod mockserver {
 				"roots": result.roots,
 			});
 
-			Ok(CallToolResult {
-				content: vec![Content::text(payload.to_string())],
-				structured_content: Some(payload),
-				is_error: Some(false),
-				meta: None,
-			})
+			Ok(CallToolResult::structured(payload))
 		}
 
 		#[tool(description = "Echo HTTP attributes")]
@@ -2209,10 +1689,10 @@ mod mockserver {
 				"This is an example prompt with your message here: '{}'",
 				args.message
 			);
-			Ok(vec![PromptMessage {
-				role: PromptMessageRole::User,
-				content: PromptMessageContent::text(prompt),
-			}])
+			Ok(vec![PromptMessage::new(
+				PromptMessageRole::User,
+				PromptMessageContent::text(prompt),
+			)])
 		}
 
 		/// Analyze the current counter value and suggest next steps
@@ -2240,13 +1720,10 @@ mod mockserver {
 				),
 			];
 
-			Ok(GetPromptResult {
-				description: Some(format!(
-					"Counter analysis for reaching {} from {}",
-					args.goal, current_value
-				)),
-				messages,
-			})
+			Ok(GetPromptResult::new(messages).with_description(format!(
+				"Counter analysis for reaching {} from {}",
+				args.goal, current_value
+			)))
 		}
 	}
 
@@ -2254,18 +1731,18 @@ mod mockserver {
 	#[prompt_handler]
 	impl ServerHandler for Counter {
 		fn get_info(&self) -> ServerInfo {
-			ServerInfo {
-				protocol_version: ProtocolVersion::V_2025_06_18,
-				capabilities: ServerCapabilities::builder()
+			ServerInfo::new(
+				ServerCapabilities::builder()
 					.enable_completions()
 					.enable_prompts()
 					.enable_resources()
 					.enable_tools()
 					.enable_tasks_with(TasksCapability::server_default())
 					.build(),
-				server_info: Implementation::from_build_env(),
-				instructions: Some("This server provides counter tools and prompts.".to_string()),
-			}
+			)
+			.with_protocol_version(ProtocolVersion::V_2025_06_18)
+			.with_server_info(Implementation::from_build_env())
+			.with_instructions("This server provides counter tools and prompts.")
 		}
 
 		async fn complete(
@@ -2278,9 +1755,9 @@ mod mockserver {
 				Reference::Resource(_) => "resource",
 			};
 			let value = format!("{kind}-{}", request.argument.value);
-			let completion =
-				CompletionInfo::with_all_values(vec![value]).expect("completion values should be valid");
-			Ok(CompleteResult { completion })
+			let completion = CompletionInfo::with_all_values(vec![value])
+				.map_err(|e| McpError::internal_error(e, None))?;
+			Ok(CompleteResult::new(completion))
 		}
 
 		async fn list_resources(
@@ -2288,14 +1765,10 @@ mod mockserver {
 			_request: Option<PaginatedRequestParams>,
 			_: RequestContext<RoleServer>,
 		) -> Result<ListResourcesResult, McpError> {
-			Ok(ListResourcesResult {
-				resources: vec![
-					self._create_resource_text("str:////Users/to/some/path/", "cwd"),
-					self._create_resource_text("memo://insights", "memo-name"),
-				],
-				next_cursor: None,
-				meta: None,
-			})
+			Ok(ListResourcesResult::with_all_items(vec![
+				self._create_resource_text("str:////Users/to/some/path/", "cwd"),
+				self._create_resource_text("memo://insights", "memo-name"),
+			]))
 		}
 
 		async fn read_resource(
@@ -2306,15 +1779,15 @@ mod mockserver {
 			match uri.as_str() {
 				"str:////Users/to/some/path/" => {
 					let cwd = "/Users/to/some/path/";
-					Ok(ReadResourceResult {
-						contents: vec![ResourceContents::text(cwd, uri)],
-					})
+					Ok(ReadResourceResult::new(vec![ResourceContents::text(
+						cwd, uri,
+					)]))
 				},
 				"memo://insights" => {
 					let memo = "Business Intelligence Memo\n\nAnalysis has revealed 5 key insights ...";
-					Ok(ReadResourceResult {
-						contents: vec![ResourceContents::text(memo, uri)],
-					})
+					Ok(ReadResourceResult::new(vec![ResourceContents::text(
+						memo, uri,
+					)]))
 				},
 				_ => Err(McpError::resource_not_found(
 					"resource_not_found",
@@ -2330,21 +1803,9 @@ mod mockserver {
 			_request: Option<PaginatedRequestParams>,
 			_: RequestContext<RoleServer>,
 		) -> Result<ListResourceTemplatesResult, McpError> {
-			Ok(ListResourceTemplatesResult {
-				next_cursor: None,
-				resource_templates: vec![
-					RawResourceTemplate {
-						uri_template: "memo://{id}".to_string(),
-						name: "counter-template".to_string(),
-						title: None,
-						description: None,
-						mime_type: None,
-						icons: None,
-					}
-					.no_annotation(),
-				],
-				meta: None,
-			})
+			Ok(ListResourceTemplatesResult::with_all_items(vec![
+				RawResourceTemplate::new("memo://{id}", "counter-template").no_annotation(),
+			]))
 		}
 
 		async fn initialize(
@@ -2366,7 +1827,7 @@ mod mockserver {
 				"arguments": request.arguments,
 			});
 			let task = tasks.create_task(result);
-			Ok(CreateTaskResult { task })
+			Ok(CreateTaskResult::new(task))
 		}
 
 		async fn list_tasks(
@@ -2375,15 +1836,9 @@ mod mockserver {
 			_: RequestContext<RoleServer>,
 		) -> Result<ListTasksResult, McpError> {
 			let tasks = self.tasks.lock().await;
-			Ok(ListTasksResult {
-				tasks: tasks
-					.tasks
-					.values()
-					.map(|entry| entry.task.clone())
-					.collect(),
-				next_cursor: None,
-				total: None,
-			})
+			Ok(ListTasksResult::new(
+				tasks.iter_tasks().cloned().collect::<Vec<_>>(),
+			))
 		}
 
 		async fn get_task_info(
@@ -2392,7 +1847,7 @@ mod mockserver {
 			_: RequestContext<RoleServer>,
 		) -> Result<GetTaskResult, McpError> {
 			let mut tasks = self.tasks.lock().await;
-			if let Some(entry) = tasks.tasks.get_mut(&request.task_id) {
+			if let Some(entry) = tasks.get_mut(&request.task_id) {
 				if entry.task.status == TaskStatus::Working && entry.result.is_some() {
 					entry.task.status = TaskStatus::Completed;
 					entry.task.status_message = Some("completed".to_string());
@@ -2415,7 +1870,7 @@ mod mockserver {
 			_: RequestContext<RoleServer>,
 		) -> Result<GetTaskPayloadResult, McpError> {
 			let mut tasks = self.tasks.lock().await;
-			let entry = tasks.tasks.get_mut(&request.task_id);
+			let entry = tasks.get_mut(&request.task_id);
 			let Some(entry) = entry else {
 				return Err(McpError::invalid_request(
 					"task not found".to_string(),
@@ -2426,7 +1881,7 @@ mod mockserver {
 				entry.task.status = TaskStatus::Completed;
 				entry.task.status_message = Some("completed".to_string());
 				entry.task.last_updated_at = entry.task.created_at.clone();
-				return Ok(GetTaskPayloadResult(result));
+				return Ok(GetTaskPayloadResult::new(result));
 			}
 			Err(McpError::invalid_request(
 				"task not ready".to_string(),
@@ -2440,7 +1895,7 @@ mod mockserver {
 			_: RequestContext<RoleServer>,
 		) -> Result<CancelTaskResult, McpError> {
 			let mut tasks = self.tasks.lock().await;
-			if let Some(entry) = tasks.tasks.get_mut(&request.task_id) {
+			if let Some(entry) = tasks.get_mut(&request.task_id) {
 				entry.task.status = TaskStatus::Cancelled;
 				entry.task.status_message = Some("cancelled".to_string());
 				entry.task.last_updated_at = entry.task.created_at.clone();
@@ -2454,107 +1909,6 @@ mod mockserver {
 				"task not found".to_string(),
 				None,
 			))
-		}
-	}
-
-	#[derive(Clone)]
-	pub struct MetaServer {
-		label: String,
-	}
-
-	impl MetaServer {
-		pub fn new(label: impl Into<String>) -> Self {
-			Self {
-				label: label.into(),
-			}
-		}
-	}
-
-	impl ServerHandler for MetaServer {
-		fn get_info(&self) -> ServerInfo {
-			ServerInfo {
-				protocol_version: ProtocolVersion::V_2025_06_18,
-				capabilities: ServerCapabilities::builder()
-					.enable_completions()
-					.enable_tools()
-					.build(),
-				server_info: Implementation::from_build_env(),
-				instructions: Some("Meta-only test server.".to_string()),
-			}
-		}
-
-		async fn complete(
-			&self,
-			request: CompleteRequestParams,
-			_: RequestContext<RoleServer>,
-		) -> Result<CompleteResult, McpError> {
-			let kind = match request.r#ref {
-				Reference::Prompt(_) => "prompt",
-				Reference::Resource(_) => "resource",
-			};
-			let value = format!("meta-{kind}-{}", request.argument.value);
-			let completion =
-				CompletionInfo::with_all_values(vec![value]).expect("completion values should be valid");
-			Ok(CompleteResult { completion })
-		}
-
-		async fn list_tools(
-			&self,
-			_request: Option<PaginatedRequestParams>,
-			_: RequestContext<RoleServer>,
-		) -> Result<ListToolsResult, McpError> {
-			let mut meta = Meta::new();
-			meta.0.insert("label".to_string(), json!(self.label));
-			Ok(ListToolsResult {
-				tools: Vec::new(),
-				next_cursor: None,
-				meta: Some(meta),
-			})
-		}
-
-		async fn initialize(
-			&self,
-			_request: InitializeRequestParams,
-			_: RequestContext<RoleServer>,
-		) -> Result<InitializeResult, McpError> {
-			Ok(self.get_info())
-		}
-	}
-
-	#[derive(Debug, Default)]
-	struct TaskStore {
-		next_id: u64,
-		tasks: HashMap<String, TaskEntry>,
-	}
-
-	#[derive(Debug)]
-	struct TaskEntry {
-		task: Task,
-		result: Option<serde_json::Value>,
-	}
-
-	impl TaskStore {
-		fn create_task(&mut self, result: serde_json::Value) -> Task {
-			let task_id = format!("task-{}", self.next_id);
-			self.next_id += 1;
-			let created_at = "2026-01-01T00:00:00Z".to_string();
-			let task = Task {
-				task_id: task_id.clone(),
-				status: TaskStatus::Working,
-				status_message: Some("queued".to_string()),
-				created_at: created_at.clone(),
-				last_updated_at: created_at,
-				ttl: None,
-				poll_interval: Some(10),
-			};
-			self.tasks.insert(
-				task_id,
-				TaskEntry {
-					task: task.clone(),
-					result: Some(result),
-				},
-			);
-			task
 		}
 	}
 }

@@ -741,7 +741,7 @@ impl LocalBackend {
 						McpPrefixMode::Always => true,
 						McpPrefixMode::Conditional => false,
 					}),
-					failure_mode: tgt.failure_mode.unwrap_or_default(),
+					allow_degraded: tgt.allow_degraded,
 				};
 				backends.push(Backend::MCP(name, m).into());
 				backends
@@ -800,7 +800,6 @@ pub enum McpPrefixMode {
 	#[default]
 	Conditional,
 }
-
 #[apply(schema_de!)]
 pub struct LocalMcpBackend {
 	pub targets: Vec<Arc<LocalMcpTarget>>,
@@ -808,10 +807,8 @@ pub struct LocalMcpBackend {
 	pub stateful_mode: McpStatefulMode,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub prefix_mode: Option<McpPrefixMode>,
-	/// Behavior when one or more MCP targets fail to initialize or fail during fanout.
-	/// Defaults to `failClosed`.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub failure_mode: Option<FailureMode>,
+	#[serde(default)]
+	pub allow_degraded: bool,
 }
 
 #[apply(schema_de!)]

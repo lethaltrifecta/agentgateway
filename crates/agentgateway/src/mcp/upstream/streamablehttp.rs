@@ -122,6 +122,9 @@ impl Client {
 		{
 			return Ok(StreamableHttpPostResponse::Accepted);
 		}
+		if !resp.status().is_success() {
+			return Err(ClientError::Status(Box::new(resp)));
+		}
 
 		let session_id = resp
 			.headers()
@@ -129,61 +132,9 @@ impl Client {
 			.and_then(|v| v.to_str().ok())
 			.map(|s| s.to_string());
 		let content_type = resp.headers().get(CONTENT_TYPE);
-		if !resp.status().is_success() {
-			if content_type
-				.and_then(|ct| ct.to_str().ok())
-				.is_some_and(|ct| ct.starts_with(JSON_MIME_TYPE))
-			{
-				let lim = crate::http::response_buffer_limit(&resp);
-				let content_encoding = resp.headers().typed_get::<headers::ContentEncoding>();
-				let (parts, body) = resp.into_parts();
-				let body_bytes = crate::http::compression::to_bytes_with_decompression(
-					body,
-					content_encoding.as_ref(),
-					lim,
-				)
-				.await
-				.map_err(ClientError::new)?
-				.1;
-				// Only pass through JSON-RPC errors; a success response on non-success HTTP is invalid.
-				match serde_json::from_slice::<ServerJsonRpcMessage>(&body_bytes) {
-					Ok(message @ ServerJsonRpcMessage::Error(_)) => {
-						tracing::debug!(
-							status = %parts.status,
-							"passing through JSON-RPC error from non-success HTTP response"
-						);
-						return Ok(StreamableHttpPostResponse::Json(message, session_id));
-					},
-					Ok(_) => {
-						tracing::debug!(
-							status = %parts.status,
-							"non-error JSON-RPC body on non-success HTTP response; returning status error"
-						);
-					},
-					Err(e) => {
-						tracing::debug!(
-							status = %parts.status,
-							error = %e,
-							"failed to parse JSON-RPC error from non-success HTTP response; returning status error"
-						);
-					},
-				}
-				let resp = ::http::Response::from_parts(parts, crate::http::Body::from(body_bytes));
-				return Err(ClientError::Status(Box::new(resp)));
-			}
-
-			let lim = crate::http::response_buffer_limit(&resp);
-			let (parts, body) = resp.into_parts();
-			let body_bytes = crate::http::read_body_with_limit(body, lim)
-				.await
-				.map_err(ClientError::new)?;
-
-			let resp = ::http::Response::from_parts(parts, crate::http::Body::from(body_bytes));
-			return Err(ClientError::Status(Box::new(resp)));
-		}
 
 		match content_type {
-			Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
+			Some(ct) if content_type_matches(ct, EVENT_STREAM_MIME_TYPE) => {
 				let content_encoding = resp.headers().typed_get::<headers::ContentEncoding>();
 				let (body, _encoding) =
 					crate::http::compression::decompress_body(resp.into_body(), content_encoding.as_ref())
@@ -191,7 +142,7 @@ impl Client {
 				let event_stream = SseStream::from_byte_stream(body.into_data_stream()).boxed();
 				Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
 			},
-			Some(ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
+			Some(ct) if content_type_matches(ct, JSON_MIME_TYPE) => {
 				let lim = crate::http::response_buffer_limit(&resp);
 				let content_encoding = resp.headers().typed_get::<headers::ContentEncoding>();
 				let body_bytes = crate::http::compression::to_bytes_with_decompression(
@@ -228,10 +179,10 @@ impl Client {
 		ctx.apply(&mut req);
 
 		let resp = self.http_client.call(req).await?;
-
 		if !resp.status().is_success() {
 			return Err(ClientError::Status(Box::new(resp)));
 		}
+
 		Ok(StreamableHttpPostResponse::Accepted)
 	}
 	pub async fn get_event_stream(
@@ -250,7 +201,6 @@ impl Client {
 		ctx.apply(&mut req);
 
 		let resp = self.http_client.call(req).await?;
-
 		if !resp.status().is_success() {
 			return Err(ClientError::Status(Box::new(resp)));
 		}
@@ -262,7 +212,7 @@ impl Client {
 			.and_then(|v| v.to_str().ok())
 			.map(|s| s.to_string());
 		match content_type {
-			Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
+			Some(ct) if content_type_matches(ct, EVENT_STREAM_MIME_TYPE) => {
 				let content_encoding = resp.headers().typed_get::<headers::ContentEncoding>();
 				let (body, _encoding) =
 					crate::http::compression::decompress_body(resp.into_body(), content_encoding.as_ref())
@@ -288,6 +238,14 @@ impl Client {
 	}
 }
 
+fn content_type_matches(value: &http::HeaderValue, expected_mime: &str) -> bool {
+	let Ok(raw) = value.to_str() else {
+		return false;
+	};
+	let media_type = raw.split(';').next().unwrap_or_default().trim();
+	media_type.eq_ignore_ascii_case(expected_mime)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -306,5 +264,14 @@ mod tests {
 			result.is_err(),
 			"json-rpc error should be propagated as error"
 		);
+	}
+
+	#[test]
+	fn content_type_matches_accepts_parameters_but_rejects_other_json_types() {
+		let json = http::HeaderValue::from_static("application/json; charset=utf-8");
+		assert!(content_type_matches(&json, JSON_MIME_TYPE));
+
+		let patch_json = http::HeaderValue::from_static("application/json-patch+json");
+		assert!(!content_type_matches(&patch_json, JSON_MIME_TYPE));
 	}
 }

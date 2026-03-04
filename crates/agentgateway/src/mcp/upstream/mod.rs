@@ -261,6 +261,9 @@ impl UpstreamGroup {
 					self.by_name.insert(tgt.name.clone(), Arc::new(transport));
 				},
 				Err(e) => {
+					if !self.backend.allow_degraded {
+						return Err(e);
+					}
 					warn!(upstream_name = %tgt.name, error = %e, "failed to initialize MCP target; skipping");
 					failures.push((tgt.name.clone(), e));
 				},
@@ -429,6 +432,7 @@ mod tests {
 				stdio_target("missing", "__agw_missing_command__"),
 			],
 			stateful: false,
+			allow_degraded: true,
 		};
 
 		let group = UpstreamGroup::new(
@@ -450,6 +454,30 @@ mod tests {
 		);
 	}
 
+	#[cfg(target_family = "unix")]
+	#[tokio::test]
+	async fn setup_connections_fails_on_any_target_failure_by_default() {
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let backend = McpBackendGroup {
+			targets: vec![
+				stdio_target("healthy", "true"),
+				stdio_target("missing", "__agw_missing_command__"),
+			],
+			stateful: false,
+			allow_degraded: false,
+		};
+
+		let err = UpstreamGroup::new(
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+			backend,
+		)
+		.expect_err("should fail because allow_degraded is false");
+
+		assert!(err.to_string().contains("failed to start stdio server"));
+	}
+
 	#[tokio::test]
 	async fn setup_connections_errors_when_all_targets_fail() {
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
@@ -459,6 +487,7 @@ mod tests {
 				stdio_target("missing-b", "__agw_missing_command_b__"),
 			],
 			stateful: false,
+			allow_degraded: true,
 		};
 
 		let err = UpstreamGroup::new(

@@ -8,11 +8,12 @@ use http::request::Parts;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use rmcp::ErrorData;
 use rmcp::model::{
-	ClientJsonRpcMessage, ClientNotification, ClientRequest, Implementation, JsonRpcNotification,
-	JsonRpcRequest, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-	ListTasksResult, ListToolsResult, Meta, Prompt, PromptsCapability, ProtocolVersion, RequestId,
-	ResourcesCapability, ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerNotification,
-	ServerResult, TasksCapability, Tool, ToolsCapability,
+	ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString,
+	ElicitationResponseNotificationMethod, ElicitationResponseNotificationParam, Implementation,
+	JsonRpcNotification, JsonRpcRequest, ListPromptsResult, ListResourceTemplatesResult,
+	ListResourcesResult, ListTasksResult, ListToolsResult, Meta, PromptsCapability, ProtocolVersion,
+	RequestId, ResourcesCapability, ServerCapabilities, ServerInfo, ServerJsonRpcMessage,
+	ServerNotification, ServerResult, TasksCapability, ToolsCapability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -41,12 +42,13 @@ const UPSTREAM_REQUEST_ID_PREFIX: &str = "agw";
 const UPSTREAM_REQUEST_ID_SEPARATOR: &str = "::";
 const AGW_SCHEME: &str = "agw";
 const URI_PARAM: &str = "u";
-const ELICITATION_RESPONSE_METHOD: &str = "notifications/elicitation/response";
+const ELICITATION_RESPONSE_METHOD: &str = ElicitationResponseNotificationMethod::VALUE;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ElicitationResponseParams {
-	elicitation_id: String,
+	#[serde(flatten)]
+	typed: ElicitationResponseNotificationParam,
 	#[serde(flatten)]
 	extra: Map<String, Value>,
 }
@@ -67,22 +69,6 @@ enum FanoutMode {
 }
 
 impl FanoutMode {
-	fn missing_request_message(self) -> &'static str {
-		match self {
-			FanoutMode::All => "fanout request template unexpectedly missing",
-			FanoutMode::Targeted => "targeted fanout request template unexpectedly missing",
-		}
-	}
-
-	fn missing_final_request_message(self) -> &'static str {
-		match self {
-			FanoutMode::All => "fanout request template unexpectedly missing for final upstream",
-			FanoutMode::Targeted => {
-				"targeted fanout request template unexpectedly missing for final upstream"
-			},
-		}
-	}
-
 	fn stream_failure_log(self) -> &'static str {
 		match self {
 			FanoutMode::All => "upstream failed during fanout; excluding from results",
@@ -265,6 +251,7 @@ pub struct Relay {
 	// Else this is empty
 	default_target_name: Option<String>,
 	is_multiplexing: bool,
+	allow_degraded: bool,
 	// std::sync::RwLock is intentional: all accesses are synchronous (inside MergeFn or
 	// upstreams_with_capability), never held across await points.
 	upstream_infos: Arc<RwLock<HashMap<Strng, ServerInfo>>>,
@@ -312,11 +299,13 @@ impl Relay {
 		} else {
 			Some(backend.targets[0].name.to_string())
 		};
+		let allow_degraded = backend.allow_degraded;
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(client, backend)?),
 			policies,
 			default_target_name,
 			is_multiplexing,
+			allow_degraded,
 			upstream_infos: Arc::new(RwLock::new(HashMap::new())),
 			pending_elicitation_ids: Arc::new(RwLock::new(HashMap::new())),
 		})
@@ -328,6 +317,7 @@ impl Relay {
 			policies,
 			default_target_name: self.default_target_name.clone(),
 			is_multiplexing: self.is_multiplexing,
+			allow_degraded: self.allow_degraded,
 			upstream_infos: self.upstream_infos.clone(),
 			pending_elicitation_ids: self.pending_elicitation_ids.clone(),
 		}
@@ -756,7 +746,7 @@ impl Relay {
 				let meta = ltr.meta;
 				meta_entries.push((server_name.clone(), meta));
 				tools.reserve(upstream_tools.len());
-				for t in upstream_tools {
+				for mut t in upstream_tools {
 					// Apply authorization policies, filtering tools that are not allowed.
 					if !policies.validate(
 						&rbac::ResourceType::Tool(rbac::ResourceId::new(
@@ -768,10 +758,8 @@ impl Relay {
 						continue;
 					}
 					// Rename to handle multiplexing
-					tools.push(Tool {
-						name: resource_name(default_target_name.as_deref(), server_name.as_str(), t.name),
-						..t
-					});
+					t.name = resource_name(default_target_name.as_deref(), server_name.as_str(), t.name);
+					tools.push(t);
 				}
 			}
 			let meta = merge_meta(meta_entries);
@@ -845,35 +833,30 @@ impl Relay {
 						.expect("ProtocolVersion ordering must be total")
 				})
 				.unwrap_or(pv);
-			let capabilities = ServerCapabilities {
-				completions: has_completions.then_some(rmcp::model::JsonObject::default()),
-				experimental: None,
-				logging: has_logging.then_some(rmcp::model::JsonObject::default()),
-				tasks: has_tasks.then_some(TasksCapability::default()),
-				tools: has_tools.then_some(ToolsCapability::default()),
-				prompts: has_prompts.then_some(PromptsCapability::default()),
-				resources: has_resources.then_some(ResourcesCapability {
-					subscribe: Some(has_resource_subscribe),
-					list_changed: Some(has_resource_list_changed),
-				}),
-				extensions: if extensions.is_empty() {
-					None
-				} else {
-					Some(extensions)
-				},
+			let mut capabilities = ServerCapabilities::default();
+			capabilities.completions = has_completions.then_some(rmcp::model::JsonObject::default());
+			capabilities.logging = has_logging.then_some(rmcp::model::JsonObject::default());
+			capabilities.tasks = has_tasks.then_some(TasksCapability::default());
+			capabilities.tools = has_tools.then_some(ToolsCapability::default());
+			capabilities.prompts = has_prompts.then_some(PromptsCapability::default());
+			capabilities.resources = has_resources.then_some(ResourcesCapability {
+				subscribe: Some(has_resource_subscribe),
+				list_changed: Some(has_resource_list_changed),
+			});
+			capabilities.extensions = if extensions.is_empty() {
+				None
+			} else {
+				Some(extensions)
 			};
-			let instructions = Some(
-				"This server is a gateway to a set of mcp servers. It is responsible for routing requests to the correct server and aggregating the results.".to_string(),
-			);
 			Ok(
-				ServerInfo {
-					protocol_version: lowest_version,
-					capabilities,
-					server_info: Implementation::from_build_env(),
-					instructions,
-				}
-				.into(),
-			)
+					ServerInfo::new(capabilities)
+						.with_protocol_version(lowest_version)
+						.with_server_info(Implementation::from_build_env())
+						.with_instructions(
+							"This server is a gateway to a set of mcp servers. It is responsible for routing requests to the correct server and aggregating the results.",
+						)
+						.into(),
+				)
 		})
 	}
 
@@ -891,7 +874,7 @@ impl Relay {
 				let meta = lpr.meta;
 				meta_entries.push((server_name.clone(), meta));
 				prompts.reserve(upstream_prompts.len());
-				for p in upstream_prompts {
+				for mut p in upstream_prompts {
 					if !policies.validate(
 						&rbac::ResourceType::Prompt(rbac::ResourceId::new(
 							server_name.as_str(),
@@ -901,15 +884,14 @@ impl Relay {
 					) {
 						continue;
 					}
-					prompts.push(Prompt {
-						name: resource_name(
-							default_target_name.as_deref(),
-							server_name.as_str(),
-							Cow::Owned(p.name),
-						)
-						.into_owned(),
-						..p
-					});
+					let old_name = std::mem::take(&mut p.name);
+					p.name = resource_name(
+						default_target_name.as_deref(),
+						server_name.as_str(),
+						Cow::Owned(old_name),
+					)
+					.into_owned();
+					prompts.push(p);
 				}
 			}
 			let meta = merge_meta(meta_entries);
@@ -1038,6 +1020,7 @@ impl Relay {
 					tasks: upstream_tasks,
 					next_cursor,
 					total,
+					..
 				} = ltr;
 				if upstream_result_count == 1 {
 					single_next_cursor = next_cursor;
@@ -1067,14 +1050,10 @@ impl Relay {
 			} else {
 				(None, None)
 			};
-			Ok(
-				ListTasksResult {
-					tasks,
-					next_cursor,
-					total,
-				}
-				.into(),
-			)
+			let mut out = ListTasksResult::new(tasks);
+			out.next_cursor = next_cursor;
+			out.total = total;
+			Ok(out.into())
 		})
 	}
 	pub fn merge_empty(&self) -> Box<MergeFn> {
@@ -1106,8 +1085,18 @@ impl Relay {
 		ctx: IncomingRequestContext,
 	) -> Result<Response, UpstreamError> {
 		self.clear_pending_elicitation_ids();
-		for (_, con) in self.upstreams.iter_named() {
-			con.delete(&ctx).await?;
+		let allow_degraded = self.allow_degraded;
+		for (name, con) in self.upstreams.iter_named() {
+			if let Err(e) = con.delete(&ctx).await {
+				if !allow_degraded {
+					return Err(e);
+				}
+				tracing::warn!(
+					%name,
+					?e,
+					"upstream failed during session deletion; continuing cleanup"
+				);
+			}
 		}
 		Ok(accepted_response())
 	}
@@ -1116,17 +1105,28 @@ impl Relay {
 		ctx: IncomingRequestContext,
 	) -> Result<Response, UpstreamError> {
 		let mut streams = Vec::new();
+		let allow_degraded = self.allow_degraded;
 		for (name, con) in self.upstreams.iter_named() {
-			match con.get_event_stream(&ctx).await {
-				Ok(s) => streams.push((name, s)),
-				Err(e) => {
-					tracing::debug!(
-						%name,
-						?e,
-						"upstream failed to provide event stream; skipping for this session"
-					);
-				},
+			if allow_degraded {
+				match con.get_event_stream(&ctx).await {
+					Ok(s) => streams.push((name, s)),
+					Err(e) => {
+						tracing::debug!(
+							%name,
+							?e,
+							"upstream failed to provide event stream; skipping for this session"
+						);
+					},
+				}
+			} else {
+				streams.push((name, con.get_event_stream(&ctx).await?));
 			}
+		}
+
+		if streams.is_empty() {
+			return Err(UpstreamError::InvalidRequest(
+				"all upstreams failed to provide event stream".to_string(),
+			));
 		}
 
 		let ms = mergestream::MergeStream::new_without_merge(streams, self.message_mapper());
@@ -1140,33 +1140,23 @@ impl Relay {
 		names: Vec<Strng>,
 		mode: FanoutMode,
 	) -> Result<Vec<(Strng, mergestream::Messages)>, UpstreamError> {
-		let names_len = names.len();
-		let mut streams = Vec::with_capacity(names_len);
-		let mut request_template = Some(request);
-
-		for (idx, name) in names.into_iter().enumerate() {
+		let allow_degraded = self.allow_degraded;
+		let mut streams = Vec::with_capacity(names.len());
+		for name in names {
 			let con = self
 				.upstreams
 				.get(name.as_ref())
 				.map_err(|e| UpstreamError::InvalidRequest(e.to_string()))?;
-			let request = if idx + 1 == names_len {
-				request_template.take().ok_or_else(|| {
-					UpstreamError::InvalidRequest(mode.missing_final_request_message().to_string())
-				})?
-			} else {
-				request_template
-					.as_ref()
-					.ok_or_else(|| UpstreamError::InvalidRequest(mode.missing_request_message().to_string()))?
-					.clone()
-			};
-			match con.generic_stream(request, ctx).await {
-				Ok(s) => streams.push((name, s)),
+			match con.generic_stream(request.clone(), ctx).await {
+				Ok(stream) => streams.push((name, stream)),
 				Err(e) => {
+					if !allow_degraded {
+						return Err(e);
+					}
 					tracing::warn!(%name, ?e, "{}", mode.stream_failure_log());
 				},
 			}
 		}
-
 		Ok(streams)
 	}
 
@@ -1240,6 +1230,9 @@ impl Relay {
 							.generic_notification(ClientNotification::CancelledNotification(cn), &ctx)
 							.await
 						{
+							if !self.allow_degraded {
+								return Err(e);
+							}
 							tracing::warn!(%server_name, ?e, "targeted cancellation failed");
 						}
 						return Ok(accepted_response());
@@ -1251,6 +1244,9 @@ impl Relay {
 						.generic_notification(ClientNotification::CancelledNotification(cn.clone()), &ctx)
 						.await
 					{
+						if !self.allow_degraded {
+							return Err(e);
+						}
 						tracing::warn!(%name, ?e, "cancellation fanout failed; ignoring");
 					}
 				}
@@ -1266,6 +1262,9 @@ impl Relay {
 							.generic_notification(ClientNotification::ProgressNotification(pn), &ctx)
 							.await
 						{
+							if !self.allow_degraded {
+								return Err(e);
+							}
 							tracing::warn!(%server_name, ?e, "targeted progress notification failed");
 						}
 						return Ok(accepted_response());
@@ -1277,35 +1276,42 @@ impl Relay {
 						.generic_notification(ClientNotification::ProgressNotification(pn.clone()), &ctx)
 						.await
 					{
+						if !self.allow_degraded {
+							return Err(e);
+						}
 						tracing::warn!(%name, ?e, "progress notification fanout failed; ignoring");
 					}
 				}
 			},
 			ClientNotification::CustomNotification(cn) => {
+				let enforce_pending_elicitation = self.should_prefix_identifiers();
 				let fallback_notification = match RoutedCustomNotification::parse(cn) {
 					RoutedCustomNotification::ElicitationResponse {
 						mut original,
 						mut params,
 					} => {
 						if let Ok((server_name, original_elicitation_id)) =
-							self.decode_upstream_elicitation_id(&params.elicitation_id)
+							self.decode_upstream_elicitation_id(&params.typed.elicitation_id)
 						{
-							if !self.consume_pending_elicitation_id(&params.elicitation_id, server_name.as_ref())
-							{
+							if enforce_pending_elicitation
+								&& !self.consume_pending_elicitation_id(
+									&params.typed.elicitation_id,
+									server_name.as_ref(),
+								) {
 								tracing::warn!(
 									%server_name,
-									elicitation_id = %params.elicitation_id,
+									elicitation_id = %params.typed.elicitation_id,
 									"dropping untracked elicitation response"
 								);
 								return Ok(accepted_response());
 							}
-							params.elicitation_id = original_elicitation_id;
+							params.typed.elicitation_id = original_elicitation_id;
 							let params_value = match serde_json::to_value(&params) {
 								Ok(v) => v,
 								Err(e) => {
 									tracing::warn!(
 										%server_name,
-										elicitation_id = %params.elicitation_id,
+										elicitation_id = %params.typed.elicitation_id,
 										error = %e,
 										"dropping elicitation response: failed to serialize params"
 									);
@@ -1319,13 +1325,16 @@ impl Relay {
 										.generic_notification(ClientNotification::CustomNotification(original), &ctx)
 										.await
 									{
+										if !self.allow_degraded {
+											return Err(e);
+										}
 										tracing::warn!(%server_name, ?e, "targeted elicitation response failed");
 									}
 								},
 								Err(_) => {
 									tracing::warn!(
 										%server_name,
-										elicitation_id = %params.elicitation_id,
+										elicitation_id = %params.typed.elicitation_id,
 										"dropping elicitation response: upstream not found"
 									);
 								},
@@ -1333,7 +1342,7 @@ impl Relay {
 							return Ok(accepted_response());
 						}
 						tracing::warn!(
-							elicitation_id = %params.elicitation_id,
+							elicitation_id = %params.typed.elicitation_id,
 							"dropping elicitation response: failed to decode upstream id"
 						);
 						return Ok(accepted_response());
@@ -1349,9 +1358,12 @@ impl Relay {
 						)
 						.await
 					{
+						if !self.allow_degraded {
+							return Err(e);
+						}
 						tracing::warn!(
-							%name,
-							?e,
+								%name,
+								?e,
 							"custom notification fanout failed; ignoring"
 						);
 					}
@@ -1361,9 +1373,12 @@ impl Relay {
 				// Regular fanout for other notifications (like 'initialized')
 				for (name, con) in self.upstreams.iter_named() {
 					if let Err(e) = con.generic_notification(notification.clone(), &ctx).await {
+						if !self.allow_degraded {
+							return Err(e);
+						}
 						tracing::warn!(
-							%name,
-							?e,
+								%name,
+								?e,
 							"upstream notification failed; ignoring"
 						);
 					}
@@ -1388,29 +1403,18 @@ impl Relay {
 		Ok(accepted_response())
 	}
 	fn get_info(pv: ProtocolVersion, _multiplexing: bool) -> ServerInfo {
-		let capabilities = ServerCapabilities {
-			completions: None,
-			experimental: None,
-			logging: None,
-			tasks: Some(TasksCapability::default()),
-			tools: Some(ToolsCapability::default()),
-			prompts: Some(PromptsCapability::default()),
-			resources: Some(ResourcesCapability::default()),
-			extensions: None,
-		};
-		let instructions = Some(
-			"This server is a gateway to a set of mcp servers. It is responsible for routing requests to the correct server and aggregating the results.".to_string(),
-		);
-		ServerInfo {
-			protocol_version: pv,
-			capabilities,
-			server_info: Implementation {
-				name: "agentgateway".to_string(),
-				version: BuildInfo::new().version.to_string(),
-				..Default::default()
-			},
-			instructions,
-		}
+		let capabilities = ServerCapabilities::builder()
+			.enable_tasks_with(TasksCapability::default())
+			.enable_tools_with(ToolsCapability::default())
+			.enable_prompts_with(PromptsCapability::default())
+			.enable_resources_with(ResourcesCapability::default())
+			.build();
+		ServerInfo::new(capabilities)
+				.with_protocol_version(pv)
+				.with_server_info(Implementation::from_build_env())
+				.with_instructions(
+					"This server is a gateway to a set of mcp servers. It is responsible for routing requests to the correct server and aggregating the results.",
+				)
 	}
 }
 
@@ -1535,6 +1539,21 @@ mod tests {
 		}
 	}
 
+	fn single_capture_relay(allow_degraded: bool, capture_file: &Path) -> Result<Relay, mcp::Error> {
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		Relay::new(
+			McpBackendGroup {
+				targets: vec![capture_target("serverA", capture_file)],
+				stateful: false,
+				allow_degraded,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+	}
+
 	#[test]
 	fn merge_meta_includes_upstreams() {
 		let mut meta_a = Meta::new();
@@ -1620,6 +1639,7 @@ mod tests {
 					}),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1666,6 +1686,7 @@ mod tests {
 					}),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1713,6 +1734,7 @@ mod tests {
 					}),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1758,6 +1780,7 @@ mod tests {
 					}),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1789,6 +1812,7 @@ mod tests {
 					capture_target("serverB", server_b_capture.path()),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1799,14 +1823,12 @@ mod tests {
 
 		let rewritten_id = relay.encode_upstream_request_id("serverA", &RequestId::Number(1));
 		let encoded_id = rewritten_id.to_string();
-		let notification = ClientNotification::CancelledNotification(CancelledNotification {
-			method: Default::default(),
-			params: CancelledNotificationParam {
+		let notification = ClientNotification::CancelledNotification(CancelledNotification::new(
+			CancelledNotificationParam {
 				request_id: rewritten_id,
 				reason: Some("client cancelled".to_string()),
 			},
-			extensions: Default::default(),
-		});
+		));
 
 		let r = JsonRpcNotification {
 			jsonrpc: Default::default(),
@@ -1851,6 +1873,7 @@ mod tests {
 					capture_target("serverB", server_b_capture.path()),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1862,16 +1885,11 @@ mod tests {
 		let rewritten_progress_token =
 			relay.encode_upstream_progress_token("serverA", &ProgressToken(RequestId::Number(1)));
 		let encoded_token = rewritten_progress_token.0.to_string();
-		let notification = ClientNotification::ProgressNotification(ProgressNotification {
-			method: Default::default(),
-			params: ProgressNotificationParam {
-				progress_token: rewritten_progress_token,
-				progress: 0.5,
-				total: Some(1.0),
-				message: Some("halfway".to_string()),
-			},
-			extensions: Default::default(),
-		});
+		let notification = ClientNotification::ProgressNotification(ProgressNotification::new(
+			ProgressNotificationParam::new(rewritten_progress_token, 0.5)
+				.with_total(1.0)
+				.with_message("halfway"),
+		));
 
 		let r = JsonRpcNotification {
 			jsonrpc: Default::default(),
@@ -1930,6 +1948,7 @@ mod tests {
 					}),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1942,16 +1961,14 @@ mod tests {
 			jsonrpc: Default::default(),
 			id: RequestId::Number(7),
 			request: rmcp::model::ServerRequest::CreateElicitationRequest(
-				rmcp::model::CreateElicitationRequest {
-					method: Default::default(),
-					params: rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+				rmcp::model::CreateElicitationRequest::new(
+					rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
 						meta: None,
 						message: "Open a URL".to_string(),
 						url: "https://example.com/flow".to_string(),
 						elicitation_id: "elicit-1".to_string(),
 					},
-					extensions: Default::default(),
-				},
+				),
 			),
 		});
 		let rewritten_request = relay.map_server_message("serverA", request_message);
@@ -1981,13 +1998,9 @@ mod tests {
 		let completion_message = ServerJsonRpcMessage::Notification(JsonRpcNotification {
 			jsonrpc: Default::default(),
 			notification: ServerNotification::ElicitationCompletionNotification(
-				rmcp::model::ElicitationCompletionNotification {
-					method: Default::default(),
-					params: rmcp::model::ElicitationResponseNotificationParam {
-						elicitation_id: "elicit-2".to_string(),
-					},
-					extensions: Default::default(),
-				},
+				rmcp::model::ElicitationCompletionNotification::new(
+					rmcp::model::ElicitationResponseNotificationParam::new("elicit-2"),
+				),
 			),
 		});
 		let rewritten_completion = relay.map_server_message("serverA", completion_message);
@@ -2020,6 +2033,7 @@ mod tests {
 					capture_target("serverB", server_b_capture.path()),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2032,16 +2046,14 @@ mod tests {
 			jsonrpc: Default::default(),
 			id: RequestId::Number(11),
 			request: rmcp::model::ServerRequest::CreateElicitationRequest(
-				rmcp::model::CreateElicitationRequest {
-					method: Default::default(),
-					params: rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+				rmcp::model::CreateElicitationRequest::new(
+					rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
 						meta: None,
 						message: "Open a URL".to_string(),
 						url: "https://example.com/flow".to_string(),
 						elicitation_id: "elicit-1".to_string(),
 					},
-					extensions: Default::default(),
-				},
+				),
 			),
 		});
 		let rewritten_request = relay.map_server_message("serverA", request_message);
@@ -2112,6 +2124,7 @@ mod tests {
 					capture_target("serverB", server_b_capture.path()),
 				],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2152,6 +2165,138 @@ mod tests {
 		.await;
 	}
 
+	#[tokio::test]
+	async fn send_notification_elicitation_response_single_target_untracked_id_should_passthrough() {
+		use rmcp::model::JsonRpcNotification;
+
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let server_a_capture = NamedTempFile::new().expect("temp file");
+		let relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![capture_target("serverA", server_a_capture.path())],
+				stateful: false,
+				allow_degraded: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+
+		let notification =
+			ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(
+				ELICITATION_RESPONSE_METHOD,
+				Some(json!({
+					"elicitationId": "elicit-single-target",
+					"action": "accept"
+				})),
+			));
+		let r = JsonRpcNotification {
+			jsonrpc: Default::default(),
+			notification,
+		};
+
+		let ctx = IncomingRequestContext::empty();
+		let result = relay.send_notification(r, ctx).await;
+		assert!(result.is_ok());
+
+		wait_until_contains(
+			server_a_capture.path(),
+			"\"notifications/elicitation/response\"",
+		)
+		.await;
+		wait_until_contains(
+			server_a_capture.path(),
+			"\"elicitationId\":\"elicit-single-target\"",
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn send_fanout_deletion_allow_degraded_true_ignores_cleanup_errors() {
+		let capture = NamedTempFile::new().expect("temp file");
+		let relay = single_capture_relay(true, capture.path()).expect("relay with allow_degraded=true");
+		let ctx = IncomingRequestContext::empty();
+
+		let first = relay.send_fanout_deletion(ctx.clone()).await;
+		assert!(first.is_ok(), "first deletion should succeed");
+
+		let second = relay.send_fanout_deletion(ctx).await;
+		assert!(
+			second.is_ok(),
+			"degraded deletion should ignore cleanup errors"
+		);
+	}
+
+	#[tokio::test]
+	async fn send_fanout_deletion_allow_degraded_false_returns_cleanup_error() {
+		let capture = NamedTempFile::new().expect("temp file");
+		let relay =
+			single_capture_relay(false, capture.path()).expect("relay with allow_degraded=false");
+		let ctx = IncomingRequestContext::empty();
+
+		let first = relay.send_fanout_deletion(ctx.clone()).await;
+		assert!(first.is_ok(), "first deletion should succeed");
+
+		let second = relay.send_fanout_deletion(ctx).await;
+		assert!(
+			second.is_err(),
+			"strict deletion should return cleanup errors"
+		);
+	}
+
+	#[tokio::test]
+	async fn send_notification_allow_degraded_true_ignores_delivery_errors() {
+		let capture = NamedTempFile::new().expect("temp file");
+		let relay = single_capture_relay(true, capture.path()).expect("relay with allow_degraded=true");
+		let ctx = IncomingRequestContext::empty();
+
+		let deleted = relay.send_fanout_deletion(ctx.clone()).await;
+		assert!(deleted.is_ok(), "upstream shutdown should succeed");
+
+		let notification = JsonRpcNotification {
+			jsonrpc: Default::default(),
+			notification: ClientNotification::InitializedNotification(
+				rmcp::model::InitializedNotification {
+					method: Default::default(),
+					extensions: Default::default(),
+				},
+			),
+		};
+		let result = relay.send_notification(notification, ctx).await;
+		assert!(
+			result.is_ok(),
+			"degraded mode should ignore notification delivery errors"
+		);
+	}
+
+	#[tokio::test]
+	async fn send_notification_allow_degraded_false_returns_delivery_error() {
+		let capture = NamedTempFile::new().expect("temp file");
+		let relay =
+			single_capture_relay(false, capture.path()).expect("relay with allow_degraded=false");
+		let ctx = IncomingRequestContext::empty();
+
+		let deleted = relay.send_fanout_deletion(ctx.clone()).await;
+		assert!(deleted.is_ok(), "upstream shutdown should succeed");
+
+		let notification = JsonRpcNotification {
+			jsonrpc: Default::default(),
+			notification: ClientNotification::InitializedNotification(
+				rmcp::model::InitializedNotification {
+					method: Default::default(),
+					extensions: Default::default(),
+				},
+			),
+		};
+		let result = relay.send_notification(notification, ctx).await;
+		assert!(
+			result.is_err(),
+			"strict mode should return notification delivery errors"
+		);
+	}
+
 	#[test]
 	fn relay_rejects_backend_name_containing_delimiter() {
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
@@ -2169,6 +2314,7 @@ mod tests {
 					backend_policies: Default::default(),
 				})],
 				stateful: false,
+				allow_degraded: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
