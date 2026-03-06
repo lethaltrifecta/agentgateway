@@ -50,7 +50,7 @@ impl NormalizedLocalConfig {
 	pub async fn from(
 		config: &crate::Config,
 		client: client::Client,
-		oidc: Arc<crate::http::oidc::OidcClient>,
+		oidc: crate::http::oidc::OidcJwtService,
 		gateway_name: ListenerTarget,
 		s: &str,
 	) -> anyhow::Result<NormalizedLocalConfig> {
@@ -1011,9 +1011,6 @@ struct LocalOAuth2Policy {
 	client_secret: crate::serdes::FileOrInline,
 	/// Explicit callback URL configured with the upstream provider.
 	redirect_uri: String,
-	/// Allow non-loopback `http://` redirect URIs for local development only.
-	#[serde(default)]
-	allow_insecure_redirect_uri: bool,
 	/// OAuth scopes requested during browser login flow.
 	#[serde(default)]
 	scopes: Vec<String>,
@@ -1043,7 +1040,6 @@ impl LocalOAuth2Policy {
 			client_id,
 			client_secret,
 			redirect_uri,
-			allow_insecure_redirect_uri,
 			scopes,
 			cookie_name,
 			refreshable_cookie_max_age_seconds,
@@ -1116,7 +1112,6 @@ impl LocalOAuth2Policy {
 			client_secret: secrecy::SecretString::new(client_secret.into()),
 			resolved_provider,
 			redirect_uri: Some(redirect_uri),
-			allow_insecure_redirect_uri,
 			scopes,
 			cookie_name,
 			refreshable_cookie_max_age_seconds,
@@ -1127,30 +1122,54 @@ impl LocalOAuth2Policy {
 		Ok(policy)
 	}
 
-	async fn try_into_runtime(
+	async fn into_resolved_policy(
 		self,
-		client: Client,
-		oidc: crate::http::oidc::OidcJwtResolver<'_>,
-		ctx: &PolicyBuildContext,
-	) -> anyhow::Result<crate::http::oauth2::OAuth2> {
-		let attachment_key = ctx.oauth2_attachment_key()?;
+		client: &Client,
+		oidc: crate::http::oidc::OidcJwtService,
+	) -> anyhow::Result<crate::types::agent::OAuth2Policy> {
 		let mut policy = self.into_policy()?;
 		if policy.resolved_provider.is_some() {
-			return crate::http::oauth2::OAuth2::new(policy, attachment_key);
+			return Ok(policy);
 		}
 
-		let issuer = policy.oidc_issuer.clone().ok_or_else(|| {
-			anyhow!("oauth2 policy requires resolved provider metadata when issuer is not configured")
-		})?;
+		let issuer = policy
+			.oidc_issuer
+			.clone()
+			.ok_or_else(|| anyhow!("oauth2 issuer-based local policy requires an oidc issuer"))?;
 		let resolved_provider = oidc
 			.resolve_oauth2_provider(
-				crate::http::oidc::OidcCallContext::new(&client, None, policy.provider_backend.as_ref()),
+				crate::http::oidc::OidcCallContext::new(client, None, policy.provider_backend.as_ref()),
 				&issuer,
 			)
 			.await
 			.map_err(|e| anyhow!("failed resolving local oauth2 provider metadata: {e}"))?;
 		policy.resolved_provider = Some(Box::new(resolved_provider));
-		crate::http::oauth2::OAuth2::new(policy, attachment_key)
+		crate::http::oauth2::OAuth2::validate_policy(&policy)?;
+		Ok(policy)
+	}
+
+	async fn into_stored_policy(
+		self,
+		client: Client,
+		services: &PolicyBuildServices,
+		ctx: &PolicyBuildContext,
+	) -> anyhow::Result<crate::http::oauth2::StoredOAuth2Policy> {
+		let attachment_key = ctx.oauth2_attachment_key()?;
+		let policy = self
+			.into_resolved_policy(&client, services.oidc.clone())
+			.await?;
+		crate::http::oauth2::StoredOAuth2Policy::new(policy, attachment_key)
+	}
+}
+
+#[derive(Clone)]
+pub(crate) struct PolicyBuildServices {
+	oidc: crate::http::oidc::OidcJwtService,
+}
+
+impl PolicyBuildServices {
+	fn new(oidc: crate::http::oidc::OidcJwtService) -> Self {
+		Self { oidc }
 	}
 }
 
@@ -1548,7 +1567,7 @@ struct TCPFilterOrPolicy {
 
 async fn convert(
 	client: client::Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc: crate::http::oidc::OidcJwtService,
 	gateway: ListenerTarget,
 	config: &crate::Config,
 	i: LocalConfig,
@@ -1710,7 +1729,7 @@ fn llm_model_name_header_match(model_name: &str) -> anyhow::Result<HeaderValueMa
 
 async fn convert_llm_config(
 	client: client::Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc: crate::http::oidc::OidcJwtService,
 	config: &crate::Config,
 	gateway: ListenerTarget,
 	llm_config: LocalLLMConfig,
@@ -2104,7 +2123,7 @@ json(request.body).model
 
 async fn convert_mcp_config(
 	client: client::Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc: crate::http::oidc::OidcJwtService,
 	config: &crate::Config,
 	gateway: ListenerTarget,
 	mcp_config: LocalSimpleMcpConfig,
@@ -2208,7 +2227,7 @@ fn detect_bind_protocol(listeners: &ListenerSet) -> BindProtocol {
 
 async fn convert_listener(
 	client: client::Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc: crate::http::oidc::OidcJwtService,
 	idx: usize,
 	l: LocalListener,
 	bind_key: Strng,
@@ -2323,9 +2342,9 @@ async fn convert_listener(
 	Ok((l, all_policies, all_backends))
 }
 
-pub async fn convert_route(
+pub(crate) async fn convert_route(
 	client: client::Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc: crate::http::oidc::OidcJwtService,
 	lr: LocalRoute,
 	idx: usize,
 	listener_key: ListenerKey,
@@ -2462,10 +2481,11 @@ async fn split_frontend_policies(
 }
 async fn split_policies(
 	client: Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc: crate::http::oidc::OidcJwtService,
 	ctx: &PolicyBuildContext,
 	pol: FilterOrPolicy,
 ) -> Result<ResolvedPolicies, Error> {
+	let services = PolicyBuildServices::new(oidc);
 	let mut resolved = ResolvedPolicies::default();
 	let ResolvedPolicies {
 		backend_policies,
@@ -2535,7 +2555,9 @@ async fn split_policies(
 	}
 	if let Some(p) = mcp_authentication {
 		// Translate local MCP authn into runtime authn with a ready JWT validator.
-		let authn: McpAuthentication = p.translate(client.clone(), oidc.as_ref().jwt()).await?;
+		let authn: McpAuthentication = p
+			.translate(client.clone(), services.oidc.resolver())
+			.await?;
 		backend_policies.push(BackendPolicy::McpAuthentication(authn));
 		// Do NOT inject a separate route-level JwtAuth; MCP router handles validation using jwt_validator.
 	}
@@ -2559,7 +2581,7 @@ async fn split_policies(
 	}
 	if let Some(p) = jwt_auth {
 		route_policies.push(TrafficPolicy::JwtAuth(
-			p.try_into(client.clone(), oidc.as_ref().jwt()).await?,
+			p.try_into(client.clone(), services.oidc.resolver()).await?,
 		));
 	}
 	if let Some(p) = basic_auth {
@@ -2581,10 +2603,8 @@ async fn split_policies(
 		route_policies.push(TrafficPolicy::ExtAuthz(p))
 	}
 	if let Some(p) = oauth2 {
-		let oauth2 = p
-			.try_into_runtime(client.clone(), oidc.as_ref().jwt(), ctx)
-			.await?;
-		route_policies.push(TrafficPolicy::OAuth2(Box::new(oauth2)))
+		let oauth2 = p.into_stored_policy(client.clone(), &services, ctx).await?;
+		route_policies.push(TrafficPolicy::OAuth2(Arc::new(oauth2)))
 	}
 	if let Some(p) = ext_proc {
 		route_policies.push(TrafficPolicy::ExtProc(p))
@@ -2609,7 +2629,7 @@ async fn split_policies(
 #[cfg(test)]
 pub(crate) async fn split_policies_for_test(
 	client: Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc: crate::http::oidc::OidcJwtService,
 	pol: FilterOrPolicy,
 ) -> Result<ResolvedPolicies, Error> {
 	let ctx = PolicyBuildContext::listener_policy("test-listener");

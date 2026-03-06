@@ -298,7 +298,8 @@ pub async fn tls_mock() -> (MockServer, MockTlsCertificates) {
 }
 
 pub struct TestBind {
-	pub pi: Arc<ProxyInputs>,
+	pi: Arc<ProxyInputs>,
+	oidc: Arc<crate::http::oidc::OidcClient>,
 	drain_rx: DrainWatcher,
 	_drain_tx: DrainTrigger,
 
@@ -364,6 +365,9 @@ impl TestBind {
 	}
 	pub fn inputs(&self) -> Arc<ProxyInputs> {
 		self.pi.clone()
+	}
+	pub fn oidc(&self) -> Arc<crate::http::oidc::OidcClient> {
+		self.oidc.clone()
 	}
 	pub fn with_route(self, r: Route) -> Self {
 		self.pi.stores.binds.write().insert_route(r, LISTENER_KEY);
@@ -697,6 +701,7 @@ impl TestBind {
 			bind.protocol,
 			server,
 			self.pi.clone(),
+			self.oidc.clone(),
 			self.drain_rx.clone(),
 		);
 		tokio::spawn(async move {
@@ -711,6 +716,7 @@ impl TestBind {
 		let addr = listener.local_addr().unwrap();
 
 		let pi = self.pi.clone();
+		let oidc = self.oidc.clone();
 		let drain_rx = self.drain_rx.clone();
 
 		tokio::spawn(async move {
@@ -732,6 +738,7 @@ impl TestBind {
 					BindProtocol::http,
 					socket,
 					pi.clone(),
+					oidc.clone(),
 					drain_rx.clone(),
 				);
 				tokio::spawn(bind);
@@ -747,12 +754,11 @@ pub fn setup_proxy_test(cfg: &str) -> anyhow::Result<TestBind> {
 	agent_core::telemetry::testing::setup_test_logging();
 	let config = crate::config::parse_config(cfg.to_string(), None)?;
 	let encoder = config.session_encoder.clone();
-	let oidc = Arc::new(crate::http::oidc::OidcProvider::new());
+	let oidc = Arc::new(crate::http::oidc::OidcClient::new());
 	let stores = Stores::from_init(crate::store::StoresInit {
 		ipv6_enabled: config.ipv6_enabled,
-		oidc: oidc.clone(),
 	});
-	let client = client::Client::new(&config.dns, None, Default::default(), None, oidc.clone());
+	let client = client::Client::new(&config.dns, None, Default::default(), None);
 	let (drain_tx, drain_rx) = drain::new();
 	let pi = Arc::new(ProxyInputs {
 		cfg: Arc::new(config),
@@ -768,6 +774,7 @@ pub fn setup_proxy_test(cfg: &str) -> anyhow::Result<TestBind> {
 	});
 	Ok(TestBind {
 		pi,
+		oidc,
 		drain_rx,
 		_drain_tx: drain_tx,
 

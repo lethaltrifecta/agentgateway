@@ -42,15 +42,15 @@ impl ProxyResponse {
 			| ProxyError::BackendDoesNotExist => ProxyResponseReason::NoHealthyBackend,
 			ProxyError::UpgradeFailed(_, _)
 			| ProxyError::InvalidRequest
+			| ProxyError::AuthPolicyConflict(_)
 			| ProxyError::ProcessingString(_)
 			| ProxyError::Processing(_)
 			| ProxyError::Body(_)
 			| ProxyError::Http(_)
 			| ProxyError::BackendUnsupportedMirror
-			| ProxyError::Generic(_)
 			| ProxyError::FilterError(_) => ProxyResponseReason::Internal,
 			ProxyError::JwtAuthenticationFailure(_) => ProxyResponseReason::JwtAuth,
-			ProxyError::OAuth2AuthenticationFailure(http::oauth2::OAuth2Error::InvalidToken(_)) => {
+			ProxyError::OAuth2AuthenticationFailure(http::oauth2::Error::InvalidToken(_)) => {
 				ProxyResponseReason::JwtAuth
 			},
 			ProxyError::McpJwtAuthenticationFailure(_, _) => ProxyResponseReason::JwtAuth,
@@ -125,8 +125,6 @@ impl Display for ProxyResponseReason {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
-	#[error("generic error: {0}")]
-	Generic(String),
 	#[error("bind not found")]
 	BindNotFound,
 	#[error("listener not found")]
@@ -199,10 +197,12 @@ pub enum ProxyError {
 	InvalidRequest,
 	#[error("request upgrade failed, backend tried {1:?} but {0:?} was requested")]
 	UpgradeFailed(Option<HeaderValue>, Option<HeaderValue>),
+	#[error("invalid auth policy state: {0}")]
+	AuthPolicyConflict(&'static str),
 	#[error("mcp: {0}")]
 	MCP(mcp::Error),
 	#[error("{0}")]
-	OAuth2AuthenticationFailure(#[from] http::oauth2::OAuth2Error),
+	OAuth2AuthenticationFailure(#[from] http::oauth2::Error),
 }
 
 impl ProxyError {
@@ -231,20 +231,24 @@ impl ProxyError {
 			ProxyError::CsrfValidationFailed => StatusCode::FORBIDDEN,
 
 			ProxyError::UpgradeFailed(_, _) => StatusCode::BAD_GATEWAY,
+			ProxyError::AuthPolicyConflict(_) => StatusCode::INTERNAL_SERVER_ERROR,
 
 			// Should it be 4xx?
 			ProxyError::FilterError(_) => StatusCode::INTERNAL_SERVER_ERROR,
 			ProxyError::InvalidRequest => StatusCode::BAD_REQUEST,
 
 			ProxyError::JwtAuthenticationFailure(_) => StatusCode::UNAUTHORIZED,
-			ProxyError::OAuth2AuthenticationFailure(http::oauth2::OAuth2Error::InvalidToken(_)) => {
+			ProxyError::OAuth2AuthenticationFailure(http::oauth2::Error::InvalidToken(_)) => {
 				StatusCode::UNAUTHORIZED
 			},
-			ProxyError::OAuth2AuthenticationFailure(http::oauth2::OAuth2Error::Handshake(_)) => {
+			ProxyError::OAuth2AuthenticationFailure(http::oauth2::Error::Handshake(_)) => {
 				StatusCode::BAD_REQUEST
 			},
-			ProxyError::OAuth2AuthenticationFailure(http::oauth2::OAuth2Error::OidcDiscovery(_)) => {
+			ProxyError::OAuth2AuthenticationFailure(http::oauth2::Error::OidcDiscovery(_)) => {
 				StatusCode::BAD_GATEWAY
+			},
+			ProxyError::OAuth2AuthenticationFailure(http::oauth2::Error::Internal(_)) => {
+				StatusCode::INTERNAL_SERVER_ERROR
 			},
 			ProxyError::BasicAuthenticationFailure(_) => StatusCode::UNAUTHORIZED,
 			ProxyError::APIKeyAuthenticationFailure(_) => StatusCode::UNAUTHORIZED,
@@ -290,7 +294,6 @@ impl ProxyError {
 			ProxyError::MCP(mcp::Error::SendError(_, _)) => StatusCode::INTERNAL_SERVER_ERROR,
 			// Note: we do not return a 401/403 here, as the obscure that it was rejected due to auth
 			ProxyError::MCP(mcp::Error::Authorization(_, _, _)) => StatusCode::INTERNAL_SERVER_ERROR,
-			ProxyError::Generic(_) => StatusCode::INTERNAL_SERVER_ERROR,
 		};
 		let msg = self.to_string();
 		let mut rb = ::http::Response::builder().status(code);
@@ -453,10 +456,4 @@ pub fn resolve_simple_backend_with_policies(
 		backend,
 		inline_policies,
 	})
-}
-
-impl From<anyhow::Error> for ProxyError {
-	fn from(e: anyhow::Error) -> Self {
-		ProxyError::Generic(e.to_string())
-	}
 }

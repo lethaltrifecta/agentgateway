@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::client::Client;
 use crate::http::jwt::{
-	JWTValidationOptions, Jwt, Mode as JwtMode, Provider as JwtProvider, TokenError,
+	Claims, JWTValidationOptions, Jwt, Mode as JwtMode, Provider as JwtProvider, TokenError,
 };
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{ResolvedOAuth2Provider, SimpleBackendReference};
@@ -399,7 +399,6 @@ impl<'a> OidcJwtResolver<'a> {
 				.clone(),
 		})
 	}
-
 	pub async fn get_info(
 		self,
 		ctx: OidcCallContext<'_>,
@@ -418,6 +417,47 @@ impl<'a> OidcJwtResolver<'a> {
 	) -> Result<crate::http::jwt::Claims, Error> {
 		self
 			.client
+			.validate_token(ctx, issuer, audiences, token)
+			.await
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct OidcJwtService {
+	client: Arc<OidcClient>,
+}
+
+impl OidcJwtService {
+	pub fn resolver(&self) -> OidcJwtResolver<'_> {
+		self.client.jwt()
+	}
+
+	pub async fn resolve_oauth2_provider(
+		&self,
+		ctx: OidcCallContext<'_>,
+		issuer: &str,
+	) -> Result<ResolvedOAuth2Provider, Error> {
+		self.client.jwt().resolve_oauth2_provider(ctx, issuer).await
+	}
+
+	pub async fn get_info(
+		&self,
+		ctx: OidcCallContext<'_>,
+		issuer: &str,
+		audiences: Option<Vec<String>>,
+	) -> Result<(Arc<OidcMetadata>, Arc<Jwt>), Error> {
+		self.client.jwt().get_info(ctx, issuer, audiences).await
+	}
+
+	pub async fn validate_token(
+		&self,
+		ctx: OidcCallContext<'_>,
+		issuer: &str,
+		audiences: Option<Vec<String>>,
+		token: &str,
+	) -> Result<Claims, Error> {
+		self
+			.resolver()
 			.validate_token(ctx, issuer, audiences, token)
 			.await
 	}
@@ -501,6 +541,29 @@ impl Default for OidcClient {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct OidcTokenService {
+	client: Arc<OidcClient>,
+}
+
+impl OidcTokenService {
+	pub async fn exchange_code(
+		&self,
+		ctx: OidcCallContext<'_>,
+		req: ExchangeCodeRequest<'_>,
+	) -> Result<TokenResponse, Error> {
+		self.client.tokens().exchange_code(ctx, req).await
+	}
+
+	pub async fn refresh_token(
+		&self,
+		ctx: OidcCallContext<'_>,
+		req: RefreshTokenRequest<'_>,
+	) -> Result<TokenResponse, Error> {
+		self.client.tokens().refresh_token(ctx, req).await
+	}
+}
+
 impl OidcClient {
 	pub fn new() -> Self {
 		Self {
@@ -524,6 +587,18 @@ impl OidcClient {
 
 	pub fn tokens(&self) -> OidcTokenClient<'_> {
 		OidcTokenClient { client: self }
+	}
+
+	pub fn jwt_service(self: &Arc<Self>) -> OidcJwtService {
+		OidcJwtService {
+			client: self.clone(),
+		}
+	}
+
+	pub fn token_service(self: &Arc<Self>) -> OidcTokenService {
+		OidcTokenService {
+			client: self.clone(),
+		}
 	}
 
 	fn validate_issuer_url(issuer: &str) -> Result<(), Error> {
@@ -838,6 +913,7 @@ impl OidcClient {
 					}
 
 					// 4. Slow Path: Network Call (singleflight work gate is held for this cache key)
+					let jwk_set = self.fetch_jwk_set(ctx, metadata).await?;
 					let jwk_set = self.fetch_jwk_set(ctx, metadata).await?;
 
 					let provider = JwtProvider::from_jwks(

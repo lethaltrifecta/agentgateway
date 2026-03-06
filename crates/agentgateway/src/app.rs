@@ -50,16 +50,8 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	let xds_metrics = agent_xds::Metrics::new(sub_registry);
 	agent_core::metrics::TokioCollector::register(sub_registry, &data_plane_handle);
 
-	let oidc = Arc::new(crate::http::oidc::OidcProvider::new());
-
 	// TODO: use for XDS
-	let control_client = client::Client::new(
-		&config.dns,
-		None,
-		config.backend.clone(),
-		None,
-		oidc.clone(),
-	);
+	let control_client = client::Client::new(&config.dns, None, config.backend.clone(), None);
 	let ca = if let Some(cfg) = &config.ca {
 		Some(Arc::new(caclient::CaClient::new(
 			control_client.clone(),
@@ -82,18 +74,12 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 		pool,
 		config.backend.clone(),
 		Some(metrics_handle.clone()),
-		oidc.clone(),
 	);
 
 	let (xds_tx, xds_rx) = tokio::sync::watch::channel(());
-	let state_mgr = state_manager::StateManager::new(
-		config.clone(),
-		control_client.clone(),
-		xds_metrics,
-		xds_tx,
-		oidc.clone(),
-	)
-	.await?;
+	let state_mgr =
+		state_manager::StateManager::new(config.clone(), control_client.clone(), xds_metrics, xds_tx)
+			.await?;
 	let stores = state_mgr.stores();
 	let mut xds_rx_for_task = xds_rx.clone();
 	tokio::spawn(async move {
@@ -119,15 +105,14 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	#[cfg(feature = "ui")]
 	info!("serving UI at http://{}/ui", config.admin_addr);
 
-	let pi = ProxyInputs {
-		cfg: config.clone(),
-		stores: stores.clone(),
-		metrics: metrics_handle.clone(),
-		upstream: client.clone(),
+	let pi = ProxyInputs::new(
+		config.clone(),
+		stores.clone(),
+		metrics_handle.clone(),
+		client.clone(),
 		ca,
-
-		mcp_state: mcp::App::new(stores.clone(), config.session_encoder.clone()),
-	};
+		mcp::App::new(stores.clone(), config.session_encoder.clone()),
+	);
 
 	let gw = proxy::Gateway::new(Arc::new(pi), drain_rx.clone());
 

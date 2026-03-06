@@ -1531,7 +1531,6 @@ mod tests {
 				token_endpoint_auth_methods_supported: vec!["client_secret_post".to_string()],
 			})),
 			redirect_uri: Some("https://example.com/_gateway/callback".to_string()),
-			allow_insecure_redirect_uri: false,
 			scopes: vec!["openid".to_string()],
 			cookie_name: None,
 			refreshable_cookie_max_age_seconds: None,

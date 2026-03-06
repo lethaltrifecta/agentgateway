@@ -20,14 +20,6 @@ pub(crate) fn set_cookie_values(resp: &reqwest::Response) -> Vec<String> {
 		.collect()
 }
 
-pub(crate) fn cookie_header_from_response(resp: &reqwest::Response) -> String {
-	set_cookie_values(resp)
-		.into_iter()
-		.filter_map(|v| v.split(';').next().map(str::trim).map(ToOwned::to_owned))
-		.collect::<Vec<_>>()
-		.join("; ")
-}
-
 pub(crate) fn find_cookie_pair(
 	set_cookie_headers: &[String],
 	cookie_name_prefix: &str,

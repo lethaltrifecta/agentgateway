@@ -33,12 +33,10 @@ impl StateManager {
 		client: client::Client,
 		xds_metrics: agent_xds::Metrics,
 		awaiting_ready: tokio::sync::watch::Sender<()>,
-		oidc: Arc<crate::http::oidc::OidcProvider>,
 	) -> anyhow::Result<Self> {
 		let xds = &config.xds;
 		let stores = Stores::from_init(crate::store::StoresInit {
 			ipv6_enabled: config.ipv6_enabled,
-			oidc,
 		});
 		let xds_client = if let Some(addr) = &xds.address {
 			let connector = control::grpc_connector(
@@ -103,18 +101,25 @@ pub struct LocalClient {
 
 impl LocalClient {
 	pub async fn run(self) -> Result<(), anyhow::Error> {
+		let oidc = Arc::new(crate::http::oidc::OidcClient::new());
 		if let ConfigSource::File(path) = &self.cfg {
 			// Load initial state then watch
-			self.watch_config_file(path).await?;
+			self.watch_config_file(path, oidc).await?;
 		} else {
 			// Load it once
-			self.reload_config(PreviousState::default()).await?;
+			self
+				.reload_config(PreviousState::default(), oidc.jwt_service())
+				.await?;
 		}
 
 		Ok(())
 	}
 
-	async fn watch_config_file(&self, path: &Path) -> anyhow::Result<()> {
+	async fn watch_config_file(
+		&self,
+		path: &Path,
+		oidc: Arc<crate::http::oidc::OidcClient>,
+	) -> anyhow::Result<()> {
 		let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
 		// Create a watcher with a 250ms debounce
@@ -138,7 +143,9 @@ impl LocalClient {
 		info!("Watching config file: {}", path.display());
 
 		let lc: LocalClient = self.to_owned();
-		let mut next_state = lc.reload_config(PreviousState::default()).await?;
+		let mut next_state = lc
+			.reload_config(PreviousState::default(), oidc.jwt_service())
+			.await?;
 		tokio::task::spawn(async move {
 			// Resolve initial target (symlink or not)
 			let mut real_config_path = lc.resolve_symlink(&abspath).await.ok();
@@ -156,7 +163,10 @@ impl LocalClient {
 				}) {
 					real_config_path = current_config_path.clone();
 					info!("Config file changed, reloading...");
-					match lc.reload_config(next_state.clone()).await {
+					match lc
+						.reload_config(next_state.clone(), oidc.jwt_service())
+						.await
+					{
 						Ok(nxt) => {
 							next_state = nxt;
 							info!("Config reloaded successfully")
@@ -188,11 +198,16 @@ impl LocalClient {
 		}
 	}
 
-	async fn reload_config(&self, prev: PreviousState) -> anyhow::Result<PreviousState> {
+	async fn reload_config(
+		&self,
+		prev: PreviousState,
+		oidc: crate::http::oidc::OidcJwtService,
+	) -> anyhow::Result<PreviousState> {
 		let config_content = self.cfg.read_to_string().await?;
 		let config = crate::types::local::NormalizedLocalConfig::from(
 			&self.config,
 			self.client.clone(),
+			oidc,
 			self.gateway.clone(),
 			config_content.as_str(),
 		)

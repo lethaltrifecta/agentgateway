@@ -27,6 +27,7 @@ import (
 
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/identity/jwks_url"
 	agwir "github.com/agentgateway/agentgateway/controller/pkg/agentgateway/ir"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/plugins"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/translator"
@@ -468,22 +469,20 @@ func (s *Syncer) buildAgwResources(gateways krt.Collection[*translator.GatewayLi
 		return []utils.TypedNamespacedName{o.From}
 	}).AsCollection(append(krtopts.ToOptions("RouteAttachments"), utils.TypedNamespacedNameIndexCollectionFunc)...)
 
-	ancestorsIndex := krt.NewIndex(ancestorBackends, "ancestors", func(o *utils.AncestorBackend) []utils.TypedNamespacedName {
+	policyAncestorBackends := plugins.BuildPolicyAncestorBackendsCollection(s.agwCollections)
+	allAncestorBackends := krt.JoinCollection(
+		[]krt.Collection[*utils.AncestorBackend]{ancestorBackends, policyAncestorBackends},
+		krtopts.ToOptions("AllAncestorBackends")...,
+	)
+	allAncestorsIndex := krt.NewIndex(allAncestorBackends, "all-ancestors", func(o *utils.AncestorBackend) []utils.TypedNamespacedName {
 		return []utils.TypedNamespacedName{o.Backend}
 	})
-	ancestorCollection := ancestorsIndex.AsCollection(append(krtopts.ToOptions("AncestorBackend"), utils.TypedNamespacedNameIndexCollectionFunc)...)
-	referenceIndex := plugins.BuildReferenceIndex(ancestorCollection, routeAttachmentsIndex)
-	agwPolicies, policyReferences, policyStatuses := AgwPolicyCollection(s.agwPlugins, referenceIndex, krtopts)
-	backendPolicyReferences := s.newAgwBackendPolicyReferences(s.agwCollections.Backends, krtopts)
-	joinedPolicyReferences := krt.JoinCollection([]krt.Collection[*plugins.PolicyAttachment]{policyReferences, backendPolicyReferences}, krtopts.ToOptions("JoinPolicyAttachment")...)
-	policyReferencesIndex := krt.NewIndex(joinedPolicyReferences, "policyReferences", func(o *plugins.PolicyAttachment) []utils.TypedNamespacedName {
-		return []utils.TypedNamespacedName{o.Backend}
-	})
-	policyReferencesIndexCollection := policyReferencesIndex.AsCollection(append(krtopts.ToOptions("PolicyReferencesIndex"), utils.TypedNamespacedNameIndexCollectionFunc)...)
-	referenceIndex = referenceIndex.WithPolicyAttachments(policyReferencesIndexCollection)
+	allAncestorCollection := allAncestorsIndex.AsCollection(append(krtopts.ToOptions("AllAncestorBackendIndex"), utils.TypedNamespacedNameIndexCollectionFunc)...)
+	referenceIndex := plugins.BuildReferenceIndex(allAncestorCollection, routeAttachmentsIndex)
+	agwPolicies, policyStatuses := AgwPolicyCollection(s.agwPlugins, referenceIndex, krtopts)
 
 	// Create an agentgateway backend collection from the kgateway backend resources
-	agwBackendStatus, agwBackends := s.newAgwBackendCollection(s.agwCollections.Backends, referenceIndex, krtopts)
+	agwBackendStatus, agwBackends := s.newAgwBackendCollection(s.agwCollections.Backends, allAncestorCollection, krtopts)
 
 	// Join all Agw resources
 	allAgwResources := krt.JoinCollection([]krt.Collection[agwir.AgwResource]{binds, listeners, agwRoutes, agwPolicies, agwBackends}, krtopts.ToOptions("Resources")...)
@@ -540,8 +539,9 @@ func (s *Syncer) newAgwBackendCollection(
 		[]agwir.AgwResource,
 	) {
 		pc := plugins.PolicyCtx{
-			Krt:         ctx,
-			Collections: s.agwCollections,
+			Krt:            ctx,
+			Collections:    s.agwCollections,
+			JWKSURLBuilder: jwks_url.NewJwksUrlFactory(s.agwCollections.BackendTransportLookup),
 		}
 		return agentgatewaybackend.TranslateAgwBackend(pc, backend, references)
 	}, krtopts.ToOptions("Backends")...)

@@ -149,7 +149,6 @@ policies:
       traffic:
         jwtAuth:
           mode: optional
-          forward: false
           providers:
             - issuer: agentgateway.dev
               keys:

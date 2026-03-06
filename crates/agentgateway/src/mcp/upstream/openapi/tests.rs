@@ -29,10 +29,8 @@ async fn setup() -> (MockServer, Handler) {
 	let parsed = reqwest::Url::parse(&host).unwrap();
 	let config = crate::config::parse_config("{}".to_string(), None).unwrap();
 	let encoder = config.session_encoder.clone();
-	let oidc = Arc::new(crate::http::oidc::OidcProvider::new());
 	let stores = Stores::from_init(crate::store::StoresInit {
 		ipv6_enabled: config.ipv6_enabled,
-		oidc: oidc.clone(),
 	});
 	let client = Client::new(
 		&client::Config {
@@ -42,20 +40,18 @@ async fn setup() -> (MockServer, Handler) {
 		None,
 		BackendConfig::default(),
 		None,
-		oidc.clone(),
 	);
-	let pi = Arc::new(ProxyInputs {
-		cfg: Arc::new(config),
-		stores: stores.clone(),
-		metrics: Arc::new(crate::metrics::Metrics::new(
+	let pi = Arc::new(ProxyInputs::new(
+		Arc::new(config),
+		stores.clone(),
+		Arc::new(crate::metrics::Metrics::new(
 			metrics::sub_registry(&mut Registry::default()),
 			Default::default(),
 		)),
-		upstream: client.clone(),
-		ca: None,
-
-		mcp_state: mcp::router::App::new(stores.clone(), encoder),
-	});
+		client.clone(),
+		None,
+		mcp::router::App::new(stores.clone(), encoder),
+	));
 
 	let client = PolicyClient { inputs: pi.clone() };
 	// Define a sample tool for testing
