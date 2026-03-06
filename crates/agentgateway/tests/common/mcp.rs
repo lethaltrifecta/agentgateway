@@ -24,6 +24,9 @@ use tokio::sync::oneshot;
 
 use super::task_store::TaskStore;
 
+pub(crate) const TEST_SESSION_KEY: &str =
+	"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
 pub(crate) type ComprehensiveClient = RunningService<RoleClient, ComprehensiveClientHandler>;
 
 pub(crate) async fn setup_comprehensive_client(
@@ -199,7 +202,9 @@ pub(crate) fn multiplex_config(
 ) -> String {
 	format!(
 		r#"
-config: {{}}
+config:
+  session:
+    key: {TEST_SESSION_KEY}
 binds:
 - port: $PORT
   listeners:
@@ -238,7 +243,9 @@ pub(crate) fn multiplex_transport_matrix_config(
 ) -> String {
 	format!(
 		r#"
-config: {{}}
+config:
+  session:
+    key: {TEST_SESSION_KEY}
 binds:
 - port: $PORT
   listeners:
@@ -274,7 +281,9 @@ pub(crate) fn simple_multiplex_config(
 	targets: &[(String, std::net::SocketAddr)],
 ) -> String {
 	let mut config = format!(
-		r#"config: {{}}
+		r#"config:
+  session:
+    key: {TEST_SESSION_KEY}
 binds:
 - port: $PORT
   listeners:

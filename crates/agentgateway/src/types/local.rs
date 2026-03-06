@@ -742,6 +742,7 @@ impl LocalBackend {
 						McpPrefixMode::Conditional => false,
 					}),
 					allow_degraded: tgt.allow_degraded,
+					allow_insecure_multiplex: tgt.allow_insecure_multiplex,
 				};
 				backends.push(Backend::MCP(name, m).into());
 				backends
@@ -809,6 +810,8 @@ pub struct LocalMcpBackend {
 	pub prefix_mode: Option<McpPrefixMode>,
 	#[serde(default)]
 	pub allow_degraded: bool,
+	#[serde(default)]
+	pub allow_insecure_multiplex: bool,
 }
 
 #[apply(schema_de!)]

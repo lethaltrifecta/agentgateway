@@ -18,9 +18,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common::gateway::AgentGateway;
 use crate::common::mcp::{
-	ComprehensiveClient, MockMcpServer, multiplex_config, multiplex_transport_matrix_config,
-	setup_comprehensive_client, simple_multiplex_config, start_mock_legacy_sse_server,
-	start_mock_mcp_meta_server, start_mock_mcp_server, start_mock_mcp_tools_only_prompt_leak_server,
+	ComprehensiveClient, MockMcpServer, TEST_SESSION_KEY, multiplex_config,
+	multiplex_transport_matrix_config, setup_comprehensive_client, simple_multiplex_config,
+	start_mock_legacy_sse_server, start_mock_mcp_meta_server, start_mock_mcp_server,
+	start_mock_mcp_tools_only_prompt_leak_server,
 };
 
 struct MultiplexTestFixture {
@@ -163,7 +164,13 @@ fn enterprise_multiplex_config(
 	broken_addr: SocketAddr,
 ) -> String {
 	let mut config = String::from(
-		r#"config: {}
+		r#"config:
+  session:
+    key: "#,
+	);
+	config.push_str(TEST_SESSION_KEY);
+	config.push_str(
+		r#"
 binds:
 - port: $PORT
   listeners:

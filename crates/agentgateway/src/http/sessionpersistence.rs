@@ -148,10 +148,17 @@ pub enum Error {
 	InvalidSessionEncoding,
 	#[error("invalid session format: {0}")]
 	InvalidSessionFormat(#[from] serde_json::Error),
+	#[error("multiplexed MCP sessions require encrypted session ids")]
+	EncryptedSessionIdsRequired,
 	#[error("encryption: {0}")]
 	Encryption(#[from] aes::Error),
 }
 
+/// Encodes client-visible MCP identifiers.
+///
+/// `Base64` keeps identifiers ASCII-safe without adding authenticity or
+/// confidentiality. `Aes` encrypts the payload so multiplex session state can be
+/// carried by the client without being forgeable or inspectable.
 #[derive(Debug, Clone)]
 pub enum Encoder {
 	Base64(base64::Encoder),
@@ -162,6 +169,7 @@ impl Encoder {
 	pub fn base64() -> Encoder {
 		Encoder::Base64(base64::Encoder)
 	}
+
 	pub fn aes(key: &str) -> anyhow::Result<Encoder> {
 		let key = hex::decode(key)?;
 		// AES-256-GCM requires a 32-byte key (64 hex characters when encoded with `openssl rand -hex 32`).
@@ -172,8 +180,12 @@ impl Encoder {
 				key.len() * 2,
 			);
 		}
-		let enc = aes::Encoder::new(key.as_ref())?;
-		Ok(Encoder::Aes(Arc::new(enc)))
+		let e = aes::Encoder::new(key.as_ref())?;
+		Ok(Encoder::Aes(Arc::new(e)))
+	}
+
+	pub const fn is_encrypted(&self) -> bool {
+		matches!(self, Encoder::Aes(_))
 	}
 }
 
@@ -196,6 +208,7 @@ impl Encoder {
 			Encoder::Aes(e) => e.encrypt(plaintext).map_err(Into::into),
 		}
 	}
+
 	pub fn decrypt(&self, encoded: &str) -> Result<Vec<u8>, Error> {
 		match self {
 			Encoder::Base64(e) => e

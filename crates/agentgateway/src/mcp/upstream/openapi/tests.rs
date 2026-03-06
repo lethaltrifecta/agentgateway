@@ -1045,6 +1045,7 @@ async fn test_openapi_from_url() {
 		stateful_mode: McpStatefulMode::Stateful,
 		prefix_mode: None,
 		allow_degraded: false,
+		allow_insecure_multiplex: false,
 	});
 
 	// Convert to runtime backends

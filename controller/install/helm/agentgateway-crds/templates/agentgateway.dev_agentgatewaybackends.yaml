@@ -6604,16 +6604,18 @@ spec:
               mcp:
                 description: mcp represents an MCP backend
                 properties:
-                  failureMode:
+                  allowDegraded:
                     description: |-
-                      FailureMode controls behavior when MCP targets fail to initialize or
-                      become unavailable at runtime. "FailOpen" skips failed targets and
-                      continues serving from healthy ones. "FailClosed" (default) fails the
-                      entire session if any target fails.
-                    enum:
-                    - FailOpen
-                    - FailClosed
-                    type: string
+                      AllowDegraded allows MCP backend initialization and runtime fanout to
+                      continue when some targets fail.
+                    type: boolean
+                  allowInsecureMultiplex:
+                    description: |-
+                      AllowInsecureMultiplex explicitly allows insecure base64 multiplex session ids.
+
+                      This is unsafe and intended only for local or single-user development
+                      environments where clients are fully trusted.
+                    type: boolean
                   sessionRouting:
                     description: |-
                       SessionRouting configures MCP session behavior for requests.

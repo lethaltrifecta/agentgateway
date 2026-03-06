@@ -5954,8 +5954,13 @@ type MCPBackend struct {
 	// Allow backend group initialization and runtime fanout to continue when
 	// some MCP targets fail.
 	AllowDegraded bool `protobuf:"varint,5,opt,name=allow_degraded,json=allowDegraded,proto3" json:"allow_degraded,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Explicitly allows insecure base64 multiplex session ids.
+	//
+	// This is unsafe and intended only for local or single-user development
+	// environments where clients are fully trusted.
+	AllowInsecureMultiplex bool `protobuf:"varint,6,opt,name=allow_insecure_multiplex,json=allowInsecureMultiplex,proto3" json:"allow_insecure_multiplex,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *MCPBackend) Reset() {
@@ -6012,6 +6017,13 @@ func (x *MCPBackend) GetPrefixMode() MCPBackend_PrefixMode {
 func (x *MCPBackend) GetAllowDegraded() bool {
 	if x != nil {
 		return x.AllowDegraded
+	}
+	return false
+}
+
+func (x *MCPBackend) GetAllowInsecureMultiplex() bool {
+	if x != nil {
+		return x.AllowInsecureMultiplex
 	}
 	return false
 }
@@ -11886,14 +11898,15 @@ const file_resource_proto_rawDesc = "" +
 	"\bproviderB\x10\n" +
 	"\x0e_path_override\x1a\\\n" +
 	"\rProviderGroup\x12K\n" +
-	"\tproviders\x18\x01 \x03(\v2-.agentgateway.dev.resource.AIBackend.ProviderR\tproviders\"\xf7\x02\n" +
+	"\tproviders\x18\x01 \x03(\v2-.agentgateway.dev.resource.AIBackend.ProviderR\tproviders\"\xb1\x03\n" +
 	"\n" +
 	"MCPBackend\x12>\n" +
 	"\atargets\x18\x02 \x03(\v2$.agentgateway.dev.resource.MCPTargetR\atargets\x12W\n" +
 	"\rstateful_mode\x18\x03 \x01(\x0e22.agentgateway.dev.resource.MCPBackend.StatefulModeR\fstatefulMode\x12Q\n" +
 	"\vprefix_mode\x18\x04 \x01(\x0e20.agentgateway.dev.resource.MCPBackend.PrefixModeR\n" +
 	"prefixMode\x12%\n" +
-	"\x0eallow_degraded\x18\x05 \x01(\bR\rallowDegraded\"+\n" +
+	"\x0eallow_degraded\x18\x05 \x01(\bR\rallowDegraded\x128\n" +
+	"\x18allow_insecure_multiplex\x18\x06 \x01(\bR\x16allowInsecureMultiplex\"+\n" +
 	"\fStatefulMode\x12\f\n" +
 	"\bSTATEFUL\x10\x00\x12\r\n" +
 	"\tSTATELESS\x10\x01\")\n" +

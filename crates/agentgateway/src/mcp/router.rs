@@ -35,8 +35,9 @@ pub struct App {
 }
 
 impl App {
-	pub fn new(state: Stores, encoder: Encoder) -> Self {
-		let session: Arc<SessionManager> = Arc::new(crate::mcp::session::SessionManager::new(encoder));
+	pub fn new(state: Stores, session_encoder: Encoder) -> Self {
+		let session: Arc<SessionManager> =
+			Arc::new(crate::mcp::session::SessionManager::new(session_encoder));
 		Self { state, session }
 	}
 
@@ -107,6 +108,7 @@ impl App {
 				targets: nt,
 				stateful: backend.stateful,
 				allow_degraded: backend.allow_degraded,
+				allow_insecure_multiplex: backend.allow_insecure_multiplex,
 			}
 		};
 		let sm = self.session.clone();
@@ -179,6 +181,7 @@ pub struct McpBackendGroup {
 	pub targets: Vec<Arc<McpTarget>>,
 	pub stateful: bool,
 	pub allow_degraded: bool,
+	pub allow_insecure_multiplex: bool,
 }
 
 impl McpBackendGroup {
@@ -241,6 +244,7 @@ impl McpBackendGroup {
 			targets,
 			stateful: self.stateful,
 			allow_degraded,
+			allow_insecure_multiplex: self.allow_insecure_multiplex,
 		})
 	}
 }

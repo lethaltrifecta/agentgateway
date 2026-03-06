@@ -1193,6 +1193,8 @@ pub struct McpBackend {
 	pub always_use_prefix: bool,
 	#[serde(skip_serializing_if = "is_false")]
 	pub allow_degraded: bool,
+	#[serde(skip_serializing_if = "is_false")]
+	pub allow_insecure_multiplex: bool,
 }
 
 impl McpBackend {

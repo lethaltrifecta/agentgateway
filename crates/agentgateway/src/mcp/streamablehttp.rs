@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::http::{Request, Response};
 use crate::mcp::handler::RelayInputs;
-use crate::mcp::session::{Session, SessionManager};
+use crate::mcp::session::{Session, SessionManager, dropper};
 use crate::telemetry::log::AsyncLog;
 use crate::*;
 use ::http::StatusCode;
@@ -110,13 +110,15 @@ impl StreamableHttpService {
 		if !self.config.stateful_mode {
 			let relay = inputs.build_new_connections()?;
 			// Use stateless session - not registered in session manager
-			let mut session = self.session_manager.create_stateless_session(relay);
+			let mut session = self
+				.session_manager
+				.create_stateless_session(relay)
+				.map_err(|error| mcp::Error::StartSession(error.to_string()))?;
+			let cleanup = dropper(self.session_manager.clone(), session.clone(), part.clone());
 			let response = session
 				.stateless_send_and_initialize(part.clone(), message)
 				.await;
-
-			// Clean up upstream resources (e.g., stdio processes)
-			let _ = session.delete_session(part).await;
+			cleanup.cleanup().await;
 			return response;
 		}
 
@@ -320,6 +322,7 @@ mod tests {
 				targets,
 				stateful: true,
 				allow_degraded,
+				allow_insecure_multiplex: false,
 			},
 			policies: McpAuthorizationSet::new(vec![].into()),
 			client: PolicyClient {
@@ -329,12 +332,12 @@ mod tests {
 	}
 
 	fn encode_snapshot(
-		encoder: &Encoder,
+		session_encoder: &Encoder,
 		members: Vec<MCPSnapshotMember>,
 		routing: MCPSnapshotRouting,
 	) -> String {
 		SessionState::MCPSnapshot(MCPSnapshotState::new(members, routing))
-			.encode(encoder)
+			.encode(session_encoder)
 			.expect("snapshot should encode")
 	}
 

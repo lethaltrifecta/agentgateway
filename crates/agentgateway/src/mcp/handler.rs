@@ -1,6 +1,6 @@
 use agent_core::strng::Strng;
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join_all};
 use http::StatusCode;
 use http::request::Parts;
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
@@ -15,9 +15,8 @@ use rmcp::model::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -34,20 +33,18 @@ use crate::mcp::router::McpBackendGroup;
 use crate::mcp::session::SessionContinuity;
 use crate::mcp::streamablehttp::ServerSseMessage;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
-use crate::mcp::{ClientError, MCPInfo, mergestream, rbac, upstream};
+use crate::mcp::{
+	ClientError, MCPInfo, local_session_binding, mergestream, rbac, session_binding_tag, upstream,
+};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::{AsyncLog, SpanWriteOnDrop, SpanWriter};
 
 // Double underscore namespacing (SEP-993) avoids collisions with tool names that include "_".
 // Reference: modelcontextprotocol/modelcontextprotocol#94.
-const DELIMITER: &str = "__";
+const TARGET_NAME_DELIMITER: &str = "__";
 const AGW_SCHEME: &str = "agw";
-const URI_PARAM: &str = "u";
+const AGW_URI_QUERY_PARAM: &str = "u";
 const ELICITATION_RESPONSE_METHOD: &str = ElicitationResponseNotificationMethod::VALUE;
-const ROUTED_REQUEST_ID_KIND: &str = "agw-request";
-const ROUTED_REQUEST_ID_VERSION: u8 = 1;
-const ELICITATION_ROUTE_ID_KIND: &str = "agw-elicitation";
-const ELICITATION_ROUTE_ID_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,11 +70,29 @@ struct ElicitationRouteId {
 }
 
 impl ElicitationRouteId {
+	const KIND: &str = "agw-elicitation";
+	const VERSION: u8 = 1;
+
 	fn new(session_binding: &str, target: &str, original_id: &str) -> Self {
 		Self {
-			kind: ELICITATION_ROUTE_ID_KIND.to_string(),
-			version: ELICITATION_ROUTE_ID_VERSION,
+			kind: Self::KIND.to_string(),
+			version: Self::VERSION,
 			session_binding: session_binding.to_string(),
+			target: target.to_string(),
+			original_id: original_id.to_string(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PendingElicitation {
+	target: String,
+	original_id: String,
+}
+
+impl PendingElicitation {
+	fn new(target: &str, original_id: &str) -> Self {
+		Self {
 			target: target.to_string(),
 			original_id: original_id.to_string(),
 		}
@@ -109,14 +124,17 @@ struct RoutedRequestId {
 }
 
 impl RoutedRequestId {
+	const KIND: &str = "agw-request";
+	const VERSION: u8 = 1;
+
 	fn new(session_binding: &str, target: &str, original_id: &RequestId) -> Self {
 		let (original_id_kind, original_id) = match original_id {
 			RequestId::Number(value) => (RoutedRequestIdKind::Number, value.to_string()),
 			RequestId::String(value) => (RoutedRequestIdKind::String, value.to_string()),
 		};
 		Self {
-			kind: ROUTED_REQUEST_ID_KIND.to_string(),
-			version: ROUTED_REQUEST_ID_VERSION,
+			kind: Self::KIND.to_string(),
+			version: Self::VERSION,
 			session_binding: session_binding.to_string(),
 			target: target.to_string(),
 			original_id_kind,
@@ -125,12 +143,12 @@ impl RoutedRequestId {
 	}
 
 	fn into_parts(self) -> Result<(String, RequestId), UpstreamError> {
-		if self.kind != ROUTED_REQUEST_ID_KIND {
+		if self.kind != Self::KIND {
 			return Err(UpstreamError::InvalidRequest(
 				"unknown routed request id kind".to_string(),
 			));
 		}
-		if self.version != ROUTED_REQUEST_ID_VERSION {
+		if self.version != Self::VERSION {
 			return Err(UpstreamError::InvalidRequest(
 				"unsupported routed request id version".to_string(),
 			));
@@ -199,16 +217,6 @@ fn decode_target_from_uri_host(target: &str) -> Option<String> {
 		.map(|decoded| decoded.into_owned())
 }
 
-fn session_binding_fingerprint(session_handle: &str) -> String {
-	let mut hasher = Sha256::new();
-	hasher.update(session_handle.as_bytes());
-	hex::encode(hasher.finalize())
-}
-
-fn local_session_binding() -> String {
-	session_binding_fingerprint(&uuid::Uuid::new_v4().to_string())
-}
-
 /// Prepends the server name to a resource name when multiplexing.
 ///
 /// This ensures resource names are unique across multiple backends.
@@ -224,7 +232,7 @@ fn resource_name<'a>(
 	if default_target_name.is_some() {
 		return name;
 	}
-	Cow::Owned(format!("{target}{DELIMITER}{name}"))
+	Cow::Owned(format!("{target}{TARGET_NAME_DELIMITER}{name}"))
 }
 
 fn prefix_task_id(default_target_name: Option<&str>, server_name: &str, task_id: &mut String) {
@@ -255,7 +263,7 @@ fn wrap_resource_uri<'a>(
 	encoded.push_str("://");
 	encoded.push_str(&encode_target_for_uri_host(target));
 	encoded.push_str("/?");
-	encoded.push_str(URI_PARAM);
+	encoded.push_str(AGW_URI_QUERY_PARAM);
 	encoded.push('=');
 
 	let bytes = uri.as_bytes();
@@ -312,11 +320,13 @@ pub struct Relay {
 	default_target_name: Option<String>,
 	is_multiplexing: bool,
 	allow_degraded: bool,
+	allow_insecure_multiplex: bool,
 	// std::sync::RwLock is intentional: all accesses are synchronous (inside MergeFn or
 	// upstreams_with_capability), never held across await points.
 	upstream_infos: Arc<RwLock<HashMap<Strng, ServerInfo>>>,
 	route_id_encoder: Encoder,
 	session_binding: Arc<RwLock<String>>,
+	pending_elicitations: Arc<RwLock<HashMap<String, PendingElicitation>>>,
 }
 
 pub struct RelayInputs {
@@ -404,14 +414,15 @@ impl Relay {
 		runtime_allow_degraded: bool,
 		routing: MCPSnapshotRouting,
 	) -> Result<Self, mcp::Error> {
+		let allow_insecure_multiplex = backend.allow_insecure_multiplex;
 		for target in &backend.targets {
-			if target.name.contains(DELIMITER) {
+			if target.name.contains(TARGET_NAME_DELIMITER) {
 				return Err(mcp::Error::SendError(
 					None,
 					format!(
 						"backend target name {:?} must not contain the reserved delimiter {:?}",
 						target.name.as_str(),
-						DELIMITER
+						TARGET_NAME_DELIMITER
 					),
 				));
 			}
@@ -422,9 +433,12 @@ impl Relay {
 			default_target_name: routing.default_target_name,
 			is_multiplexing: routing.is_multiplexing,
 			allow_degraded: runtime_allow_degraded,
+			allow_insecure_multiplex,
 			upstream_infos: Arc::new(RwLock::new(HashMap::new())),
+			// The concrete encoder is bound once the downstream session id exists.
 			route_id_encoder: Encoder::base64(),
 			session_binding: Arc::new(RwLock::new(local_session_binding())),
+			pending_elicitations: Arc::new(RwLock::new(HashMap::new())),
 		})
 	}
 
@@ -435,9 +449,11 @@ impl Relay {
 			default_target_name: self.default_target_name.clone(),
 			is_multiplexing: self.is_multiplexing,
 			allow_degraded: self.allow_degraded,
+			allow_insecure_multiplex: self.allow_insecure_multiplex,
 			upstream_infos: self.upstream_infos.clone(),
 			route_id_encoder: self.route_id_encoder.clone(),
 			session_binding: self.session_binding.clone(),
+			pending_elicitations: self.pending_elicitations.clone(),
 		}
 	}
 
@@ -452,7 +468,7 @@ impl Relay {
 			tracing::error!("session binding lock poisoned while updating; continuing");
 			e.into_inner()
 		});
-		*binding = session_binding_fingerprint(session_handle);
+		*binding = session_binding_tag(session_handle);
 	}
 
 	pub fn parse_resource_name<'a, 'b: 'a>(
@@ -463,7 +479,7 @@ impl Relay {
 			Ok((default, res))
 		} else {
 			res
-				.split_once(DELIMITER)
+				.split_once(TARGET_NAME_DELIMITER)
 				.ok_or(UpstreamError::InvalidRequest(
 					"invalid resource name".to_string(),
 				))
@@ -481,19 +497,61 @@ impl Relay {
 		let target = decode_target_from_uri_host(parsed.host_str()?)?;
 		parsed
 			.query_pairs()
-			.find(|(k, _)| k == URI_PARAM)
+			.find(|(k, _)| k == AGW_URI_QUERY_PARAM)
 			.map(|(_, v)| (target, v.into_owned()))
 	}
 
-	fn should_prefix_identifiers(&self) -> bool {
+	pub fn uses_routed_identifiers(&self) -> bool {
 		self.default_target_name.is_none()
+	}
+
+	fn register_pending_elicitation(&self, routed_id: &str, target: &str, original_id: &str) {
+		let mut pending = self.pending_elicitations.write().unwrap_or_else(|e| {
+			tracing::error!("pending elicitation lock poisoned while registering; continuing");
+			e.into_inner()
+		});
+		pending.insert(
+			routed_id.to_string(),
+			PendingElicitation::new(target, original_id),
+		);
+	}
+
+	fn clear_pending_elicitation(&self, target: &str, original_id: &str) {
+		let needle = PendingElicitation::new(target, original_id);
+		let mut pending = self.pending_elicitations.write().unwrap_or_else(|e| {
+			tracing::error!("pending elicitation lock poisoned while clearing; continuing");
+			e.into_inner()
+		});
+		let stale = pending
+			.iter()
+			.filter_map(|(routed_id, active)| (active == &needle).then_some(routed_id.clone()))
+			.collect::<HashSet<_>>();
+		if stale.is_empty() {
+			return;
+		}
+		pending.retain(|routed_id, _| !stale.contains(routed_id));
+	}
+
+	fn take_active_elicitation(&self, routed_id: &str, target: &str, original_id: &str) -> bool {
+		let expected = PendingElicitation::new(target, original_id);
+		let mut pending = self.pending_elicitations.write().unwrap_or_else(|e| {
+			tracing::error!("pending elicitation lock poisoned while consuming; continuing");
+			e.into_inner()
+		});
+		pending
+			.remove(routed_id)
+			.is_some_and(|active| active == expected)
 	}
 
 	/// Rewrites a downstream Request ID to ensure uniqueness across upstreams.
 	///
-	fn encode_upstream_request_id(&self, server_name: &str, id: &RequestId) -> RequestId {
-		if !self.should_prefix_identifiers() {
-			return id.clone();
+	fn encode_upstream_request_id(
+		&self,
+		server_name: &str,
+		id: &RequestId,
+	) -> Result<RequestId, ClientError> {
+		if !self.uses_routed_identifiers() {
+			return Ok(id.clone());
 		}
 		// Bind routed IDs to the current downstream session so replayed or
 		// cross-session tokens cannot steer a request to the wrong upstream.
@@ -504,33 +562,37 @@ impl Relay {
 		let route_id = RoutedRequestId::new(session_binding.as_str(), server_name, id);
 		let plaintext =
 			serde_json::to_string(&route_id).expect("serializing routed request id should not fail");
-		match self.route_id_encoder.encrypt(&plaintext) {
-			Ok(encoded) => RequestId::String(encoded.into()),
-			Err(error) => {
-				tracing::warn!(
-					%error,
-					%server_name,
-					"failed to encode routed request id; leaving original id unwrapped"
-				);
-				id.clone()
-			},
-		}
+		self
+			.route_id_encoder
+			.encrypt(&plaintext)
+			.map(|encoded| RequestId::String(encoded.into()))
+			.map_err(|error| {
+				ClientError::new(anyhow::anyhow!(
+					"failed to encode routed request id for {server_name}: {error}"
+				))
+			})
 	}
 
 	fn encode_upstream_progress_token(
 		&self,
 		server_name: &str,
 		token: &rmcp::model::ProgressToken,
-	) -> rmcp::model::ProgressToken {
-		if !self.should_prefix_identifiers() {
-			return token.clone();
+	) -> Result<rmcp::model::ProgressToken, ClientError> {
+		if !self.uses_routed_identifiers() {
+			return Ok(token.clone());
 		}
-		rmcp::model::ProgressToken(self.encode_upstream_request_id(server_name, &token.0))
+		self
+			.encode_upstream_request_id(server_name, &token.0)
+			.map(rmcp::model::ProgressToken)
 	}
 
-	fn encode_upstream_elicitation_id(&self, server_name: &str, elicitation_id: &str) -> String {
-		if !self.should_prefix_identifiers() {
-			return elicitation_id.to_string();
+	fn encode_upstream_elicitation_id(
+		&self,
+		server_name: &str,
+		elicitation_id: &str,
+	) -> Result<String, ClientError> {
+		if !self.uses_routed_identifiers() {
+			return Ok(elicitation_id.to_string());
 		}
 		let session_binding = self.session_binding.read().unwrap_or_else(|e| {
 			tracing::error!("session binding lock poisoned while encoding elicitation id; continuing");
@@ -539,17 +601,11 @@ impl Relay {
 		let route_id = ElicitationRouteId::new(session_binding.as_str(), server_name, elicitation_id);
 		let plaintext =
 			serde_json::to_string(&route_id).expect("serializing elicitation route id should not fail");
-		match self.route_id_encoder.encrypt(&plaintext) {
-			Ok(encoded) => encoded,
-			Err(error) => {
-				tracing::warn!(
-					%error,
-					%server_name,
-					"failed to encode elicitation route id; leaving original id unwrapped"
-				);
-				elicitation_id.to_string()
-			},
-		}
+		self.route_id_encoder.encrypt(&plaintext).map_err(|error| {
+			ClientError::new(anyhow::anyhow!(
+				"failed to encode elicitation route id for {server_name}: {error}"
+			))
+		})
 	}
 
 	fn decode_upstream_progress_token(
@@ -576,12 +632,12 @@ impl Relay {
 		let route_id = serde_json::from_slice::<ElicitationRouteId>(&encoded).map_err(|_| {
 			UpstreamError::InvalidRequest("invalid elicitation route id payload".to_string())
 		})?;
-		if route_id.kind != ELICITATION_ROUTE_ID_KIND {
+		if route_id.kind != ElicitationRouteId::KIND {
 			return Err(UpstreamError::InvalidRequest(
 				"unknown elicitation route id kind".to_string(),
 			));
 		}
-		if route_id.version != ELICITATION_ROUTE_ID_VERSION {
+		if route_id.version != ElicitationRouteId::VERSION {
 			return Err(UpstreamError::InvalidRequest(
 				"unsupported elicitation route id version".to_string(),
 			));
@@ -694,10 +750,10 @@ impl Relay {
 		&self,
 		server_name: &str,
 		mut message: ServerJsonRpcMessage,
-	) -> ServerJsonRpcMessage {
+	) -> Result<ServerJsonRpcMessage, ClientError> {
 		match &mut message {
 			ServerJsonRpcMessage::Request(req) => {
-				req.id = self.encode_upstream_request_id(server_name, &req.id);
+				req.id = self.encode_upstream_request_id(server_name, &req.id)?;
 				if let rmcp::model::ServerRequest::CreateElicitationRequest(
 					rmcp::model::CreateElicitationRequest {
 						params:
@@ -708,12 +764,14 @@ impl Relay {
 					},
 				) = &mut req.request
 				{
+					let original_elicitation_id = elicitation_id.clone();
 					let encoded_id =
-						self.encode_upstream_elicitation_id(server_name, elicitation_id.as_str());
+						self.encode_upstream_elicitation_id(server_name, original_elicitation_id.as_str())?;
+					self.register_pending_elicitation(&encoded_id, server_name, &original_elicitation_id);
 					*elicitation_id = encoded_id;
 					tracing::debug!(
-						%elicitation_id,
-						"received url elicitation request"
+							%elicitation_id,
+							"received url elicitation request"
 					);
 				}
 			},
@@ -731,21 +789,22 @@ impl Relay {
 				},
 				ServerNotification::CancelledNotification(cn) => {
 					cn.params.request_id =
-						self.encode_upstream_request_id(server_name, &cn.params.request_id);
+						self.encode_upstream_request_id(server_name, &cn.params.request_id)?;
 				},
 				ServerNotification::ProgressNotification(pn) => {
 					pn.params.progress_token =
-						self.encode_upstream_progress_token(server_name, &pn.params.progress_token);
+						self.encode_upstream_progress_token(server_name, &pn.params.progress_token)?;
 				},
 				ServerNotification::ElicitationCompletionNotification(ec) => {
+					self.clear_pending_elicitation(server_name, &ec.params.elicitation_id);
 					ec.params.elicitation_id =
-						self.encode_upstream_elicitation_id(server_name, &ec.params.elicitation_id);
+						self.encode_upstream_elicitation_id(server_name, &ec.params.elicitation_id)?;
 				},
 				_ => {},
 			},
 			_ => {},
 		}
-		message
+		Ok(message)
 	}
 
 	/// Rewrites identifiers embedded in single-target response payloads.
@@ -755,7 +814,7 @@ impl Relay {
 	/// `ListResourcesResult`, etc.) are intentionally absent here — they are always fanout
 	/// operations whose identifiers are rewritten in their respective `merge_*` functions.
 	fn map_server_result(&self, server_name: &str, result: &mut ServerResult) {
-		if !self.should_prefix_identifiers() {
+		if !self.uses_routed_identifiers() {
 			return;
 		}
 		match result {
@@ -898,12 +957,16 @@ impl Relay {
 		self.is_multiplexing
 	}
 
+	pub fn allow_insecure_multiplex(&self) -> bool {
+		self.allow_insecure_multiplex
+	}
+
 	pub fn session_continuity(&self) -> SessionContinuity {
 		self.upstreams.session_continuity()
 	}
 
 	fn message_mapper(&self) -> Option<MessageMapper> {
-		if self.should_prefix_identifiers() {
+		if self.uses_routed_identifiers() {
 			let relay = self.clone();
 			Some(Arc::new(move |server_name: &str, message| {
 				relay.map_server_message(server_name, message)
@@ -1230,6 +1293,8 @@ impl Relay {
 			let (next_cursor, total) = if upstream_result_count == 1 {
 				(single_next_cursor, single_total)
 			} else {
+				// Multiplexed tasks/list stays intentionally unpaginated until the
+				// gateway has a real federated cursor design.
 				(None, None)
 			};
 			let mut out = ListTasksResult::new(tasks);
@@ -1258,7 +1323,7 @@ impl Relay {
 		let stream = us
 			.generic_stream(r, &ctx)
 			.await?
-			.map(move |msg| msg.map(|msg| relay.map_server_message(&server_name, msg)));
+			.map(move |msg| msg.and_then(|msg| relay.map_server_message(&server_name, msg)));
 
 		messages_to_response(id, stream)
 	}
@@ -1322,13 +1387,22 @@ impl Relay {
 		mode: FanoutMode,
 	) -> Result<Vec<(Strng, mergestream::Messages)>, UpstreamError> {
 		let allow_degraded = self.allow_degraded;
-		let mut streams = Vec::with_capacity(names.len());
-		for name in names {
-			let con = self
-				.upstreams
-				.get(name.as_ref())
-				.map_err(|e| UpstreamError::InvalidRequest(e.to_string()))?;
-			match con.generic_stream(request.clone(), ctx).await {
+		let ctx = ctx.clone();
+		let futures = names
+			.into_iter()
+			.map(|name| {
+				let con = self
+					.upstreams
+					.get(name.as_ref())
+					.map_err(|e| UpstreamError::InvalidRequest(e.to_string()))?;
+				let request = request.clone();
+				let ctx = ctx.clone();
+				Ok(async move { (name, con.generic_stream(request, &ctx).await) })
+			})
+			.collect::<Result<Vec<_>, UpstreamError>>()?;
+		let mut streams = Vec::with_capacity(futures.len());
+		for (name, result) in join_all(futures).await {
+			match result {
 				Ok(stream) => streams.push((name, stream)),
 				Err(e) => {
 					if !allow_degraded {
@@ -1359,7 +1433,13 @@ impl Relay {
 			return Err(UpstreamError::InvalidRequest(empty_error));
 		}
 
-		let ms = mergestream::MergeStream::new(streams, id.clone(), merge, self.message_mapper());
+		let ms = mergestream::MergeStream::new(
+			streams,
+			id.clone(),
+			merge,
+			!self.allow_degraded,
+			self.message_mapper(),
+		);
 		Ok((id, ms))
 	}
 
@@ -1467,7 +1547,7 @@ impl Relay {
 					);
 					return Ok(accepted_response());
 				}
-				if self.should_prefix_identifiers() {
+				if self.uses_routed_identifiers() {
 					tracing::warn!(
 						request_id = %cn.params.request_id,
 						"dropping cancellation: failed to decode routed request id"
@@ -1512,7 +1592,7 @@ impl Relay {
 					);
 					return Ok(accepted_response());
 				}
-				if self.should_prefix_identifiers() {
+				if self.uses_routed_identifiers() {
 					tracing::warn!(
 						progress_token = %pn.params.progress_token.0,
 						"dropping progress notification: failed to decode routed progress token"
@@ -1538,9 +1618,22 @@ impl Relay {
 						mut original,
 						mut params,
 					} => {
+						let routed_elicitation_id = params.typed.elicitation_id.clone();
 						if let Ok((server_name, original_elicitation_id)) =
-							self.decode_upstream_elicitation_id(&params.typed.elicitation_id)
+							self.decode_upstream_elicitation_id(&routed_elicitation_id)
 						{
+							if !self.take_active_elicitation(
+								&routed_elicitation_id,
+								&server_name,
+								&original_elicitation_id,
+							) {
+								tracing::warn!(
+									%server_name,
+									elicitation_id = %original_elicitation_id,
+									"dropping elicitation response: no active gateway-issued elicitation"
+								);
+								return Ok(accepted_response());
+							}
 							params.typed.elicitation_id = original_elicitation_id;
 							let params_value = match serde_json::to_value(&params) {
 								Ok(v) => v,
@@ -1830,6 +1923,7 @@ mod tests {
 				targets: vec![capture_target("serverA", capture_file)],
 				stateful: false,
 				allow_degraded,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1858,6 +1952,60 @@ mod tests {
 		assert!(upstreams.contains_key("b"));
 	}
 
+	#[tokio::test]
+	async fn merge_tasks_drops_pagination_when_multiple_upstreams_participate() {
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let server_a_capture = NamedTempFile::new().expect("temp file");
+		let server_b_capture = NamedTempFile::new().expect("temp file");
+		let relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+				allow_insecure_multiplex: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+
+		let mut a = ListTasksResult::new(vec![rmcp::model::Task::new(
+			"task-1".to_string(),
+			rmcp::model::TaskStatus::Working,
+			"2026-01-01T00:00:00Z".to_string(),
+			"2026-01-01T00:00:00Z".to_string(),
+		)]);
+		a.next_cursor = Some("cursor-a".to_string());
+		a.total = Some(1);
+
+		let mut b = ListTasksResult::new(vec![rmcp::model::Task::new(
+			"task-2".to_string(),
+			rmcp::model::TaskStatus::Working,
+			"2026-01-01T00:00:00Z".to_string(),
+			"2026-01-01T00:00:00Z".to_string(),
+		)]);
+		b.next_cursor = Some("cursor-b".to_string());
+		b.total = Some(1);
+
+		let merged = relay.merge_tasks(CelExecWrapper::new(Arc::new(None)))(vec![
+			(strng::new("serverA"), a.into()),
+			(strng::new("serverB"), b.into()),
+		])
+		.expect("merge should succeed");
+
+		let ServerResult::ListTasksResult(result) = merged else {
+			panic!("expected list/tasks result");
+		};
+		assert_eq!(result.tasks.len(), 2);
+		assert_eq!(result.next_cursor, None);
+		assert_eq!(result.total, None);
+	}
+
 	#[test]
 	fn wrap_resource_uri_preserves_template_braces() {
 		let wrapped = wrap_resource_uri(None, "counter", "memo://{bucket}/path");
@@ -1878,7 +2026,7 @@ mod tests {
 		assert_eq!(decoded_target.as_deref(), Some(target));
 		let extracted = parsed
 			.query_pairs()
-			.find(|(k, _)| k == URI_PARAM)
+			.find(|(k, _)| k == AGW_URI_QUERY_PARAM)
 			.map(|(_, v)| v.into_owned())
 			.expect("wrapped uri should contain u param");
 		assert_eq!(extracted, uri);
@@ -1890,7 +2038,7 @@ mod tests {
 	#[case("node9", "dash-and.dot")]
 	fn resource_name_prefixes_when_multiplexing(#[case] target: &str, #[case] name: &str) {
 		let prefixed = resource_name(None, target, Cow::Borrowed(name));
-		assert_eq!(prefixed, format!("{target}{DELIMITER}{name}"));
+		assert_eq!(prefixed, format!("{target}{TARGET_NAME_DELIMITER}{name}"));
 	}
 
 	#[tokio::test]
@@ -1924,6 +2072,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1932,7 +2081,9 @@ mod tests {
 		)
 		.expect("relay");
 
-		let id = relay.encode_upstream_request_id("server::with::colons", &RequestId::Number(1));
+		let id = relay
+			.encode_upstream_request_id("server::with::colons", &RequestId::Number(1))
+			.expect("request id should encode");
 		let (decoded_name, decoded_id) = relay
 			.decode_upstream_request_id(&id)
 			.expect("decode failed");
@@ -1971,6 +2122,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -1980,7 +2132,9 @@ mod tests {
 		.expect("relay");
 
 		let original = RequestId::String("my::id:with::separators".into());
-		let id = relay.encode_upstream_request_id("server::with::colons", &original);
+		let id = relay
+			.encode_upstream_request_id("server::with::colons", &original)
+			.expect("request id should encode");
 		let (decoded_name, decoded_id) = relay
 			.decode_upstream_request_id(&id)
 			.expect("decode failed");
@@ -2019,6 +2173,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2054,6 +2209,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2062,7 +2218,9 @@ mod tests {
 		)
 		.expect("relay");
 
-		let id = relay.encode_upstream_request_id("serverA", &RequestId::Number(1));
+		let id = relay
+			.encode_upstream_request_id("serverA", &RequestId::Number(1))
+			.expect("request id should encode");
 		let err = mismatched_relay
 			.decode_upstream_request_id(&id)
 			.expect_err("mismatched session binding should be rejected");
@@ -2100,6 +2258,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2146,6 +2305,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2178,6 +2338,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2186,7 +2347,9 @@ mod tests {
 		)
 		.expect("relay");
 
-		let rewritten_id = relay.encode_upstream_request_id("serverA", &RequestId::Number(1));
+		let rewritten_id = relay
+			.encode_upstream_request_id("serverA", &RequestId::Number(1))
+			.expect("request id should encode");
 		let encoded_id = rewritten_id.to_string();
 		let notification = ClientNotification::CancelledNotification(CancelledNotification::new(
 			CancelledNotificationParam {
@@ -2237,6 +2400,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2252,6 +2416,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2260,7 +2425,9 @@ mod tests {
 		)
 		.expect("relay");
 
-		let rewritten_id = relay.encode_upstream_request_id("serverA", &RequestId::Number(1));
+		let rewritten_id = relay
+			.encode_upstream_request_id("serverA", &RequestId::Number(1))
+			.expect("request id should encode");
 		let notification = ClientNotification::CancelledNotification(CancelledNotification::new(
 			CancelledNotificationParam {
 				request_id: rewritten_id,
@@ -2307,6 +2474,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2315,8 +2483,9 @@ mod tests {
 		)
 		.expect("relay");
 
-		let rewritten_progress_token =
-			relay.encode_upstream_progress_token("serverA", &ProgressToken(RequestId::Number(1)));
+		let rewritten_progress_token = relay
+			.encode_upstream_progress_token("serverA", &ProgressToken(RequestId::Number(1)))
+			.expect("progress token should encode");
 		let encoded_token = rewritten_progress_token.0.to_string();
 		let notification = ClientNotification::ProgressNotification(ProgressNotification::new(
 			ProgressNotificationParam::new(rewritten_progress_token, 0.5)
@@ -2382,6 +2551,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2404,7 +2574,9 @@ mod tests {
 				),
 			),
 		});
-		let rewritten_request = relay.map_server_message("serverA", request_message);
+		let rewritten_request = relay
+			.map_server_message("serverA", request_message)
+			.expect("server request should rewrite");
 		let ServerJsonRpcMessage::Request(req) = rewritten_request else {
 			panic!("expected server request");
 		};
@@ -2436,7 +2608,9 @@ mod tests {
 				),
 			),
 		});
-		let rewritten_completion = relay.map_server_message("serverA", completion_message);
+		let rewritten_completion = relay
+			.map_server_message("serverA", completion_message)
+			.expect("completion notification should rewrite");
 		let ServerJsonRpcMessage::Notification(notification) = rewritten_completion else {
 			panic!("expected server notification");
 		};
@@ -2467,6 +2641,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2489,7 +2664,9 @@ mod tests {
 				),
 			),
 		});
-		let rewritten_request = relay.map_server_message("serverA", request_message);
+		let rewritten_request = relay
+			.map_server_message("serverA", request_message)
+			.expect("server request should rewrite");
 		let ServerJsonRpcMessage::Request(req) = rewritten_request else {
 			panic!("expected server request");
 		};
@@ -2544,7 +2721,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn send_notification_elicitation_response_self_routed_id_should_route_without_tracking() {
+	async fn send_notification_elicitation_response_untracked_id_should_be_dropped() {
 		use rmcp::model::JsonRpcNotification;
 
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
@@ -2558,6 +2735,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2566,7 +2744,9 @@ mod tests {
 		)
 		.expect("relay");
 
-		let encoded = relay.encode_upstream_elicitation_id("serverA", "elicit-untracked");
+		let encoded = relay
+			.encode_upstream_elicitation_id("serverA", "elicit-untracked")
+			.expect("elicitation id should encode");
 		let notification =
 			ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(
 				ELICITATION_RESPONSE_METHOD,
@@ -2584,14 +2764,10 @@ mod tests {
 		let result = relay.send_notification(r, ctx).await;
 		assert!(result.is_ok());
 
-		wait_until_contains(
+		assert_not_contains_for(
 			server_a_capture.path(),
 			"\"notifications/elicitation/response\"",
-		)
-		.await;
-		wait_until_contains(
-			server_a_capture.path(),
-			"\"elicitationId\":\"elicit-untracked\"",
+			Duration::from_millis(500),
 		)
 		.await;
 		assert_not_contains_for(
@@ -2617,6 +2793,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2632,6 +2809,7 @@ mod tests {
 				],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2640,7 +2818,9 @@ mod tests {
 		)
 		.expect("relay");
 
-		let encoded = relay.encode_upstream_elicitation_id("serverA", "elicit-mismatch");
+		let encoded = relay
+			.encode_upstream_elicitation_id("serverA", "elicit-mismatch")
+			.expect("elicitation id should encode");
 		let notification =
 			ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(
 				ELICITATION_RESPONSE_METHOD,
@@ -2673,7 +2853,210 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn send_notification_elicitation_response_single_target_untracked_id_should_passthrough() {
+	async fn send_notification_elicitation_response_duplicate_should_be_dropped() {
+		use rmcp::model::JsonRpcNotification;
+
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let server_a_capture = NamedTempFile::new().expect("temp file");
+		let server_b_capture = NamedTempFile::new().expect("temp file");
+		let relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+				allow_insecure_multiplex: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+
+		let request_message = ServerJsonRpcMessage::Request(JsonRpcRequest {
+			jsonrpc: Default::default(),
+			id: RequestId::Number(17),
+			request: rmcp::model::ServerRequest::CreateElicitationRequest(
+				rmcp::model::CreateElicitationRequest::new(
+					rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+						meta: None,
+						message: "Open a URL".to_string(),
+						url: "https://example.com/flow".to_string(),
+						elicitation_id: "elicit-dup".to_string(),
+					},
+				),
+			),
+		});
+		let rewritten_request = relay
+			.map_server_message("serverA", request_message)
+			.expect("server request should rewrite");
+		let ServerJsonRpcMessage::Request(req) = rewritten_request else {
+			panic!("expected server request");
+		};
+		let rmcp::model::ServerRequest::CreateElicitationRequest(create_req) = req.request else {
+			panic!("expected create elicitation request");
+		};
+		let rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+			elicitation_id: encoded,
+			..
+		} = create_req.params
+		else {
+			panic!("expected URL elicitation params");
+		};
+
+		let send_response = |elicitation_id: &str| JsonRpcNotification {
+			jsonrpc: Default::default(),
+			notification: ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(
+				ELICITATION_RESPONSE_METHOD,
+				Some(json!({
+					"elicitationId": elicitation_id,
+					"action": "accept"
+				})),
+			)),
+		};
+
+		let ctx = IncomingRequestContext::empty();
+		relay
+			.send_notification(send_response(&encoded), ctx.clone())
+			.await
+			.expect("first response should be accepted");
+		relay
+			.send_notification(send_response(&encoded), ctx)
+			.await
+			.expect("duplicate response should be ignored");
+
+		wait_until_contains(
+			server_a_capture.path(),
+			"\"notifications/elicitation/response\"",
+		)
+		.await;
+		let server_a_raw = tokio::fs::read_to_string(server_a_capture.path())
+			.await
+			.unwrap_or_default();
+		assert_eq!(
+			server_a_raw
+				.matches("\"notifications/elicitation/response\"")
+				.count(),
+			1,
+			"duplicate elicitation response should not be forwarded twice"
+		);
+		assert_not_contains_for(
+			server_b_capture.path(),
+			"\"notifications/elicitation/response\"",
+			Duration::from_millis(500),
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn send_notification_elicitation_response_post_resume_should_be_dropped() {
+		use rmcp::model::JsonRpcNotification;
+
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let server_a_capture = NamedTempFile::new().expect("temp file");
+		let server_b_capture = NamedTempFile::new().expect("temp file");
+		let relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+				allow_insecure_multiplex: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay")
+		.with_session_binding("session-1", Encoder::base64());
+		let resumed_relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+				allow_insecure_multiplex: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay")
+		.with_session_binding("session-1", Encoder::base64());
+
+		let request_message = ServerJsonRpcMessage::Request(JsonRpcRequest {
+			jsonrpc: Default::default(),
+			id: RequestId::Number(19),
+			request: rmcp::model::ServerRequest::CreateElicitationRequest(
+				rmcp::model::CreateElicitationRequest::new(
+					rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+						meta: None,
+						message: "Open a URL".to_string(),
+						url: "https://example.com/flow".to_string(),
+						elicitation_id: "elicit-resume".to_string(),
+					},
+				),
+			),
+		});
+		let rewritten_request = relay
+			.map_server_message("serverA", request_message)
+			.expect("server request should rewrite");
+		let ServerJsonRpcMessage::Request(req) = rewritten_request else {
+			panic!("expected server request");
+		};
+		let rmcp::model::ServerRequest::CreateElicitationRequest(create_req) = req.request else {
+			panic!("expected create elicitation request");
+		};
+		let rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+			elicitation_id: encoded,
+			..
+		} = create_req.params
+		else {
+			panic!("expected URL elicitation params");
+		};
+
+		let notification =
+			ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(
+				ELICITATION_RESPONSE_METHOD,
+				Some(json!({
+					"elicitationId": encoded,
+					"action": "accept"
+				})),
+			));
+		let r = JsonRpcNotification {
+			jsonrpc: Default::default(),
+			notification,
+		};
+
+		let ctx = IncomingRequestContext::empty();
+		let result = resumed_relay.send_notification(r, ctx).await;
+		assert!(result.is_ok());
+
+		assert_not_contains_for(
+			server_a_capture.path(),
+			"\"notifications/elicitation/response\"",
+			Duration::from_millis(500),
+		)
+		.await;
+		assert_not_contains_for(
+			server_b_capture.path(),
+			"\"notifications/elicitation/response\"",
+			Duration::from_millis(500),
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn send_notification_elicitation_response_single_target_tracked_id_should_route() {
 		use rmcp::model::JsonRpcNotification;
 
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
@@ -2683,6 +3066,7 @@ mod tests {
 				targets: vec![capture_target("serverA", server_a_capture.path())],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {
@@ -2691,11 +3075,41 @@ mod tests {
 		)
 		.expect("relay");
 
+		let request_message = ServerJsonRpcMessage::Request(JsonRpcRequest {
+			jsonrpc: Default::default(),
+			id: RequestId::Number(13),
+			request: rmcp::model::ServerRequest::CreateElicitationRequest(
+				rmcp::model::CreateElicitationRequest::new(
+					rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+						meta: None,
+						message: "Open a URL".to_string(),
+						url: "https://example.com/flow".to_string(),
+						elicitation_id: "elicit-single-target".to_string(),
+					},
+				),
+			),
+		});
+		let rewritten_request = relay
+			.map_server_message("serverA", request_message)
+			.expect("server request should register elicitation");
+		let ServerJsonRpcMessage::Request(req) = rewritten_request else {
+			panic!("expected server request");
+		};
+		let rmcp::model::ServerRequest::CreateElicitationRequest(create_req) = req.request else {
+			panic!("expected create elicitation request");
+		};
+		let rmcp::model::CreateElicitationRequestParams::UrlElicitationParams {
+			elicitation_id, ..
+		} = create_req.params
+		else {
+			panic!("expected URL elicitation params");
+		};
+
 		let notification =
 			ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(
 				ELICITATION_RESPONSE_METHOD,
 				Some(json!({
-					"elicitationId": "elicit-single-target",
+					"elicitationId": elicitation_id,
 					"action": "accept"
 				})),
 			));
@@ -2822,6 +3236,7 @@ mod tests {
 				})],
 				stateful: false,
 				allow_degraded: false,
+				allow_insecure_multiplex: false,
 			},
 			McpAuthorizationSet::new(vec![].into()),
 			PolicyClient {

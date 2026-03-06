@@ -340,9 +340,10 @@ func translateMCPBackends(ctx plugins.PolicyCtx, be *agentgateway.AgentgatewayBa
 		Name: plugins.ResourceName(be),
 		Kind: &api.Backend_Mcp{
 			Mcp: &api.MCPBackend{
-				Targets:      mcpTargets,
-				StatefulMode: sessionRouting,
-				FailureMode:  failureMode,
+				Targets:                mcpTargets,
+				StatefulMode:           sessionRouting,
+				AllowDegraded:          mcp.AllowDegraded,
+				AllowInsecureMultiplex: mcp.AllowInsecureMultiplex,
 			},
 		},
 		InlinePolicies: inlinePolicies,

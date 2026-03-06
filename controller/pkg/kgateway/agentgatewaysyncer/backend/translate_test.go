@@ -161,6 +161,32 @@ func TestBuildMCP(t *testing.T) {
 			},
 			expectError: true,
 		},
+		{
+			name: "Static MCPBackend target backend with backend flags",
+			backend: &agentgateway.AgentgatewayBackend{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "static-mcp-backend-backend-flags",
+					Namespace: "test-ns",
+				},
+				Spec: agentgateway.AgentgatewayBackendSpec{
+					MCP: &agentgateway.MCPBackend{
+						AllowDegraded:          true,
+						AllowInsecureMultiplex: true,
+						Targets: []agentgateway.McpTargetSelector{
+							{
+								Name: "static-target",
+								Static: &agentgateway.McpTarget{
+									Host:     "mcp-server.example.com",
+									Port:     8080,
+									Path:     stringPtr("override-sse"),
+									Protocol: ptr.Of(agentgateway.MCPProtocolSSE),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {

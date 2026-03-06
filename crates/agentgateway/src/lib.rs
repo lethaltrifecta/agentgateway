@@ -271,8 +271,7 @@ pub struct RawHBONE {
 
 #[apply(schema_de!)]
 pub struct RawSession {
-	/// The AES-256-GCM session protection key to be used for session tokens.
-	/// If not set, sessions will not be encrypted.
+	/// The AES-256-GCM key used to encrypt session ids.
 	/// For example, generated via `openssl rand -hex 32`.
 	#[cfg_attr(feature = "schema", schemars(with = "String"))]
 	#[serde(serialize_with = "ser_redact", deserialize_with = "deser_key")]

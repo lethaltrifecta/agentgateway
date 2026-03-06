@@ -852,6 +852,7 @@ impl TryFrom<&proto::agent::Backend> for BackendWithPolicies {
 						proto::agent::mcp_backend::PrefixMode::Conditional => false,
 					},
 					allow_degraded: m.allow_degraded,
+					allow_insecure_multiplex: m.allow_insecure_multiplex,
 				},
 			),
 			None => {
@@ -2200,7 +2201,7 @@ mod tests {
 	use super::*;
 	use crate::types::proto::agent::backend_policy_spec::Ai;
 
-	fn mcp_backend(allow_degraded: bool) -> proto::agent::Backend {
+	fn mcp_backend(allow_degraded: bool, allow_insecure_multiplex: bool) -> proto::agent::Backend {
 		proto::agent::Backend {
 			key: "mcp-backend-key".to_string(),
 			name: Some(proto::agent::ResourceName {
@@ -2225,6 +2226,7 @@ mod tests {
 				stateful_mode: proto::agent::mcp_backend::StatefulMode::Stateful as i32,
 				prefix_mode: proto::agent::mcp_backend::PrefixMode::Conditional as i32,
 				allow_degraded,
+				allow_insecure_multiplex,
 			})),
 			inline_policies: vec![],
 		}
@@ -2232,16 +2234,32 @@ mod tests {
 
 	#[test]
 	fn test_backend_mcp_allow_degraded_from_proto() -> Result<(), ProtoError> {
-		let converted = BackendWithPolicies::try_from(&mcp_backend(true))?;
+		let converted = BackendWithPolicies::try_from(&mcp_backend(true, false))?;
 		assert_matches!(
 			converted.backend,
 			Backend::MCP(_, mcp_backend) if mcp_backend.allow_degraded
 		);
 
-		let converted = BackendWithPolicies::try_from(&mcp_backend(false))?;
+		let converted = BackendWithPolicies::try_from(&mcp_backend(false, false))?;
 		assert_matches!(
 			converted.backend,
 			Backend::MCP(_, mcp_backend) if !mcp_backend.allow_degraded
+		);
+		Ok(())
+	}
+
+	#[test]
+	fn test_backend_mcp_allow_insecure_multiplex_from_proto() -> Result<(), ProtoError> {
+		let converted = BackendWithPolicies::try_from(&mcp_backend(false, true))?;
+		assert_matches!(
+			converted.backend,
+			Backend::MCP(_, mcp_backend) if mcp_backend.allow_insecure_multiplex
+		);
+
+		let converted = BackendWithPolicies::try_from(&mcp_backend(false, false))?;
+		assert_matches!(
+			converted.backend,
+			Backend::MCP(_, mcp_backend) if !mcp_backend.allow_insecure_multiplex
 		);
 		Ok(())
 	}

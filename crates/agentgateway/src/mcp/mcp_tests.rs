@@ -574,7 +574,14 @@ async fn tasks_roundtrip_single_always_prefix() {
 	let mock = mock_streamable_http_server(true).await;
 	let t = setup_proxy_test("{}")
 		.unwrap()
-		.with_mcp_backend_policies_with_prefix(mock.addr, true, false, vec![], true)
+		.with_mcp_backend_policies_with_prefix_and_insecure_opt_in(
+			mock.addr,
+			true,
+			false,
+			vec![],
+			true,
+			true,
+		)
 		.with_bind(simple_bind(basic_route(mock.addr)));
 	let io = t.serve_real_listener(BIND_KEY).await;
 	let client = mcp_streamable_client(io).await;
@@ -686,11 +693,12 @@ async fn authorization_denied_wrapped_resource_uri_returns_unknown_resource_erro
 
 	let t = setup_proxy_test("{}")
 		.unwrap()
-		.with_mcp_backend_policies_with_prefix(
+		.with_mcp_backend_policies_with_prefix_and_insecure_opt_in(
 			mock.addr,
 			true,
 			false,
 			vec![BackendPolicy::McpAuthorization(deny_all_policy)],
+			true,
 			true,
 		)
 		.with_bind(simple_bind(basic_route(mock.addr)));

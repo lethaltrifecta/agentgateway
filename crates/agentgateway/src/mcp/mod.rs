@@ -21,6 +21,7 @@ use prometheus_client::encoding::{EncodeLabelValue, LabelValueEncoder};
 pub use rbac::{McpAuthorization, McpAuthorizationSet, ResourceId, ResourceType};
 use rmcp::model::RequestId;
 pub use router::App;
+use sha2::Digest;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -95,6 +96,14 @@ impl<T> From<Error> for Result<T, ProxyError> {
 	}
 }
 
+pub(crate) fn session_binding_tag(session_handle: &str) -> String {
+	hex::encode(sha2::Sha256::digest(session_handle.as_bytes()))
+}
+
+pub(crate) fn local_session_binding() -> String {
+	session_binding_tag(&uuid::Uuid::new_v4().to_string())
+}
+
 #[derive(Error, Debug)]
 pub enum ClientError {
 	#[error("http request failed with code: {}", .0.status())]
@@ -144,6 +153,7 @@ impl Display for MCPOperation {
 pub enum ResumeFailureReason {
 	MalformedHandle,
 	LiveSessionMissing,
+	EncryptedSessionIdsRequired,
 	SnapshotMismatch,
 	SnapshotRestoreFailed,
 	UnsupportedHandle,
@@ -154,6 +164,7 @@ impl ResumeFailureReason {
 		match self {
 			Self::MalformedHandle => "malformed_handle",
 			Self::LiveSessionMissing => "live_session_missing",
+			Self::EncryptedSessionIdsRequired => "encrypted_session_ids_required",
 			Self::SnapshotMismatch => "snapshot_mismatch",
 			Self::SnapshotRestoreFailed => "snapshot_restore_failed",
 			Self::UnsupportedHandle => "unsupported_handle",

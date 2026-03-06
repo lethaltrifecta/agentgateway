@@ -336,12 +336,17 @@ type MCPBackend struct {
 	// +optional
 	SessionRouting SessionRouting `json:"sessionRouting,omitempty"`
 
-	// FailureMode controls behavior when MCP targets fail to initialize or
-	// become unavailable at runtime. "FailOpen" skips failed targets and
-	// continues serving from healthy ones. "FailClosed" (default) fails the
-	// entire session if any target fails.
+	// AllowDegraded allows MCP backend initialization and runtime fanout to
+	// continue when some targets fail.
 	// +optional
-	FailureMode FailureMode `json:"failureMode,omitempty"`
+	AllowDegraded bool `json:"allowDegraded,omitempty"`
+
+	// AllowInsecureMultiplex explicitly allows insecure base64 multiplex session ids.
+	//
+	// This is unsafe and intended only for local or single-user development
+	// environments where clients are fully trusted.
+	// +optional
+	AllowInsecureMultiplex bool `json:"allowInsecureMultiplex,omitempty"`
 }
 
 const (

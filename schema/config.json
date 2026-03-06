@@ -312,7 +312,7 @@
       "type": "object",
       "properties": {
         "key": {
-          "description": "The AES-256-GCM session protection key to be used for session tokens.\nIf not set, sessions will not be encrypted.\nFor example, generated via `openssl rand -hex 32`.",
+          "description": "The AES-256-GCM key used to encrypt session ids.\nFor example, generated via `openssl rand -hex 32`.",
           "type": "string"
         }
       },
@@ -4046,6 +4046,10 @@
         "allowDegraded": {
           "type": "boolean",
           "default": false
+        },
+        "allowInsecureMultiplex": {
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
@@ -6197,6 +6201,10 @@
           ]
         },
         "allowDegraded": {
+          "type": "boolean",
+          "default": false
+        },
+        "allowInsecureMultiplex": {
           "type": "boolean",
           "default": false
         },
