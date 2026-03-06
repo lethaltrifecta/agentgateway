@@ -1,6 +1,4 @@
 use agent_core::strng::Strng;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use http::StatusCode;
@@ -17,6 +15,7 @@ use rmcp::model::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,11 +23,15 @@ use std::sync::RwLock;
 
 use crate::cel::RequestSnapshot;
 use crate::http::Response;
-use crate::http::sessionpersistence::MCPSession;
+use crate::http::sessionpersistence::{
+	Encoder, MCPSnapshotMember, MCPSnapshotRouting, MCPSnapshotState,
+};
 use crate::mcp;
+use crate::mcp::mergestream::Messages;
 use crate::mcp::mergestream::{MergeFn, MessageMapper};
 use crate::mcp::rbac::{CelExecWrapper, McpAuthorizationSet};
 use crate::mcp::router::McpBackendGroup;
+use crate::mcp::session::SessionContinuity;
 use crate::mcp::streamablehttp::ServerSseMessage;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
 use crate::mcp::{ClientError, MCPInfo, mergestream, rbac, upstream};
@@ -38,11 +41,13 @@ use crate::telemetry::log::{AsyncLog, SpanWriteOnDrop, SpanWriter};
 // Double underscore namespacing (SEP-993) avoids collisions with tool names that include "_".
 // Reference: modelcontextprotocol/modelcontextprotocol#94.
 const DELIMITER: &str = "__";
-const UPSTREAM_REQUEST_ID_PREFIX: &str = "agw";
-const UPSTREAM_REQUEST_ID_SEPARATOR: &str = "::";
 const AGW_SCHEME: &str = "agw";
 const URI_PARAM: &str = "u";
 const ELICITATION_RESPONSE_METHOD: &str = ElicitationResponseNotificationMethod::VALUE;
+const ROUTED_REQUEST_ID_KIND: &str = "agw-request";
+const ROUTED_REQUEST_ID_VERSION: u8 = 1;
+const ELICITATION_ROUTE_ID_KIND: &str = "agw-elicitation";
+const ELICITATION_ROUTE_ID_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +56,95 @@ struct ElicitationResponseParams {
 	typed: ElicitationResponseNotificationParam,
 	#[serde(flatten)]
 	extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ElicitationRouteId {
+	#[serde(rename = "t")]
+	kind: String,
+	#[serde(rename = "v")]
+	version: u8,
+	#[serde(rename = "b")]
+	session_binding: String,
+	#[serde(rename = "n")]
+	target: String,
+	#[serde(rename = "i")]
+	original_id: String,
+}
+
+impl ElicitationRouteId {
+	fn new(session_binding: &str, target: &str, original_id: &str) -> Self {
+		Self {
+			kind: ELICITATION_ROUTE_ID_KIND.to_string(),
+			version: ELICITATION_ROUTE_ID_VERSION,
+			session_binding: session_binding.to_string(),
+			target: target.to_string(),
+			original_id: original_id.to_string(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum RoutedRequestIdKind {
+	#[serde(rename = "n")]
+	Number,
+	#[serde(rename = "s")]
+	String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RoutedRequestId {
+	#[serde(rename = "t")]
+	kind: String,
+	#[serde(rename = "v")]
+	version: u8,
+	#[serde(rename = "b")]
+	session_binding: String,
+	#[serde(rename = "n")]
+	target: String,
+	#[serde(rename = "k")]
+	original_id_kind: RoutedRequestIdKind,
+	#[serde(rename = "i")]
+	original_id: String,
+}
+
+impl RoutedRequestId {
+	fn new(session_binding: &str, target: &str, original_id: &RequestId) -> Self {
+		let (original_id_kind, original_id) = match original_id {
+			RequestId::Number(value) => (RoutedRequestIdKind::Number, value.to_string()),
+			RequestId::String(value) => (RoutedRequestIdKind::String, value.to_string()),
+		};
+		Self {
+			kind: ROUTED_REQUEST_ID_KIND.to_string(),
+			version: ROUTED_REQUEST_ID_VERSION,
+			session_binding: session_binding.to_string(),
+			target: target.to_string(),
+			original_id_kind,
+			original_id,
+		}
+	}
+
+	fn into_parts(self) -> Result<(String, RequestId), UpstreamError> {
+		if self.kind != ROUTED_REQUEST_ID_KIND {
+			return Err(UpstreamError::InvalidRequest(
+				"unknown routed request id kind".to_string(),
+			));
+		}
+		if self.version != ROUTED_REQUEST_ID_VERSION {
+			return Err(UpstreamError::InvalidRequest(
+				"unsupported routed request id version".to_string(),
+			));
+		}
+		let original_id = match self.original_id_kind {
+			RoutedRequestIdKind::Number => {
+				RequestId::Number(self.original_id.parse::<i64>().map_err(|_| {
+					UpstreamError::InvalidRequest("routed request id number parse failed".to_string())
+				})?)
+			},
+			RoutedRequestIdKind::String => RequestId::String(self.original_id.into()),
+		};
+		Ok((self.target, original_id))
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +197,16 @@ fn decode_target_from_uri_host(target: &str) -> Option<String> {
 		.decode_utf8()
 		.ok()
 		.map(|decoded| decoded.into_owned())
+}
+
+fn session_binding_fingerprint(session_handle: &str) -> String {
+	let mut hasher = Sha256::new();
+	hasher.update(session_handle.as_bytes());
+	hex::encode(hasher.finalize())
+}
+
+fn local_session_binding() -> String {
+	session_binding_fingerprint(&uuid::Uuid::new_v4().to_string())
 }
 
 /// Prepends the server name to a resource name when multiplexing.
@@ -199,50 +303,6 @@ fn merge_meta(entries: impl IntoIterator<Item = (Strng, Option<Meta>)>) -> Optio
 	Some(Meta(root))
 }
 
-fn decode_upstream_request_id_encoded(raw: &str) -> Result<(String, RequestId), UpstreamError> {
-	let mut parts = raw.split(UPSTREAM_REQUEST_ID_SEPARATOR);
-	let (Some(prefix), Some(encoded_server), Some(kind), Some(encoded_value), None) = (
-		parts.next(),
-		parts.next(),
-		parts.next(),
-		parts.next(),
-		parts.next(),
-	) else {
-		return Err(UpstreamError::InvalidRequest(
-			"upstream request id malformed".to_string(),
-		));
-	};
-	if prefix != UPSTREAM_REQUEST_ID_PREFIX {
-		return Err(UpstreamError::InvalidRequest(
-			"upstream request id missing gateway prefix".to_string(),
-		));
-	}
-	let server_name_bytes = URL_SAFE_NO_PAD.decode(encoded_server).map_err(|_| {
-		UpstreamError::InvalidRequest("upstream request id server decode failed".to_string())
-	})?;
-	let server_name = String::from_utf8(server_name_bytes).map_err(|_| {
-		UpstreamError::InvalidRequest("upstream request id server utf8 decode failed".to_string())
-	})?;
-	let value_bytes = URL_SAFE_NO_PAD.decode(encoded_value).map_err(|_| {
-		UpstreamError::InvalidRequest("upstream request id value decode failed".to_string())
-	})?;
-	let value = String::from_utf8(value_bytes).map_err(|_| {
-		UpstreamError::InvalidRequest("upstream request id value utf8 decode failed".to_string())
-	})?;
-	let original_id = match kind {
-		"n" => value.parse::<i64>().map(RequestId::Number).map_err(|_| {
-			UpstreamError::InvalidRequest("upstream request id number parse failed".to_string())
-		})?,
-		"s" => RequestId::String(value.into()),
-		_ => {
-			return Err(UpstreamError::InvalidRequest(
-				"upstream request id kind unknown".to_string(),
-			));
-		},
-	};
-	Ok((server_name, original_id))
-}
-
 #[derive(Debug, Clone)]
 pub struct Relay {
 	upstreams: Arc<upstream::UpstreamGroup>,
@@ -255,9 +315,8 @@ pub struct Relay {
 	// std::sync::RwLock is intentional: all accesses are synchronous (inside MergeFn or
 	// upstreams_with_capability), never held across await points.
 	upstream_infos: Arc<RwLock<HashMap<Strng, ServerInfo>>>,
-	// Tracks URL-elicitation IDs emitted to the client so completion notifications can only
-	// be routed back to the originating upstream.
-	pending_elicitation_ids: Arc<RwLock<HashMap<String, Strng>>>,
+	route_id_encoder: Encoder,
+	session_binding: Arc<RwLock<String>>,
 }
 
 pub struct RelayInputs {
@@ -270,6 +329,44 @@ impl RelayInputs {
 	pub fn build_new_connections(self) -> Result<Relay, mcp::Error> {
 		Relay::new(self.backend, self.policies, self.client)
 	}
+
+	pub fn build_snapshot_connections(
+		self,
+		members: &[MCPSnapshotMember],
+		routing: MCPSnapshotRouting,
+	) -> Result<Option<Relay>, mcp::Error> {
+		if members.is_empty() {
+			return Ok(None);
+		}
+		// Resume rebuilds the exact initialized subset captured in the session
+		// token. We never reinterpret an existing session against whatever targets
+		// happen to be healthy now.
+		let matches_snapshot = match self.backend.matches_snapshot_members(members) {
+			Ok(matches_snapshot) => matches_snapshot,
+			Err(error) => {
+				tracing::warn!(%error, "failed to fingerprint snapshot members during resume");
+				return Ok(None);
+			},
+		};
+		if !matches_snapshot {
+			return Ok(None);
+		}
+		let runtime_allow_degraded = self.backend.allow_degraded;
+		let Some(backend) = self
+			.backend
+			.snapshot_subset(members.iter().map(|member| member.target.as_str()), false)
+		else {
+			return Ok(None);
+		};
+		Relay::new_with_routing(
+			backend,
+			self.policies,
+			self.client,
+			runtime_allow_degraded,
+			routing,
+		)
+		.map(Some)
+	}
 }
 
 impl Relay {
@@ -277,6 +374,35 @@ impl Relay {
 		backend: McpBackendGroup,
 		policies: McpAuthorizationSet,
 		client: PolicyClient,
+	) -> Result<Self, mcp::Error> {
+		let mut is_multiplexing = false;
+		let default_target_name = if backend.targets.len() != 1 {
+			is_multiplexing = true;
+			None
+		} else if backend.targets[0].always_use_prefix {
+			None
+		} else {
+			Some(backend.targets[0].name.to_string())
+		};
+		let runtime_allow_degraded = backend.allow_degraded;
+		Self::new_with_routing(
+			backend,
+			policies,
+			client,
+			runtime_allow_degraded,
+			MCPSnapshotRouting {
+				default_target_name,
+				is_multiplexing,
+			},
+		)
+	}
+
+	pub fn new_with_routing(
+		backend: McpBackendGroup,
+		policies: McpAuthorizationSet,
+		client: PolicyClient,
+		runtime_allow_degraded: bool,
+		routing: MCPSnapshotRouting,
 	) -> Result<Self, mcp::Error> {
 		for target in &backend.targets {
 			if target.name.contains(DELIMITER) {
@@ -290,24 +416,15 @@ impl Relay {
 				));
 			}
 		}
-		let mut is_multiplexing = false;
-		let default_target_name = if backend.targets.len() != 1 {
-			is_multiplexing = true;
-			None
-		} else if backend.targets[0].always_use_prefix {
-			None
-		} else {
-			Some(backend.targets[0].name.to_string())
-		};
-		let allow_degraded = backend.allow_degraded;
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(client, backend)?),
 			policies,
-			default_target_name,
-			is_multiplexing,
-			allow_degraded,
+			default_target_name: routing.default_target_name,
+			is_multiplexing: routing.is_multiplexing,
+			allow_degraded: runtime_allow_degraded,
 			upstream_infos: Arc::new(RwLock::new(HashMap::new())),
-			pending_elicitation_ids: Arc::new(RwLock::new(HashMap::new())),
+			route_id_encoder: Encoder::base64(),
+			session_binding: Arc::new(RwLock::new(local_session_binding())),
 		})
 	}
 
@@ -319,8 +436,23 @@ impl Relay {
 			is_multiplexing: self.is_multiplexing,
 			allow_degraded: self.allow_degraded,
 			upstream_infos: self.upstream_infos.clone(),
-			pending_elicitation_ids: self.pending_elicitation_ids.clone(),
+			route_id_encoder: self.route_id_encoder.clone(),
+			session_binding: self.session_binding.clone(),
 		}
+	}
+
+	pub fn with_session_binding(mut self, session_handle: &str, route_id_encoder: Encoder) -> Self {
+		self.route_id_encoder = route_id_encoder;
+		self.set_session_binding(session_handle);
+		self
+	}
+
+	pub fn set_session_binding(&self, session_handle: &str) {
+		let mut binding = self.session_binding.write().unwrap_or_else(|e| {
+			tracing::error!("session binding lock poisoned while updating; continuing");
+			e.into_inner()
+		});
+		*binding = session_binding_fingerprint(session_handle);
 	}
 
 	pub fn parse_resource_name<'a, 'b: 'a>(
@@ -359,24 +491,30 @@ impl Relay {
 
 	/// Rewrites a downstream Request ID to ensure uniqueness across upstreams.
 	///
-	/// Format: `agw::base64url(server_name)::kind::base64url(value)`
-	/// This allows `decode_upstream_request_id` to route the response back to the correct server.
 	fn encode_upstream_request_id(&self, server_name: &str, id: &RequestId) -> RequestId {
 		if !self.should_prefix_identifiers() {
 			return id.clone();
 		}
-		let (kind, value) = match id {
-			RequestId::Number(n) => ("n", n.to_string()),
-			RequestId::String(s) => ("s", s.to_string()),
-		};
-		let encoded_server = URL_SAFE_NO_PAD.encode(server_name.as_bytes());
-		let encoded_value = URL_SAFE_NO_PAD.encode(value.as_bytes());
-		RequestId::String(
-			format!(
-				"{UPSTREAM_REQUEST_ID_PREFIX}{UPSTREAM_REQUEST_ID_SEPARATOR}{encoded_server}{UPSTREAM_REQUEST_ID_SEPARATOR}{kind}{UPSTREAM_REQUEST_ID_SEPARATOR}{encoded_value}"
-			)
-			.into(),
-		)
+		// Bind routed IDs to the current downstream session so replayed or
+		// cross-session tokens cannot steer a request to the wrong upstream.
+		let session_binding = self.session_binding.read().unwrap_or_else(|e| {
+			tracing::error!("session binding lock poisoned while encoding request id; continuing");
+			e.into_inner()
+		});
+		let route_id = RoutedRequestId::new(session_binding.as_str(), server_name, id);
+		let plaintext =
+			serde_json::to_string(&route_id).expect("serializing routed request id should not fail");
+		match self.route_id_encoder.encrypt(&plaintext) {
+			Ok(encoded) => RequestId::String(encoded.into()),
+			Err(error) => {
+				tracing::warn!(
+					%error,
+					%server_name,
+					"failed to encode routed request id; leaving original id unwrapped"
+				);
+				id.clone()
+			},
+		}
 	}
 
 	fn encode_upstream_progress_token(
@@ -391,11 +529,26 @@ impl Relay {
 	}
 
 	fn encode_upstream_elicitation_id(&self, server_name: &str, elicitation_id: &str) -> String {
-		let id =
-			self.encode_upstream_request_id(server_name, &RequestId::String(elicitation_id.into()));
-		match id {
-			RequestId::String(s) => s.to_string(),
-			RequestId::Number(_) => elicitation_id.to_string(),
+		if !self.should_prefix_identifiers() {
+			return elicitation_id.to_string();
+		}
+		let session_binding = self.session_binding.read().unwrap_or_else(|e| {
+			tracing::error!("session binding lock poisoned while encoding elicitation id; continuing");
+			e.into_inner()
+		});
+		let route_id = ElicitationRouteId::new(session_binding.as_str(), server_name, elicitation_id);
+		let plaintext =
+			serde_json::to_string(&route_id).expect("serializing elicitation route id should not fail");
+		match self.route_id_encoder.encrypt(&plaintext) {
+			Ok(encoded) => encoded,
+			Err(error) => {
+				tracing::warn!(
+					%error,
+					%server_name,
+					"failed to encode elicitation route id; leaving original id unwrapped"
+				);
+				elicitation_id.to_string()
+			},
 		}
 	}
 
@@ -411,14 +564,38 @@ impl Relay {
 		&self,
 		elicitation_id: &str,
 	) -> Result<(String, String), UpstreamError> {
-		let (server_name, original_id) =
-			self.decode_upstream_request_id(&RequestId::String(elicitation_id.into()))?;
-		let RequestId::String(original) = original_id else {
+		if let Some(default) = self.default_target_name.as_deref() {
+			return Ok((default.to_string(), elicitation_id.to_string()));
+		}
+		// Elicitation responses may arrive after a resume, so the ID has to carry
+		// its own routing authority instead of depending on local pending state.
+		let encoded = self
+			.route_id_encoder
+			.decrypt(elicitation_id)
+			.map_err(|_| UpstreamError::InvalidRequest("invalid elicitation route id".to_string()))?;
+		let route_id = serde_json::from_slice::<ElicitationRouteId>(&encoded).map_err(|_| {
+			UpstreamError::InvalidRequest("invalid elicitation route id payload".to_string())
+		})?;
+		if route_id.kind != ELICITATION_ROUTE_ID_KIND {
 			return Err(UpstreamError::InvalidRequest(
-				"upstream elicitation id must be a string".to_string(),
+				"unknown elicitation route id kind".to_string(),
 			));
-		};
-		Ok((server_name, original.to_string()))
+		}
+		if route_id.version != ELICITATION_ROUTE_ID_VERSION {
+			return Err(UpstreamError::InvalidRequest(
+				"unsupported elicitation route id version".to_string(),
+			));
+		}
+		let session_binding = self.session_binding.read().unwrap_or_else(|e| {
+			tracing::error!("session binding lock poisoned while decoding elicitation id; continuing");
+			e.into_inner()
+		});
+		if route_id.session_binding != session_binding.as_str() {
+			return Err(UpstreamError::InvalidRequest(
+				"elicitation route id does not match this session".to_string(),
+			));
+		}
+		Ok((route_id.target, route_id.original_id))
 	}
 
 	/// Decodes an upstream request ID that was previously encoded by the gateway.
@@ -444,7 +621,23 @@ impl Relay {
 				"upstream request id must be a string when multiplexing".to_string(),
 			));
 		};
-		decode_upstream_request_id_encoded(raw.as_ref())
+		let encoded = self
+			.route_id_encoder
+			.decrypt(raw.as_ref())
+			.map_err(|_| UpstreamError::InvalidRequest("invalid routed request id".to_string()))?;
+		let route_id = serde_json::from_slice::<RoutedRequestId>(&encoded).map_err(|_| {
+			UpstreamError::InvalidRequest("invalid routed request id payload".to_string())
+		})?;
+		let session_binding = self.session_binding.read().unwrap_or_else(|e| {
+			tracing::error!("session binding lock poisoned while decoding request id; continuing");
+			e.into_inner()
+		});
+		if route_id.session_binding != session_binding.as_str() {
+			return Err(UpstreamError::InvalidRequest(
+				"routed request id does not match this session".to_string(),
+			));
+		}
+		route_id.into_parts()
 	}
 
 	/// Returns a list of upstream server names that support a specific capability.
@@ -517,7 +710,6 @@ impl Relay {
 				{
 					let encoded_id =
 						self.encode_upstream_elicitation_id(server_name, elicitation_id.as_str());
-					self.track_pending_elicitation_id(server_name, &encoded_id);
 					*elicitation_id = encoded_id;
 					tracing::debug!(
 						%elicitation_id,
@@ -548,60 +740,12 @@ impl Relay {
 				ServerNotification::ElicitationCompletionNotification(ec) => {
 					ec.params.elicitation_id =
 						self.encode_upstream_elicitation_id(server_name, &ec.params.elicitation_id);
-					self.clear_pending_elicitation_id(&ec.params.elicitation_id);
 				},
 				_ => {},
 			},
 			_ => {},
 		}
 		message
-	}
-
-	fn track_pending_elicitation_id(&self, server_name: &str, encoded_elicitation_id: &str) {
-		let mut pending = self.pending_elicitation_ids.write().unwrap_or_else(|e| {
-			tracing::error!("pending elicitation map lock poisoned while tracking; continuing");
-			e.into_inner()
-		});
-		pending.insert(encoded_elicitation_id.to_string(), server_name.into());
-	}
-
-	fn clear_pending_elicitation_id(&self, encoded_elicitation_id: &str) {
-		let mut pending = self.pending_elicitation_ids.write().unwrap_or_else(|e| {
-			tracing::error!("pending elicitation map lock poisoned while clearing; continuing");
-			e.into_inner()
-		});
-		pending.remove(encoded_elicitation_id);
-	}
-
-	pub fn clear_pending_elicitation_ids(&self) {
-		let mut pending = self.pending_elicitation_ids.write().unwrap_or_else(|e| {
-			tracing::error!("pending elicitation map lock poisoned while clearing all; continuing");
-			e.into_inner()
-		});
-		let cleared = pending.len();
-		pending.clear();
-		if cleared > 0 {
-			tracing::debug!(cleared, "cleared pending elicitation ids");
-		}
-	}
-
-	fn consume_pending_elicitation_id(
-		&self,
-		encoded_elicitation_id: &str,
-		expected_server_name: &str,
-	) -> bool {
-		let mut pending = self.pending_elicitation_ids.write().unwrap_or_else(|e| {
-			tracing::error!("pending elicitation map lock poisoned while consuming; continuing");
-			e.into_inner()
-		});
-		let Some(server_name) = pending.get(encoded_elicitation_id) else {
-			return false;
-		};
-		if server_name.as_str() != expected_server_name {
-			return false;
-		}
-		pending.remove(encoded_elicitation_id);
-		true
 	}
 
 	/// Rewrites identifiers embedded in single-target response payloads.
@@ -661,64 +805,101 @@ impl Relay {
 }
 
 impl Relay {
-	pub fn get_sessions(&self) -> Option<Vec<MCPSession>> {
-		let mut sessions = Vec::with_capacity(self.upstreams.size());
-		for (_, us) in self.upstreams.iter_named() {
-			sessions.push(us.get_session_state()?);
+	pub fn snapshot_state(&self) -> Result<MCPSnapshotState, mcp::Error> {
+		let infos = self.upstream_infos.read().unwrap_or_else(|e| {
+			tracing::error!(
+				"upstream capability cache lock poisoned while snapshotting initialize state; continuing"
+			);
+			e.into_inner()
+		});
+		let mut members = Vec::with_capacity(infos.len());
+		for (name, us) in self.upstreams.iter_named() {
+			let Some(info) = infos.get(&name).cloned() else {
+				continue;
+			};
+			let target = self.upstreams.target(name.as_str()).ok_or_else(|| {
+				mcp::Error::SendError(
+					None,
+					format!("missing configured target for upstream {}", name.as_str()),
+				)
+			})?;
+			let fingerprint = target.snapshot_fingerprint().map_err(|e| {
+				mcp::Error::SendError(
+					None,
+					format!(
+						"failed to fingerprint upstream {} for session snapshot: {e}",
+						name.as_str()
+					),
+				)
+			})?;
+			let session = us.get_session_state().ok_or_else(|| {
+				mcp::Error::SendError(
+					None,
+					format!(
+						"upstream {} does not support resumable session snapshots",
+						name.as_str()
+					),
+				)
+			})?;
+			members.push(MCPSnapshotMember::new(
+				name.to_string(),
+				session,
+				info,
+				fingerprint,
+			));
 		}
-		Some(sessions)
+		if members.is_empty() {
+			return Err(mcp::Error::SendError(
+				None,
+				"no initialized upstreams available for session snapshot".to_string(),
+			));
+		}
+		Ok(MCPSnapshotState::new(
+			members,
+			MCPSnapshotRouting {
+				default_target_name: self.default_target_name.clone(),
+				is_multiplexing: self.is_multiplexing,
+			},
+		))
 	}
 
-	pub fn set_sessions(&self, sessions: Vec<MCPSession>) -> anyhow::Result<()> {
-		if sessions.iter().all(|session| session.target_name.is_none()) {
-			if sessions.len() != self.upstreams.size() {
-				anyhow::bail!(
-					"session count {} did not match initialized upstreams {}",
-					sessions.len(),
-					self.upstreams.size()
-				);
-			}
-			for ((_, us), session) in self.upstreams.iter_named().zip(sessions) {
-				us.set_session_id(session.session.as_deref(), session.backend);
-			}
-			return Ok(());
+	pub fn restore_snapshot_state(&self, members: &[MCPSnapshotMember]) -> Result<(), mcp::Error> {
+		let mut restored_infos = HashMap::with_capacity(members.len());
+		for member in members {
+			let us = self.upstreams.get(member.target.as_str()).map_err(|_| {
+				mcp::Error::SendError(
+					None,
+					format!(
+						"snapshot target {:?} is no longer initialized",
+						member.target
+					),
+				)
+			})?;
+			// Restore both upstream session affinity and the initialize-time
+			// capability cache so post-resume routing matches the original session.
+			us.set_session_id(member.session.as_deref(), member.backend);
+			restored_infos.insert(member.target.as_str().into(), member.info.clone());
 		}
-
-		if sessions.iter().any(|session| session.target_name.is_none()) {
-			anyhow::bail!("mixed keyed and unkeyed MCP session state is unsupported");
-		}
-
-		// Target-keyed resume is intentionally strict: if the initialized target set changed,
-		// failing the resume is safer than binding persisted session state to the wrong target.
-		let mut by_target = HashMap::with_capacity(sessions.len());
-		for session in sessions {
-			let target_name = session
-				.target_name
-				.clone()
-				.expect("checked all sessions are target-keyed above");
-			if by_target.insert(target_name.clone(), session).is_some() {
-				anyhow::bail!("duplicate persisted session for target {target_name}");
-			}
-		}
-
-		if by_target.len() != self.upstreams.size() {
-			anyhow::bail!(
-				"persisted target count {} did not match initialized upstreams {}",
-				by_target.len(),
-				self.upstreams.size()
+		let mut infos = self.upstream_infos.write().unwrap_or_else(|e| {
+			tracing::error!(
+				"upstream capability cache lock poisoned while restoring initialize state; continuing"
 			);
-		}
-
-		for (target_name, us) in self.upstreams.iter_named() {
-			let session = by_target
-				.remove(target_name.as_str())
-				.ok_or_else(|| anyhow::anyhow!("missing persisted session for target {target_name}"))?;
-			us.set_session_id(session.session.as_deref(), session.backend);
-		}
+			e.into_inner()
+		});
+		*infos = restored_infos;
 		Ok(())
 	}
+
+	pub fn count(&self) -> usize {
+		self.upstreams.size()
+	}
+
 	pub fn is_multiplexing(&self) -> bool {
 		self.is_multiplexing
+	}
+
+	pub fn session_continuity(&self) -> SessionContinuity {
+		self.upstreams.session_continuity()
 	}
 
 	fn message_mapper(&self) -> Option<MessageMapper> {
@@ -774,8 +955,9 @@ impl Relay {
 		})
 	}
 
-	pub fn merge_initialize(&self, pv: ProtocolVersion, multiplexing: bool) -> Box<MergeFn> {
+	pub fn merge_initialize(&self, pv: ProtocolVersion) -> Box<MergeFn> {
 		let info_store = self.upstream_infos.clone();
+		let multiplexing = self.is_multiplexing;
 		Box::new(move |s| {
 			let mut infos = info_store.write().unwrap_or_else(|e| {
 				tracing::error!(
@@ -1084,7 +1266,6 @@ impl Relay {
 		&self,
 		ctx: IncomingRequestContext,
 	) -> Result<Response, UpstreamError> {
-		self.clear_pending_elicitation_ids();
 		let allow_degraded = self.allow_degraded;
 		for (name, con) in self.upstreams.iter_named() {
 			if let Err(e) = con.delete(&ctx).await {
@@ -1100,10 +1281,10 @@ impl Relay {
 		}
 		Ok(accepted_response())
 	}
-	pub async fn send_fanout_get(
+	pub async fn get_event_stream_messages(
 		&self,
 		ctx: IncomingRequestContext,
-	) -> Result<Response, UpstreamError> {
+	) -> Result<Messages, UpstreamError> {
 		let mut streams = Vec::new();
 		let allow_degraded = self.allow_degraded;
 		for (name, con) in self.upstreams.iter_named() {
@@ -1130,7 +1311,7 @@ impl Relay {
 		}
 
 		let ms = mergestream::MergeStream::new_without_merge(streams, self.message_mapper());
-		messages_to_response(RequestId::Number(0), ms)
+		Ok(Messages::from_stream(ms))
 	}
 
 	async fn build_fanout_streams(
@@ -1160,30 +1341,74 @@ impl Relay {
 		Ok(streams)
 	}
 
+	async fn prepare_selected_fanout(
+		&self,
+		r: JsonRpcRequest<ClientRequest>,
+		ctx: IncomingRequestContext,
+		merge: Box<MergeFn>,
+		names: Vec<Strng>,
+		fanout_mode: FanoutMode,
+		empty_error: String,
+	) -> Result<(RequestId, mergestream::MergeStream), UpstreamError> {
+		let id = r.id.clone();
+		let streams = self
+			.build_fanout_streams(r, &ctx, names, fanout_mode)
+			.await?;
+
+		if streams.is_empty() {
+			return Err(UpstreamError::InvalidRequest(empty_error));
+		}
+
+		let ms = mergestream::MergeStream::new(streams, id.clone(), merge, self.message_mapper());
+		Ok((id, ms))
+	}
+
 	pub async fn send_fanout(
 		&self,
 		r: JsonRpcRequest<ClientRequest>,
 		ctx: IncomingRequestContext,
 		merge: Box<MergeFn>,
 	) -> Result<Response, UpstreamError> {
-		let id = r.id.clone();
 		let names = self
 			.upstreams
 			.iter_named()
 			.map(|(name, _)| name)
 			.collect::<Vec<_>>();
-		let streams = self
-			.build_fanout_streams(r, &ctx, names, FanoutMode::All)
-			.await?;
-
-		if streams.is_empty() {
-			return Err(UpstreamError::InvalidRequest(
+		let (id, stream) = self
+			.prepare_selected_fanout(
+				r,
+				ctx,
+				merge,
+				names,
+				FanoutMode::All,
 				"all upstreams failed to respond to fanout".to_string(),
-			));
-		}
+			)
+			.await?;
+		messages_to_response(id, stream)
+	}
 
-		let ms = mergestream::MergeStream::new(streams, id.clone(), merge, self.message_mapper());
-		messages_to_response(id, ms)
+	pub async fn send_initialize(
+		&self,
+		r: JsonRpcRequest<ClientRequest>,
+		ctx: IncomingRequestContext,
+		pv: ProtocolVersion,
+	) -> Result<Response, UpstreamError> {
+		let names = self
+			.upstreams
+			.iter_named()
+			.map(|(name, _)| name)
+			.collect::<Vec<_>>();
+		let (id, stream) = self
+			.prepare_selected_fanout(
+				r,
+				ctx,
+				self.merge_initialize(pv),
+				names,
+				FanoutMode::All,
+				"all upstreams failed to respond to fanout".to_string(),
+			)
+			.await?;
+		messages_to_buffered_response(id, stream).await
 	}
 
 	pub async fn send_fanout_to(
@@ -1194,24 +1419,22 @@ impl Relay {
 		names: Vec<Strng>,
 	) -> Result<Response, UpstreamError> {
 		let method = r.request.method().to_string();
-		let id = r.id.clone();
 		if names.is_empty() {
 			return Err(UpstreamError::InvalidMethod(format!(
 				"no eligible backends for method {method}",
 			)));
 		}
-		let streams = self
-			.build_fanout_streams(r, &ctx, names, FanoutMode::Targeted)
+		let (id, stream) = self
+			.prepare_selected_fanout(
+				r,
+				ctx,
+				merge,
+				names,
+				FanoutMode::Targeted,
+				format!("all eligible backends failed for method {method}"),
+			)
 			.await?;
-
-		if streams.is_empty() {
-			return Err(UpstreamError::InvalidRequest(format!(
-				"all eligible backends failed for method {method}"
-			)));
-		}
-
-		let ms = mergestream::MergeStream::new(streams, id.clone(), merge, self.message_mapper());
-		messages_to_response(id, ms)
+		messages_to_response(id, stream)
 	}
 	pub async fn send_notification(
 		&self,
@@ -1237,8 +1460,21 @@ impl Relay {
 						}
 						return Ok(accepted_response());
 					}
+					tracing::warn!(
+						%server_name,
+						request_id = %cn.params.request_id,
+						"dropping cancellation: upstream not found"
+					);
+					return Ok(accepted_response());
 				}
-				// Fallback to fanout if decoding fails or server not found (e.g. not multiplexing)
+				if self.should_prefix_identifiers() {
+					tracing::warn!(
+						request_id = %cn.params.request_id,
+						"dropping cancellation: failed to decode routed request id"
+					);
+					return Ok(accepted_response());
+				}
+				// Fallback to fanout only when the session is not multiplexing.
 				for (name, con) in self.upstreams.iter_named() {
 					if let Err(e) = con
 						.generic_notification(ClientNotification::CancelledNotification(cn.clone()), &ctx)
@@ -1269,8 +1505,21 @@ impl Relay {
 						}
 						return Ok(accepted_response());
 					}
+					tracing::warn!(
+						%server_name,
+						progress_token = %pn.params.progress_token.0,
+						"dropping progress notification: upstream not found"
+					);
+					return Ok(accepted_response());
 				}
-				// Fallback to fanout if decoding fails or server not found (e.g. not multiplexing)
+				if self.should_prefix_identifiers() {
+					tracing::warn!(
+						progress_token = %pn.params.progress_token.0,
+						"dropping progress notification: failed to decode routed progress token"
+					);
+					return Ok(accepted_response());
+				}
+				// Fallback to fanout only when the session is not multiplexing.
 				for (name, con) in self.upstreams.iter_named() {
 					if let Err(e) = con
 						.generic_notification(ClientNotification::ProgressNotification(pn.clone()), &ctx)
@@ -1284,7 +1533,6 @@ impl Relay {
 				}
 			},
 			ClientNotification::CustomNotification(cn) => {
-				let enforce_pending_elicitation = self.should_prefix_identifiers();
 				let fallback_notification = match RoutedCustomNotification::parse(cn) {
 					RoutedCustomNotification::ElicitationResponse {
 						mut original,
@@ -1293,18 +1541,6 @@ impl Relay {
 						if let Ok((server_name, original_elicitation_id)) =
 							self.decode_upstream_elicitation_id(&params.typed.elicitation_id)
 						{
-							if enforce_pending_elicitation
-								&& !self.consume_pending_elicitation_id(
-									&params.typed.elicitation_id,
-									server_name.as_ref(),
-								) {
-								tracing::warn!(
-									%server_name,
-									elicitation_id = %params.typed.elicitation_id,
-									"dropping untracked elicitation response"
-								);
-								return Ok(accepted_response());
-							}
 							params.typed.elicitation_id = original_elicitation_id;
 							let params_value = match serde_json::to_value(&params) {
 								Ok(v) => v,
@@ -1451,6 +1687,8 @@ fn messages_to_response(
 ) -> Result<Response, UpstreamError> {
 	use futures_util::StreamExt;
 	use rmcp::model::ServerJsonRpcMessage;
+	// POST response streams are request-scoped. Only the session GET stream
+	// emits replayable event IDs for Last-Event-ID.
 	let stream = stream.map(move |rpc| {
 		let r = match rpc {
 			Ok(rpc) => rpc,
@@ -1458,12 +1696,58 @@ fn messages_to_response(
 				ServerJsonRpcMessage::error(ErrorData::internal_error(e.to_string(), None), id.clone())
 			},
 		};
-		// TODO: is it ok to have no event_id here?
 		ServerSseMessage {
 			event_id: None,
 			message: Arc::new(r),
 		}
 	});
+	Ok(crate::mcp::session::sse_stream_response(stream, None))
+}
+
+async fn messages_to_buffered_response(
+	id: RequestId,
+	mut stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Unpin,
+) -> Result<Response, UpstreamError> {
+	let mut messages = Vec::new();
+	while let Some(rpc) = stream.next().await {
+		let rpc = match rpc {
+			Ok(rpc) => rpc,
+			Err(e) => {
+				ServerJsonRpcMessage::error(ErrorData::internal_error(e.to_string(), None), id.clone())
+			},
+		};
+		messages.push(rpc);
+	}
+
+	let Some(first) = messages.first() else {
+		return Err(UpstreamError::InvalidRequest(
+			"all upstream streams ended before terminal response".to_string(),
+		));
+	};
+
+	if messages.len() == 1
+		&& matches!(
+			first,
+			ServerJsonRpcMessage::Response(_) | ServerJsonRpcMessage::Error(_)
+		) {
+		let body = serde_json::to_vec(first).map_err(|e| {
+			UpstreamError::InvalidRequest(format!("failed to serialize jsonrpc response: {e}"))
+		})?;
+		return ::http::Response::builder()
+			.status(StatusCode::OK)
+			.header(
+				http::header::CONTENT_TYPE,
+				rmcp::transport::common::http_header::JSON_MIME_TYPE,
+			)
+			.body(crate::http::Body::from(body))
+			.map_err(|e| UpstreamError::InvalidRequest(format!("failed to build json response: {e}")));
+	}
+
+	// Buffered POST responses follow the same request-scoped SSE contract.
+	let stream = futures_util::stream::iter(messages.into_iter().map(|message| ServerSseMessage {
+		event_id: None,
+		message: Arc::new(message),
+	}));
 	Ok(crate::mcp::session::sse_stream_response(stream, None))
 }
 
@@ -1705,6 +1989,87 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn decode_upstream_request_id_rejects_mismatched_session_binding() {
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					Arc::new(crate::mcp::router::McpTarget {
+						name: "serverA".into(),
+						spec: crate::types::agent::McpTargetSpec::Stdio {
+							cmd: "true".into(),
+							args: vec![],
+							env: Default::default(),
+						},
+						backend: None,
+						always_use_prefix: false,
+						backend_policies: Default::default(),
+					}),
+					Arc::new(crate::mcp::router::McpTarget {
+						name: "serverB".into(),
+						spec: crate::types::agent::McpTargetSpec::Stdio {
+							cmd: "true".into(),
+							args: vec![],
+							env: Default::default(),
+						},
+						backend: None,
+						always_use_prefix: false,
+						backend_policies: Default::default(),
+					}),
+				],
+				stateful: false,
+				allow_degraded: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+		let mismatched_relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					Arc::new(crate::mcp::router::McpTarget {
+						name: "serverA".into(),
+						spec: crate::types::agent::McpTargetSpec::Stdio {
+							cmd: "true".into(),
+							args: vec![],
+							env: Default::default(),
+						},
+						backend: None,
+						always_use_prefix: false,
+						backend_policies: Default::default(),
+					}),
+					Arc::new(crate::mcp::router::McpTarget {
+						name: "serverB".into(),
+						spec: crate::types::agent::McpTargetSpec::Stdio {
+							cmd: "true".into(),
+							args: vec![],
+							env: Default::default(),
+						},
+						backend: None,
+						always_use_prefix: false,
+						backend_policies: Default::default(),
+					}),
+				],
+				stateful: false,
+				allow_degraded: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+
+		let id = relay.encode_upstream_request_id("serverA", &RequestId::Number(1));
+		let err = mismatched_relay
+			.decode_upstream_request_id(&id)
+			.expect_err("mismatched session binding should be rejected");
+		assert!(matches!(err, UpstreamError::InvalidRequest(_)));
+	}
+
+	#[tokio::test]
 	async fn decode_upstream_request_id_rejects_legacy_format() {
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
 		let relay = Relay::new(
@@ -1849,6 +2214,74 @@ mod tests {
 			"serverA saw encoded request id; expected rewritten id. raw={server_a_raw:?}"
 		);
 
+		assert_not_contains_for(
+			server_b_capture.path(),
+			"\"notifications/cancelled\"",
+			Duration::from_millis(500),
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn send_notification_cancelled_mismatched_session_binding_should_be_dropped() {
+		use rmcp::model::{CancelledNotification, CancelledNotificationParam, JsonRpcNotification};
+
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let server_a_capture = NamedTempFile::new().expect("temp file");
+		let server_b_capture = NamedTempFile::new().expect("temp file");
+		let relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+		let mismatched_relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+
+		let rewritten_id = relay.encode_upstream_request_id("serverA", &RequestId::Number(1));
+		let notification = ClientNotification::CancelledNotification(CancelledNotification::new(
+			CancelledNotificationParam {
+				request_id: rewritten_id,
+				reason: Some("client cancelled".to_string()),
+			},
+		));
+		let r = JsonRpcNotification {
+			jsonrpc: Default::default(),
+			notification,
+		};
+
+		let ctx = IncomingRequestContext::empty();
+		let result = mismatched_relay.send_notification(r, ctx).await;
+		assert!(result.is_ok());
+
+		assert_not_contains_for(
+			server_a_capture.path(),
+			"\"notifications/cancelled\"",
+			Duration::from_millis(500),
+		)
+		.await;
 		assert_not_contains_for(
 			server_b_capture.path(),
 			"\"notifications/cancelled\"",
@@ -2111,7 +2544,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn send_notification_elicitation_response_untracked_id_should_be_dropped() {
+	async fn send_notification_elicitation_response_self_routed_id_should_route_without_tracking() {
 		use rmcp::model::JsonRpcNotification;
 
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
@@ -2149,6 +2582,80 @@ mod tests {
 
 		let ctx = IncomingRequestContext::empty();
 		let result = relay.send_notification(r, ctx).await;
+		assert!(result.is_ok());
+
+		wait_until_contains(
+			server_a_capture.path(),
+			"\"notifications/elicitation/response\"",
+		)
+		.await;
+		wait_until_contains(
+			server_a_capture.path(),
+			"\"elicitationId\":\"elicit-untracked\"",
+		)
+		.await;
+		assert_not_contains_for(
+			server_b_capture.path(),
+			"\"notifications/elicitation/response\"",
+			Duration::from_millis(500),
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn send_notification_elicitation_response_session_binding_mismatch_should_be_dropped() {
+		use rmcp::model::JsonRpcNotification;
+
+		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
+		let server_a_capture = NamedTempFile::new().expect("temp file");
+		let server_b_capture = NamedTempFile::new().expect("temp file");
+		let relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+		let mismatched_relay = Relay::new(
+			McpBackendGroup {
+				targets: vec![
+					capture_target("serverA", server_a_capture.path()),
+					capture_target("serverB", server_b_capture.path()),
+				],
+				stateful: false,
+				allow_degraded: false,
+			},
+			McpAuthorizationSet::new(vec![].into()),
+			PolicyClient {
+				inputs: test.inputs(),
+			},
+		)
+		.expect("relay");
+
+		let encoded = relay.encode_upstream_elicitation_id("serverA", "elicit-mismatch");
+		let notification =
+			ClientNotification::CustomNotification(rmcp::model::CustomNotification::new(
+				ELICITATION_RESPONSE_METHOD,
+				Some(json!({
+					"elicitationId": encoded,
+					"action": "accept"
+				})),
+			));
+		let r = JsonRpcNotification {
+			jsonrpc: Default::default(),
+			notification,
+		};
+
+		let ctx = IncomingRequestContext::empty();
+		let result = mismatched_relay.send_notification(r, ctx).await;
 		assert!(result.is_ok());
 
 		assert_not_contains_for(

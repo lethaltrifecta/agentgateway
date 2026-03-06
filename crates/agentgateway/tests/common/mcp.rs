@@ -107,6 +107,13 @@ pub(crate) async fn start_mock_mcp_meta_server(
 	start_streamable_mock_server(label, stateful, MetaOnlyHandler::new).await
 }
 
+pub(crate) async fn start_mock_mcp_tools_only_prompt_leak_server(
+	label: impl Into<String>,
+	stateful: bool,
+) -> MockMcpServer {
+	start_streamable_mock_server(label, stateful, ToolsOnlyPromptLeakHandler::new).await
+}
+
 async fn start_streamable_mock_server<H, F>(
 	label: impl Into<String>,
 	stateful: bool,
@@ -658,6 +665,67 @@ impl ServerHandler for MetaOnlyHandler {
 		let mut result = ListToolsResult::with_all_items(Vec::new());
 		result.meta = Some(meta);
 		std::future::ready(Ok(result))
+	}
+}
+
+#[derive(Clone)]
+struct ToolsOnlyPromptLeakHandler {
+	label: Arc<str>,
+	tool_router: rmcp::handler::server::router::tool::ToolRouter<ToolsOnlyPromptLeakHandler>,
+	prompt_router: rmcp::handler::server::router::prompt::PromptRouter<ToolsOnlyPromptLeakHandler>,
+}
+
+impl ToolsOnlyPromptLeakHandler {
+	fn new(label: Arc<str>) -> Self {
+		Self {
+			label,
+			tool_router: Self::tool_router(),
+			prompt_router: Self::prompt_router(),
+		}
+	}
+}
+
+#[tool_router]
+impl ToolsOnlyPromptLeakHandler {
+	#[rmcp::tool(description = "Echo")]
+	fn echo(
+		&self,
+		rmcp::handler::server::wrapper::Parameters(val): rmcp::handler::server::wrapper::Parameters<
+			serde_json::Value,
+		>,
+	) -> Result<CallToolResult, ErrorData> {
+		let text = val.get("val").and_then(|v| v.as_str()).unwrap_or("empty");
+		Ok(CallToolResult::success(vec![Annotated::new(
+			RawContent::text(format!("{}: {}", self.label, text)),
+			None,
+		)]))
+	}
+}
+
+#[prompt_router]
+impl ToolsOnlyPromptLeakHandler {
+	#[rmcp::prompt(name = "should_not_leak")]
+	fn should_not_leak(
+		&self,
+		rmcp::handler::server::wrapper::Parameters(val): rmcp::handler::server::wrapper::Parameters<
+			serde_json::Value,
+		>,
+	) -> Result<GetPromptResult, ErrorData> {
+		let msg = val.get("val").and_then(|v| v.as_str()).unwrap_or("none");
+		Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+			PromptMessageRole::User,
+			format!("leaked {}: {}", self.label, msg),
+		)]))
+	}
+}
+
+#[tool_handler]
+#[rmcp::prompt_handler]
+impl ServerHandler for ToolsOnlyPromptLeakHandler {
+	fn get_info(&self) -> ServerInfo {
+		ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+			.with_protocol_version(ProtocolVersion::V_2025_06_18)
+			.with_server_info(Implementation::from_build_env())
 	}
 }
 

@@ -17,6 +17,7 @@ use crate::http::jwt::Claims;
 use crate::mcp::FailureMode;
 use crate::mcp::mergestream::Messages;
 use crate::mcp::router::{McpBackendGroup, McpTarget};
+use crate::mcp::session::SessionContinuity;
 use crate::mcp::streamablehttp::StreamableHttpPostResponse;
 use crate::mcp::{mergestream, upstream};
 use crate::proxy::ProxyError;
@@ -98,6 +99,10 @@ pub(crate) enum Upstream {
 }
 
 impl Upstream {
+	pub(crate) const fn supports_reconstructible_sessions(&self) -> bool {
+		matches!(self, Upstream::McpStreamable(_))
+	}
+
 	pub fn get_session_state(&self) -> Option<http::sessionpersistence::MCPSession> {
 		match self {
 			Upstream::McpStreamable(c) => Some(c.get_session_state()),
@@ -293,6 +298,28 @@ impl UpstreamGroup {
 	pub(crate) fn iter_named(&self) -> impl Iterator<Item = (Strng, Arc<upstream::Upstream>)> {
 		self.by_name.iter().map(|(k, v)| (k.clone(), v.clone()))
 	}
+
+	pub(crate) fn session_continuity(&self) -> SessionContinuity {
+		if !self.by_name.is_empty()
+			&& self
+				.by_name
+				.values()
+				.all(|upstream| upstream.supports_reconstructible_sessions())
+		{
+			SessionContinuity::Reconstructible
+		} else {
+			SessionContinuity::LiveOnly
+		}
+	}
+
+	pub(crate) fn target(&self, name: &str) -> Option<&Arc<McpTarget>> {
+		self
+			.backend
+			.targets
+			.iter()
+			.find(|target| target.name.as_str() == name)
+	}
+
 	pub(crate) fn get(&self, name: &str) -> anyhow::Result<&upstream::Upstream> {
 		self
 			.by_name

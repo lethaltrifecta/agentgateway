@@ -70,6 +70,5 @@ backends:
               name: remote
           stateful: true
           alwaysUsePrefix: false
-          allowDegraded: false
 workloads: []
 services: []

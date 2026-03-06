@@ -52,7 +52,7 @@ pub enum Error {
 	#[error("fail to deserialize request body: {0}")]
 	Deserialize(crate::http::Error),
 	#[error("fail to create session: {0}")]
-	StartSession(crate::http::Error),
+	StartSession(String),
 	#[error("session not found")]
 	UnknownSession,
 	#[error("session header is required for non-initialize requests")]
@@ -138,6 +138,35 @@ impl Display for MCPOperation {
 	}
 }
 
+#[derive(
+	Copy, Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelValue,
+)]
+pub enum ResumeFailureReason {
+	MalformedHandle,
+	LiveSessionMissing,
+	SnapshotMismatch,
+	SnapshotRestoreFailed,
+	UnsupportedHandle,
+}
+
+impl ResumeFailureReason {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::MalformedHandle => "malformed_handle",
+			Self::LiveSessionMissing => "live_session_missing",
+			Self::SnapshotMismatch => "snapshot_mismatch",
+			Self::SnapshotRestoreFailed => "snapshot_restore_failed",
+			Self::UnsupportedHandle => "unsupported_handle",
+		}
+	}
+}
+
+impl Display for ResumeFailureReason {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MCPInfo {
 	pub method_name: Option<String>,
@@ -146,4 +175,5 @@ pub struct MCPInfo {
 	pub target_name: Option<String>,
 	pub resource: Option<MCPOperation>,
 	pub session_id: Option<String>,
+	pub resume_failure_reason: Option<ResumeFailureReason>,
 }

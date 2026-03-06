@@ -34,7 +34,8 @@ use crate::llm::InputFormat;
 use crate::mcp::{MCPOperation, ResourceId, ResourceType};
 use crate::proxy::ProxyResponseReason;
 use crate::telemetry::metrics::{
-	GenAILabels, GenAILabelsTokenUsage, HTTPLabels, MCPCall, Metrics, RouteIdentifier,
+	GenAILabels, GenAILabelsTokenUsage, HTTPLabels, MCPCall, MCPResumeFailure, Metrics,
+	RouteIdentifier,
 };
 use crate::telemetry::trc;
 use crate::telemetry::trc::TraceParent;
@@ -883,6 +884,20 @@ impl Drop for DropOnLog {
 				})
 				.inc();
 		}
+		if let Some(mcp) = &mcp
+			&& let Some(reason) = mcp.resume_failure_reason
+		{
+			log
+				.metrics
+				.mcp_resume_failures
+				.get_or_create(&MCPResumeFailure {
+					reason,
+					method: mcp.method_name.as_ref().map(RichStrng::from).into(),
+					route: route_identifier.clone(),
+					custom: custom_metric_fields.clone(),
+				})
+				.inc();
+		}
 
 		let enable_logs = maybe_enable_log && cel_exec.eval_filter();
 		if !enable_logs && !enable_trace {
@@ -982,6 +997,13 @@ impl Drop for DropOnLog {
 				mcp
 					.as_ref()
 					.and_then(|m| m.session_id.as_ref())
+					.map(display),
+			),
+			(
+				"mcp.resume.failure_reason",
+				mcp
+					.as_ref()
+					.and_then(|m| m.resume_failure_reason.as_ref())
 					.map(display),
 			),
 			(

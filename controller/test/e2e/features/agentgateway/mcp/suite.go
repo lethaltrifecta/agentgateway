@@ -110,15 +110,17 @@ func (s *testingSuite) TestSSEEndpoint() {
 
 	initBody := buildInitializeRequest("sse-client", 0)
 	headers := mcpHeaders(nil)
+	sessionID := s.initializeSession(initBody, headers, "sse")
+	s.notifyInitialized(sessionID, nil)
 
+	toolsBody := buildToolsListRequest(1)
+	toolsHeaders := withSessionID(headers, sessionID)
 	s.sendMCP(&testmatchers.HttpResponse{
 		StatusCode: http.StatusOK,
 		Headers: map[string]any{
 			"Content-Type": gomega.MatchRegexp(`^text/event-stream(?:\s*;.*)?$`),
 		},
-	}, headers, initBody, "--max-time", "8")
-
-	_ = s.initializeSession(initBody, headers, "sse")
+	}, toolsHeaders, toolsBody, "--max-time", "8")
 }
 
 func (s *testingSuite) TestDynamicMCPAdminRouting() {

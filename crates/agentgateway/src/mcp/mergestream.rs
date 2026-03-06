@@ -25,6 +25,13 @@ impl Messages {
 	pub fn from_result<T: Into<ServerResult>>(id: RequestId, result: T) -> Self {
 		Self::from(ServerJsonRpcMessage::response(result.into(), id))
 	}
+
+	pub fn from_stream<S>(stream: S) -> Self
+	where
+		S: Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,
+	{
+		Messages(stream.boxed())
+	}
 }
 
 impl Stream for Messages {

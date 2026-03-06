@@ -326,6 +326,19 @@ func FirstSSEDataPayload(body string) (string, bool) {
 	return payload, true
 }
 
+// FirstMCPPayload returns the first JSON-RPC payload from either an SSE response body
+// or a direct JSON response body.
+func FirstMCPPayload(body string) (string, bool) {
+	if payload, ok := FirstSSEDataPayload(body); ok {
+		return payload, true
+	}
+	payload := strings.TrimSpace(body)
+	if payload == "" || !IsJSONValid(payload) {
+		return "", false
+	}
+	return payload, true
+}
+
 // IsJSONValid is a small helper to check the payload is valid JSON
 func IsJSONValid(s string) bool {
 	var js json.RawMessage
@@ -442,7 +455,7 @@ func (s *testingSuite) initializeSession(initBody string, hdr map[string]string,
 		resp, body, err := s.execCurlMCP(hdr, initBody, "--max-time", "10")
 		s.Require().NoError(err, "%s initialize failed", label)
 
-		payload, ok := FirstSSEDataPayload(body)
+		payload, ok := FirstMCPPayload(body)
 		if ok && strings.TrimSpace(payload) != "" {
 			var initResp InitializeResponse
 			s.Require().NoError(json.Unmarshal([]byte(payload), &initResp), "%s initialize payload unmarshal failed", label)
@@ -464,7 +477,7 @@ func (s *testingSuite) initializeSession(initBody string, hdr map[string]string,
 		if attempt < len(backoffs) {
 			time.Sleep(backoffs[attempt])
 		} else {
-			s.Require().Failf(label, "initialize returned no SSE payload")
+			s.Require().Failf(label, "initialize returned no MCP payload")
 		}
 	}
 	return "" // unreachable
