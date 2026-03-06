@@ -42,6 +42,11 @@ type backendRefKey struct {
 }
 
 type ProviderSource struct {
+	// OwnerKey keeps the KRT output per policy owner while ResourceKey identifies
+	// the shared fetched provider state. The ideal end state is to keep this
+	// owner/shared split, but derive the shared identity from an explicit
+	// transport model rather than comparing tls.Config directly.
+	OwnerKey     string
 	ResourceKey  string
 	Issuer       string
 	RequestURL   string
@@ -52,16 +57,32 @@ type ProviderSource struct {
 }
 
 func (s ProviderSource) ResourceName() string {
+	if s.OwnerKey != "" {
+		return s.OwnerKey + ":" + s.ResourceKey
+	}
 	return s.ResourceKey
 }
 
 func (s ProviderSource) Equals(other ProviderSource) bool {
-	return s.ResourceKey == other.ResourceKey &&
+	return s.OwnerKey == other.OwnerKey &&
+		s.ResourceKey == other.ResourceKey &&
 		s.Issuer == other.Issuer &&
 		s.RequestURL == other.RequestURL &&
 		s.HostOverride == other.HostOverride &&
 		s.Ttl == other.Ttl &&
 		s.Deleted == other.Deleted &&
+		reflect.DeepEqual(s.TlsConfig, other.TlsConfig)
+}
+
+func (s ProviderSource) Equivalent(other ProviderSource) bool {
+	// Equivalent compares the shared fetch identity only. OwnerKey stays out of
+	// this comparison so the store can dedupe multiple policy owners onto one
+	// fetched provider source.
+	return s.ResourceKey == other.ResourceKey &&
+		s.Issuer == other.Issuer &&
+		s.RequestURL == other.RequestURL &&
+		s.HostOverride == other.HostOverride &&
+		s.Ttl == other.Ttl &&
 		reflect.DeepEqual(s.TlsConfig, other.TlsConfig)
 }
 

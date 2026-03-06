@@ -107,12 +107,12 @@ async fn write_config(
 	};
 	let yaml_content =
 		yamlviajson::to_string(&config_json).map_err(|e| ErrorResponse::Anyhow(e.into()))?;
-	let oidc = Arc::new(crate::http::oidc::OidcClient::new());
+	let oidc = crate::http::oidc::OidcJwtService::new_runtime();
 
 	if let Err(e) = crate::types::local::NormalizedLocalConfig::from(
 		&app.state,
 		app.client.clone(),
-		oidc.jwt_service(),
+		oidc,
 		app.state.gateway(),
 		yaml_content.as_str(),
 	)

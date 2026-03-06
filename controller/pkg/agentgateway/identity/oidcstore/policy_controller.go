@@ -2,6 +2,7 @@ package oidcstore
 
 import (
 	"context"
+	"fmt"
 
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
@@ -59,6 +60,9 @@ func (c *OIDCStorePolicyController) Init(ctx context.Context) {
 						continue
 					}
 					seen[source.ResourceKey] = struct{}{}
+					// Emit one source per policy owner. The store is responsible for
+					// collapsing owners that share the same fetched provider source.
+					source.OwnerKey = policySourceOwnerKey(p.Name, p.Namespace)
 					sources = append(sources, *source)
 				}
 			}
@@ -75,6 +79,9 @@ func (c *OIDCStorePolicyController) Init(ctx context.Context) {
 					polLogger.Error("error building oauth2 oidc provider source", "error", err, "policy", p.Name, "issuer", *p.Spec.Traffic.OAuth2.Issuer)
 				} else if _, ok := seen[source.ResourceKey]; !ok {
 					seen[source.ResourceKey] = struct{}{}
+					// Emit one source per policy owner. The store is responsible for
+					// collapsing owners that share the same fetched provider source.
+					source.OwnerKey = policySourceOwnerKey(p.Name, p.Namespace)
 					sources = append(sources, *source)
 				}
 			}
@@ -108,4 +115,8 @@ func (c *OIDCStorePolicyController) NeedLeaderElection() bool {
 
 func (c *OIDCStorePolicyController) SourceChanges() chan oidc.ProviderSource {
 	return c.sourceChanges
+}
+
+func policySourceOwnerKey(name, namespace string) string {
+	return fmt.Sprintf("%s/%s", namespace, name)
 }

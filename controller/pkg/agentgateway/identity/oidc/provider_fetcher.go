@@ -34,6 +34,11 @@ type providerFetchAt struct {
 	retryAttempt int
 }
 
+const (
+	providerFetchTimeout      = 30 * time.Second
+	providerSubscriberBufSize = 1
+)
+
 func NewProviderFetcher(cache *providerCache) *ProviderFetcher {
 	fetcher := &ProviderFetcher{
 		cache:         cache,
@@ -48,6 +53,7 @@ func NewProviderFetcher(cache *providerCache) *ProviderFetcher {
 
 func makeProviderHTTPClient(tlsConfig *tls.Config) *http.Client {
 	return &http.Client{
+		Timeout: providerFetchTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: tlsConfig,
 			DialContext: (&net.Dialer{
@@ -96,8 +102,6 @@ func (f *ProviderFetcher) maybeFetchProviders(ctx context.Context) {
 	updates := make(map[string]StoredProvider)
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	now := time.Now()
 	for {
 		maybeFetch := f.schedule.Peek()
@@ -137,8 +141,11 @@ func (f *ProviderFetcher) maybeFetchProviders(ctx context.Context) {
 		updates[fetch.source.ResourceKey] = provider
 	}
 
+	subscribers := append([]chan map[string]StoredProvider(nil), f.subscribers...)
+	f.mu.Unlock()
+
 	if len(updates) > 0 {
-		for _, subscriber := range f.subscribers {
+		for _, subscriber := range subscribers {
 			subscriber <- updates
 		}
 	}
@@ -148,7 +155,7 @@ func (f *ProviderFetcher) SubscribeToUpdates() chan map[string]StoredProvider {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	subscriber := make(chan map[string]StoredProvider)
+	subscriber := make(chan map[string]StoredProvider, providerSubscriberBufSize)
 	f.subscribers = append(f.subscribers, subscriber)
 	return subscriber
 }
@@ -185,19 +192,21 @@ func (f *ProviderFetcher) AddOrUpdateSource(source ProviderSource) error {
 }
 
 func (f *ProviderFetcher) RemoveSource(source ProviderSource) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	var subscribers []chan map[string]StoredProvider
+	var update map[string]StoredProvider
 
+	f.mu.Lock()
 	if existing, ok := f.sources[source.ResourceKey]; ok {
 		delete(f.sources, source.ResourceKey)
 		f.cache.DeleteProvider(source.ResourceKey)
 		existing.Deleted = true
+		subscribers = append([]chan map[string]StoredProvider(nil), f.subscribers...)
+		update = map[string]StoredProvider{source.ResourceKey: {}}
+	}
+	f.mu.Unlock()
 
-		for _, subscriber := range f.subscribers {
-			subscriber <- map[string]StoredProvider{
-				source.ResourceKey: {},
-			}
-		}
+	for _, subscriber := range subscribers {
+		subscriber <- update
 	}
 }
 

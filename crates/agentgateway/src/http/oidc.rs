@@ -428,6 +428,12 @@ pub struct OidcJwtService {
 }
 
 impl OidcJwtService {
+	pub fn new_runtime() -> Self {
+		Self {
+			client: Arc::new(OidcClient::new()),
+		}
+	}
+
 	pub fn resolver(&self) -> OidcJwtResolver<'_> {
 		self.client.jwt()
 	}
@@ -547,6 +553,12 @@ pub struct OidcTokenService {
 }
 
 impl OidcTokenService {
+	pub fn new_runtime() -> Self {
+		Self {
+			client: Arc::new(OidcClient::new()),
+		}
+	}
+
 	pub async fn exchange_code(
 		&self,
 		ctx: OidcCallContext<'_>,

@@ -65,6 +65,11 @@ type jwksHttpClientImpl struct {
 	Client *http.Client
 }
 
+const (
+	jwksFetchTimeout      = 30 * time.Second
+	jwksSubscriberBufSize = 1
+)
+
 func NewJwksFetcher(cache *jwksCache) *JwksFetcher {
 	toret := &JwksFetcher{
 		cache:             cache,
@@ -80,6 +85,7 @@ func NewJwksFetcher(cache *jwksCache) *JwksFetcher {
 
 func makeClient(t *tls.Config) *http.Client {
 	return &http.Client{
+		Timeout: jwksFetchTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: t,
 			DialContext: (&net.Dialer{
@@ -128,8 +134,6 @@ func (f *JwksFetcher) maybeFetchJwks(ctx context.Context) {
 	updates := make(map[string]string)
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	now := time.Now()
 	for {
 		maybeFetch := f.schedule.Peek()
@@ -168,8 +172,11 @@ func (f *JwksFetcher) maybeFetchJwks(ctx context.Context) {
 		updates[fetch.keysetSource.JwksURL] = updatedJwks
 	}
 
+	subscribers := append([]chan map[string]string(nil), f.subscribers...)
+	f.mu.Unlock()
+
 	if len(updates) > 0 {
-		for _, s := range f.subscribers {
+		for _, s := range subscribers {
 			s <- updates
 		}
 	}
@@ -179,7 +186,7 @@ func (f *JwksFetcher) SubscribeToUpdates() chan map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	subscriber := make(chan map[string]string)
+	subscriber := make(chan map[string]string, jwksSubscriberBufSize)
 	f.subscribers = append(f.subscribers, subscriber)
 
 	return subscriber
@@ -207,17 +214,21 @@ func (f *JwksFetcher) AddOrUpdateKeyset(source JwksSource) error {
 }
 
 func (f *JwksFetcher) RemoveKeyset(source JwksSource) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	var subscribers []chan map[string]string
+	var update map[string]string
 
+	f.mu.Lock()
 	if beingDeleted, ok := f.keysetSources[source.JwksURL]; ok {
 		delete(f.keysetSources, source.JwksURL)
 		f.cache.deleteJwks(source.JwksURL)
 		beingDeleted.Deleted = true
+		subscribers = append([]chan map[string]string(nil), f.subscribers...)
+		update = map[string]string{source.JwksURL: ""}
+	}
+	f.mu.Unlock()
 
-		for _, s := range f.subscribers {
-			s <- map[string]string{source.JwksURL: ""}
-		}
+	for _, s := range subscribers {
+		s <- update
 	}
 }
 

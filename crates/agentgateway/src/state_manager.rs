@@ -101,14 +101,14 @@ pub struct LocalClient {
 
 impl LocalClient {
 	pub async fn run(self) -> Result<(), anyhow::Error> {
-		let oidc = Arc::new(crate::http::oidc::OidcClient::new());
+		let oidc = crate::http::oidc::OidcJwtService::new_runtime();
 		if let ConfigSource::File(path) = &self.cfg {
 			// Load initial state then watch
 			self.watch_config_file(path, oidc).await?;
 		} else {
 			// Load it once
 			self
-				.reload_config(PreviousState::default(), oidc.jwt_service())
+				.reload_config(PreviousState::default(), oidc.clone())
 				.await?;
 		}
 
@@ -118,7 +118,7 @@ impl LocalClient {
 	async fn watch_config_file(
 		&self,
 		path: &Path,
-		oidc: Arc<crate::http::oidc::OidcClient>,
+		oidc: crate::http::oidc::OidcJwtService,
 	) -> anyhow::Result<()> {
 		let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
@@ -144,7 +144,7 @@ impl LocalClient {
 
 		let lc: LocalClient = self.to_owned();
 		let mut next_state = lc
-			.reload_config(PreviousState::default(), oidc.jwt_service())
+			.reload_config(PreviousState::default(), oidc.clone())
 			.await?;
 		tokio::task::spawn(async move {
 			// Resolve initial target (symlink or not)
@@ -163,10 +163,7 @@ impl LocalClient {
 				}) {
 					real_config_path = current_config_path.clone();
 					info!("Config file changed, reloading...");
-					match lc
-						.reload_config(next_state.clone(), oidc.jwt_service())
-						.await
-					{
+					match lc.reload_config(next_state.clone(), oidc.clone()).await {
 						Ok(nxt) => {
 							next_state = nxt;
 							info!("Config reloaded successfully")
