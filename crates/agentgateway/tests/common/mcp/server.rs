@@ -1,100 +1,24 @@
-use anyhow::Context;
 use rmcp::model::{
 	AnnotateAble, Annotated, CallToolRequestParams, CallToolResult, CancelTaskParams,
-	CancelTaskResult, ClientCapabilities, ClientInfo, ClientResult, CompleteRequestParams,
-	CompleteResult, CompletionInfo, CreateElicitationRequest, CreateElicitationRequestParams,
-	CreateElicitationResult, CreateTaskResult, ElicitationAction, ElicitationCapability,
-	ElicitationSchema, ErrorCode, ErrorData, FormElicitationCapability, GetPromptRequestParams,
-	GetPromptResult, GetTaskInfoParams, GetTaskPayloadResult, GetTaskResult, GetTaskResultParams,
-	Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-	ListTasksResult, ListToolsResult, Meta, PaginatedRequestParams, PromptMessage, PromptMessageRole,
-	ProtocolVersion, RawContent, RawResource, RawResourceTemplate, ReadResourceRequestParams,
-	ReadResourceResult, Reference, ResourceContents, ResourceUpdatedNotification,
-	ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, ServerNotification,
-	ServerRequest, SubscribeRequestParams, TaskStatus, TasksCapability, UnsubscribeRequestParams,
-	UrlElicitationCapability,
+	CancelTaskResult, ClientResult, CompleteRequestParams, CompleteResult, CompletionInfo,
+	CreateElicitationRequest, CreateElicitationRequestParams, CreateTaskResult, ElicitationSchema,
+	ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult, GetTaskInfoParams,
+	GetTaskPayloadResult, GetTaskResult, GetTaskResultParams, Implementation, ListPromptsResult,
+	ListResourceTemplatesResult, ListResourcesResult, ListTasksResult, ListToolsResult, Meta,
+	PaginatedRequestParams, PromptMessage, PromptMessageRole, ProtocolVersion, RawContent,
+	RawResource, RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, Reference,
+	ResourceContents, ResourceUpdatedNotification, ResourceUpdatedNotificationParam,
+	ServerCapabilities, ServerInfo, ServerNotification, ServerRequest, SubscribeRequestParams,
+	TaskStatus, TasksCapability, UnsubscribeRequestParams,
 };
-use rmcp::service::{NotificationContext, RequestContext, RoleClient, RunningService};
-use rmcp::{RoleServer, ServerHandler, ServiceExt, prompt_router, tool_handler, tool_router};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{ServerHandler, prompt_router, tool_handler, tool_router};
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
-use super::task_store::TaskStore;
-
-pub(crate) const TEST_SESSION_KEY: &str =
-	"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-
-pub(crate) type ComprehensiveClient = RunningService<RoleClient, ComprehensiveClientHandler>;
-
-pub(crate) async fn setup_comprehensive_client(
-	url: &str,
-	update_count: Arc<AtomicUsize>,
-) -> anyhow::Result<ComprehensiveClient> {
-	use rmcp::transport::StreamableHttpClientTransport;
-	let transport = StreamableHttpClientTransport::with_client(
-		reqwest::Client::new(),
-		rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
-			url.to_string(),
-		),
-	);
-
-	let client_info = ClientInfo::new(
-		ClientCapabilities::builder()
-			.enable_tasks_with(TasksCapability::client_default())
-			.enable_elicitation_with(ElicitationCapability {
-				form: Some(FormElicitationCapability {
-					schema_validation: Some(true),
-				}),
-				url: Some(UrlElicitationCapability::default()),
-			})
-			.build(),
-		Implementation::new("comprehensive-client", "1.0.0"),
-	);
-
-	let client = ComprehensiveClientHandler {
-		info: client_info,
-		update_count,
-	}
-	.serve(transport)
-	.await
-	.context("failed to start comprehensive client service")?;
-
-	Ok(client)
-}
-
-pub(crate) struct ComprehensiveClientHandler {
-	info: ClientInfo,
-	update_count: Arc<AtomicUsize>,
-}
-
-impl rmcp::ClientHandler for ComprehensiveClientHandler {
-	fn get_info(&self) -> ClientInfo {
-		self.info.clone()
-	}
-
-	fn create_elicitation(
-		&self,
-		_req: CreateElicitationRequestParams,
-		_: RequestContext<RoleClient>,
-	) -> impl std::future::Future<Output = Result<CreateElicitationResult, ErrorData>> + Send + '_ {
-		std::future::ready(Ok(
-			CreateElicitationResult::new(ElicitationAction::Accept)
-				.with_content(json!({"color": "diamond"})),
-		))
-	}
-
-	fn on_resource_updated(
-		&self,
-		_req: ResourceUpdatedNotificationParam,
-		_: NotificationContext<RoleClient>,
-	) -> impl std::future::Future<Output = ()> + Send + '_ {
-		self.update_count.fetch_add(1, Ordering::SeqCst);
-		std::future::ready(())
-	}
-}
+use crate::common::task_store::TaskStore;
 
 pub(crate) async fn start_mock_mcp_server(
 	label: impl Into<String>,
@@ -115,6 +39,57 @@ pub(crate) async fn start_mock_mcp_tools_only_prompt_leak_server(
 	stateful: bool,
 ) -> MockMcpServer {
 	start_streamable_mock_server(label, stateful, ToolsOnlyPromptLeakHandler::new).await
+}
+
+pub(crate) async fn start_mock_legacy_sse_server() -> MockMcpServer {
+	use legacy_rmcp::transport::sse_server::{SseServer, SseServerConfig};
+	use tokio_util::sync::CancellationToken;
+
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let cancellation = CancellationToken::new();
+	let (sse_server, service) = SseServer::new(SseServerConfig {
+		bind: addr,
+		sse_path: "/sse".to_string(),
+		post_path: "/message".to_string(),
+		ct: cancellation.child_token(),
+		sse_keep_alive: None,
+	});
+
+	let (shutdown_tx, shutdown_rx) = oneshot::channel();
+	let service_cancellation =
+		sse_server.with_service_directly(legacy_sse_mock::LegacyRobustHandler::new);
+	let server_task = tokio::spawn(async move {
+		let _ = axum::serve(listener, service)
+			.with_graceful_shutdown(async move {
+				let _ = shutdown_rx.await;
+				cancellation.cancel();
+				service_cancellation.cancel();
+			})
+			.await;
+	});
+	MockMcpServer {
+		addr,
+		shutdown_tx: Some(shutdown_tx),
+		server_task: Some(server_task),
+	}
+}
+
+pub(crate) struct MockMcpServer {
+	pub(crate) addr: std::net::SocketAddr,
+	shutdown_tx: Option<oneshot::Sender<()>>,
+	server_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MockMcpServer {
+	fn drop(&mut self) {
+		if let Some(tx) = self.shutdown_tx.take() {
+			let _ = tx.send(());
+		}
+		if let Some(task) = self.server_task.take() {
+			task.abort();
+		}
+	}
 }
 
 async fn start_streamable_mock_server<H, F>(
@@ -158,170 +133,6 @@ where
 		addr,
 		shutdown_tx: Some(shutdown_tx),
 		server_task: Some(server_task),
-	}
-}
-
-pub(crate) async fn start_mock_legacy_sse_server() -> MockMcpServer {
-	use legacy_rmcp::transport::sse_server::{SseServer, SseServerConfig};
-	use tokio_util::sync::CancellationToken;
-
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = listener.local_addr().unwrap();
-	let cancellation = CancellationToken::new();
-	let (sse_server, service) = SseServer::new(SseServerConfig {
-		bind: addr,
-		sse_path: "/sse".to_string(),
-		post_path: "/message".to_string(),
-		ct: cancellation.child_token(),
-		sse_keep_alive: None,
-	});
-
-	let (shutdown_tx, shutdown_rx) = oneshot::channel();
-	let service_cancellation =
-		sse_server.with_service_directly(legacy_sse_mock::LegacyRobustHandler::new);
-	let server_task = tokio::spawn(async move {
-		let _ = axum::serve(listener, service)
-			.with_graceful_shutdown(async move {
-				let _ = shutdown_rx.await;
-				cancellation.cancel();
-				service_cancellation.cancel();
-			})
-			.await;
-	});
-	MockMcpServer {
-		addr,
-		shutdown_tx: Some(shutdown_tx),
-		server_task: Some(server_task),
-	}
-}
-
-pub(crate) fn multiplex_config(
-	mcp1: &MockMcpServer,
-	mcp2: &MockMcpServer,
-	broken_mcp_addr: std::net::SocketAddr,
-) -> String {
-	format!(
-		r#"
-config:
-  session:
-    key: {TEST_SESSION_KEY}
-binds:
-- port: $PORT
-  listeners:
-  - name: comprehensive-gateway
-    routes:
-    - matches:
-      - path:
-          pathPrefix: /mcp
-      backends:
-      - mcp:
-          allowDegraded: true
-          targets:
-          - name: s1
-            mcp:
-              host: http://{}/mcp
-          - name: s2
-            mcp:
-              host: http://{}/mcp
-          - name: s3
-            mcp:
-              host: http://{}/mcp
-      policies:
-        mcpAuthorization:
-          rules:
-          - 'true'
-          - deny: 'mcp.tool.target == "s2" && mcp.tool.name == "echo"'
-"#,
-		mcp1.addr, mcp2.addr, broken_mcp_addr
-	)
-}
-
-pub(crate) fn multiplex_transport_matrix_config(
-	streamable: &MockMcpServer,
-	sse: &MockMcpServer,
-	broken_mcp_addr: std::net::SocketAddr,
-) -> String {
-	format!(
-		r#"
-config:
-  session:
-    key: {TEST_SESSION_KEY}
-binds:
-- port: $PORT
-  listeners:
-  - name: comprehensive-gateway
-    routes:
-    - matches:
-      - path:
-          pathPrefix: /mcp
-      backends:
-      - mcp:
-          allowDegraded: true
-          targets:
-          - name: stream
-            mcp:
-              host: http://{}/mcp
-          - name: sse
-            sse:
-              host: http://{}/sse
-          - name: s3
-            mcp:
-              host: http://{}/mcp
-      policies:
-        mcpAuthorization:
-          rules:
-          - 'true'
-"#,
-		streamable.addr, sse.addr, broken_mcp_addr
-	)
-}
-
-pub(crate) fn simple_multiplex_config(
-	listener_name: &str,
-	targets: &[(String, std::net::SocketAddr)],
-) -> String {
-	let mut config = format!(
-		r#"config:
-  session:
-    key: {TEST_SESSION_KEY}
-binds:
-- port: $PORT
-  listeners:
-  - name: {listener_name}
-    routes:
-    - matches:
-      - path:
-          pathPrefix: /mcp
-      backends:
-      - mcp:
-          allowDegraded: true
-          targets:
-"#
-	);
-
-	for (name, addr) in targets {
-		config.push_str(&format!(
-			"          - name: {name}\n            mcp:\n              host: http://{addr}/mcp\n"
-		));
-	}
-
-	config
-}
-
-pub(crate) struct MockMcpServer {
-	pub(crate) addr: std::net::SocketAddr,
-	shutdown_tx: Option<oneshot::Sender<()>>,
-	server_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for MockMcpServer {
-	fn drop(&mut self) {
-		if let Some(tx) = self.shutdown_tx.take() {
-			let _ = tx.send(());
-		}
-		if let Some(task) = self.server_task.take() {
-			task.abort();
-		}
 	}
 }
 
