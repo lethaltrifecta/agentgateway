@@ -14,7 +14,7 @@ use crate::http::sessionpersistence::{Encoder, MCPSnapshotMember};
 use crate::http::*;
 use crate::mcp::FailureMode;
 use crate::mcp::auth;
-use crate::mcp::handler::RelayInputs;
+use crate::mcp::relay::RelayInputs;
 use crate::mcp::session::SessionManager;
 use crate::mcp::sse::LegacySSEService;
 use crate::mcp::streamablehttp::{StreamableHttpServerConfig, StreamableHttpService};

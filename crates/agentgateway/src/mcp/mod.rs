@@ -1,7 +1,7 @@
 mod auth;
-mod handler;
 mod mergestream;
 mod rbac;
+mod relay;
 mod router;
 mod session;
 mod sse;

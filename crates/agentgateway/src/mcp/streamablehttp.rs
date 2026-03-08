@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::http::{Request, Response};
-use crate::mcp::handler::RelayInputs;
+use crate::mcp::relay::RelayInputs;
 use crate::mcp::session::{Session, SessionManager, dropper};
 use crate::telemetry::log::AsyncLog;
 use crate::*;
@@ -315,9 +315,9 @@ mod tests {
 	fn relay_inputs(
 		targets: Vec<Arc<McpTarget>>,
 		allow_degraded: bool,
-	) -> crate::mcp::handler::RelayInputs {
+	) -> crate::mcp::relay::RelayInputs {
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
-		crate::mcp::handler::RelayInputs {
+		crate::mcp::relay::RelayInputs {
 			backend: McpBackendGroup {
 				targets,
 				stateful: true,

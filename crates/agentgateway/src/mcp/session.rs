@@ -24,9 +24,9 @@ use tokio::sync::{
 	mpsc::{Receiver, Sender},
 };
 
-use crate::http::Response;
-use crate::mcp::handler::{Relay, RelayInputs};
+use crate::http::{Response, Uri};
 use crate::mcp::mergestream::{MergeFn, Messages};
+use crate::mcp::relay::{Relay, RelayInputs};
 use crate::mcp::streamablehttp::{ServerSseMessage, StreamableHttpPostResponse};
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
 use crate::mcp::{
@@ -513,7 +513,7 @@ impl Session {
 	/// delete any active sessions
 	pub async fn delete_session(&self, parts: Parts) -> Result<Response, ProxyError> {
 		let ctx = IncomingRequestContext::new(&parts);
-		let (_span, log, _cel) = mcp::handler::setup_request_log(parts, "delete_session");
+		let (_span, log, _cel) = mcp::relay::setup_request_log(parts, "delete_session");
 		let session_id = self.id.to_string();
 		log.non_atomic_mutate(|l| {
 			// NOTE: l.method_name keep None to respect the metrics logic: not handle GET, DELETE.
@@ -581,7 +581,7 @@ impl Session {
 			.get(LAST_EVENT_ID_HEADER)
 			.and_then(|value| value.to_str().ok())
 			.map(str::to_owned);
-		let (_span, log, _cel) = mcp::handler::setup_request_log(parts, "get_stream");
+		let (_span, log, _cel) = mcp::relay::setup_request_log(parts, "get_stream");
 		let session_id = self.id.to_string();
 		log.non_atomic_mutate(|l| {
 			// NOTE: l.method_name keep None to respect the metrics logic: which do not want to handle GET, DELETE.
@@ -813,7 +813,7 @@ impl Session {
 			ClientJsonRpcMessage::Request(mut r) => {
 				let method = r.request.method().to_string();
 				let ctx = IncomingRequestContext::new(&parts);
-				let (_span, log, cel) = mcp::handler::setup_request_log(parts, &method);
+				let (_span, log, cel) = mcp::relay::setup_request_log(parts, &method);
 				let session_id = self.id.to_string();
 				log.non_atomic_mutate(|l| {
 					l.method_name = Some(method.clone());
@@ -1057,14 +1057,15 @@ impl Session {
 					ClientNotification::CustomNotification(r) => r.method.as_str(),
 				};
 				let ctx = IncomingRequestContext::new(&parts);
-				let (_span, log, _cel) = mcp::handler::setup_request_log(parts, method);
+				let (_span, log, _cel) = mcp::relay::setup_request_log(parts, method);
 				let session_id = self.id.to_string();
 				log.non_atomic_mutate(|l| {
 					l.method_name = Some(method.to_string());
 					l.session_id = Some(session_id);
 				});
-				// Relay handles targeted routing for notifications with encoded upstream identifiers
-				// (for example cancellation/request ids and progress tokens), and fans out the rest.
+				// Relay routes encoded upstream identifiers back to the correct target and
+				// fans out the rest. Target-local lifecycle checks, like pending
+				// elicitation tracking, stay in TargetSession under the relay.
 				self.relay.send_notification(r, ctx).await
 			},
 			ClientJsonRpcMessage::Response(mut r) => {
@@ -1695,9 +1696,9 @@ mod tests {
 		targets: Vec<Arc<McpTarget>>,
 		allow_degraded: bool,
 		allow_insecure_multiplex: bool,
-	) -> crate::mcp::handler::RelayInputs {
+	) -> crate::mcp::relay::RelayInputs {
 		let test = crate::test_helpers::proxymock::setup_proxy_test("{}").expect("setup_proxy_test");
-		crate::mcp::handler::RelayInputs {
+		crate::mcp::relay::RelayInputs {
 			backend: McpBackendGroup {
 				targets,
 				stateful: true,
@@ -1714,7 +1715,7 @@ mod tests {
 	fn relay_inputs(
 		targets: Vec<Arc<McpTarget>>,
 		allow_degraded: bool,
-	) -> crate::mcp::handler::RelayInputs {
+	) -> crate::mcp::relay::RelayInputs {
 		relay_inputs_with_options(targets, allow_degraded, false)
 	}
 

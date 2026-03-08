@@ -10,7 +10,7 @@ use rmcp::model::{ClientJsonRpcMessage, ClientRequest};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::http::{DropBody, Request, Response, filters};
-use crate::mcp::handler::RelayInputs;
+use crate::mcp::relay::RelayInputs;
 use crate::mcp::session;
 use crate::mcp::session::SessionManager;
 use crate::proxy::ProxyError;
