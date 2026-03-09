@@ -4,7 +4,7 @@ use tracing::warn;
 
 use crate::common::gateway::AgentGateway;
 
-pub(crate) const SESSION_COOKIE_NAME: &str = "__Host-ag-session";
+pub(crate) const SESSION_COOKIE_NAME_PREFIX: &str = "__Host-ag-session-";
 static E2E_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(crate) fn gateway_url(gateway: &AgentGateway, path: &str) -> String {
@@ -27,7 +27,7 @@ pub(crate) fn find_cookie_pair(
 	for header in set_cookie_headers {
 		let pair = header.split(';').next()?.trim();
 		if let Some((name, _)) = pair.split_once('=')
-			&& (name == cookie_name_prefix || name.starts_with(&format!("{cookie_name_prefix}.")))
+			&& name.starts_with(cookie_name_prefix)
 		{
 			return Some(pair.to_string());
 		}
@@ -45,7 +45,7 @@ pub(crate) fn session_cookie_header(set_cookie_headers: &[String]) -> Option<Str
 		let Some((name, _)) = pair.split_once('=') else {
 			continue;
 		};
-		if name == SESSION_COOKIE_NAME || name.starts_with(&format!("{SESSION_COOKIE_NAME}.")) {
+		if name.starts_with(SESSION_COOKIE_NAME_PREFIX) {
 			pairs.push(pair.to_string());
 		}
 	}

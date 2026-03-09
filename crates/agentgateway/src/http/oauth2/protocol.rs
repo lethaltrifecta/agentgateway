@@ -1,7 +1,5 @@
 use axum::response::Response;
 use http::StatusCode;
-use tracing::warn;
-use url::Url;
 
 use super::{CallbackValidation, Error, OAuth2, OAuth2CallContext, ProtocolEndpointKind};
 use crate::client::Client;
@@ -28,9 +26,6 @@ impl OAuth2 {
 			oidc,
 		};
 		let response = match self.protocol_endpoint_kind(req.uri().path())? {
-			Some(ProtocolEndpointKind::Logout) => {
-				self.handle_logout(req.headers(), self.end_session_endpoint())
-			},
 			Some(ProtocolEndpointKind::Callback) => {
 				let redirect_uri = self.resolve_redirect_uri()?;
 				let session_redirect = self.session_redirect_for_callback(req)?;
@@ -53,7 +48,7 @@ impl OAuth2 {
 				}
 			},
 			None => Err(ProxyError::AuthPolicyConflict(
-				"oauth2 protocol endpoint dispatch requires a callback or logout path",
+				"oauth2 protocol endpoint dispatch requires a callback path",
 			)),
 		}?;
 		Self::into_direct_response(response)
@@ -97,89 +92,12 @@ impl OAuth2 {
 		if self.resolve_redirect_uri()?.path() == path {
 			return Ok(Some(ProtocolEndpointKind::Callback));
 		}
-		if self.config.sign_out_path.as_deref() == Some(path) {
-			return Ok(Some(ProtocolEndpointKind::Logout));
-		}
 		Ok(None)
-	}
-
-	pub(crate) fn is_logout_path(&self, path: &str) -> bool {
-		self.config.sign_out_path.as_deref() == Some(path)
 	}
 
 	fn extract_original_url(&self, uri: &http::Uri) -> Option<String> {
 		let state_str = Self::query_param(uri, "state")?;
 		let state = self.decrypt_handshake_state(&state_str).ok()?;
 		Some(state.original_url)
-	}
-
-	pub(super) fn handle_logout(
-		&self,
-		req_headers: &http::HeaderMap,
-		end_session_endpoint: Option<&str>,
-	) -> Result<PolicyResponse, ProxyError> {
-		let response_headers = self.clear_session_cookies();
-
-		let end_session_redirect = self
-			.get_session(req_headers)
-			.and_then(|session| self.build_end_session_redirect(&session, end_session_endpoint));
-
-		let mut resp_builder = Response::builder();
-		if let Some(location) = end_session_redirect {
-			resp_builder = resp_builder
-				.status(StatusCode::FOUND)
-				.header(http::header::LOCATION, location.as_str());
-		} else {
-			resp_builder = resp_builder.status(StatusCode::OK);
-		}
-		let resp = resp_builder.body(Default::default()).map_err(|e| {
-			ProxyError::from(Error::Internal(format!(
-				"failed to build logout response: {e}"
-			)))
-		})?;
-
-		Ok(PolicyResponse {
-			direct_response: Some(resp),
-			response_headers: Some(response_headers),
-		})
-	}
-
-	fn build_end_session_redirect(
-		&self,
-		session: &super::state::SessionState,
-		end_session_endpoint: Option<&str>,
-	) -> Option<Url> {
-		let endpoint = end_session_endpoint?;
-		let mut redirect =
-			match super::ValidatedProviderEndpointUrl::parse(endpoint, "end_session_endpoint") {
-				Ok(url) => url.into_url(),
-				Err(err) => {
-					warn!(endpoint, error = %err, "invalid end_session_endpoint from metadata");
-					return None;
-				},
-			};
-		let mut query = redirect
-			.query_pairs()
-			.into_owned()
-			.filter(|(k, _)| k != "client_id" && k != "id_token_hint" && k != "post_logout_redirect_uri")
-			.collect::<Vec<_>>();
-		query.push(("client_id".to_string(), self.config.client_id.clone()));
-		if let Some(id_token) = session.id_token.as_deref() {
-			query.push(("id_token_hint".to_string(), id_token.to_string()));
-		}
-		if let Some(post_logout_redirect_uri) = self.config.post_logout_redirect_uri.as_deref() {
-			query.push((
-				"post_logout_redirect_uri".to_string(),
-				post_logout_redirect_uri.to_string(),
-			));
-		}
-		{
-			let mut pairs = redirect.query_pairs_mut();
-			pairs.clear();
-			for (k, v) in &query {
-				pairs.append_pair(k, v);
-			}
-		}
-		Some(redirect)
 	}
 }

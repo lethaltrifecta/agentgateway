@@ -7,7 +7,7 @@ use axum_core::RequestExt;
 use axum_extra::TypedHeader;
 use axum_extra::headers::Authorization;
 use axum_extra::headers::authorization::Bearer;
-use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, JwkSet, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use secrecy::SecretString;
 use serde_json::{Map, Value};
@@ -57,11 +57,6 @@ pub enum JwkError {
 	UnexpectedAlgorithm {
 		algorithm: AlgorithmParameters,
 		key_id: String,
-	},
-	#[error("the key {key_id:?} uses unsupported elliptic curve {curve:?}")]
-	UnsupportedEllipticCurve {
-		key_id: String,
-		curve: EllipticCurve,
 	},
 	#[error("no usable signing keys found in JWKS")]
 	NoUsableSigningKeys,
@@ -361,15 +356,8 @@ impl Provider {
 					// based on the algorithm properties.
 					// Add each key algorithm in the correct family.
 					match &jwk.algorithm {
-						AlgorithmParameters::EllipticCurve(ec) => match &ec.curve {
-							EllipticCurve::P256 => vec![Algorithm::ES256],
-							EllipticCurve::P384 => vec![Algorithm::ES384],
-							curve => {
-								return Err(JwkError::UnsupportedEllipticCurve {
-									key_id: kid.clone(),
-									curve: curve.clone(),
-								});
-							},
+						AlgorithmParameters::EllipticCurve(_) => {
+							vec![Algorithm::ES256, Algorithm::ES384]
 						},
 						AlgorithmParameters::RSA(_) => {
 							vec![Algorithm::RS256, Algorithm::RS384, Algorithm::RS512]

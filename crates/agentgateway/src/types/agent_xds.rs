@@ -1732,10 +1732,6 @@ fn traffic_policy_from_proto(
 				resolved_provider,
 				redirect_uri: o.redirect_uri.clone(),
 				scopes: o.scopes.clone(),
-				cookie_name: o.cookie_name.clone(),
-				refreshable_cookie_max_age_seconds: o.refreshable_cookie_max_age_seconds,
-				sign_out_path: o.sign_out_path.clone(),
-				post_logout_redirect_uri: o.post_logout_redirect_uri.clone(),
 			};
 			let oauth2 = crate::http::oauth2::StoredOAuth2Policy::new(policy, attachment_key)
 				.map_err(|e| ProtoError::Generic(format!("invalid oauth2 policy: {e}")))?;

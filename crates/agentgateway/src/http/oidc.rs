@@ -3,7 +3,6 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_singleflight::UnaryGroup;
 use oauth2::basic::{
 	BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse, BasicTokenType,
 };
@@ -26,13 +25,6 @@ use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{ResolvedOAuth2Provider, SimpleBackendReference};
 use crate::types::discovery::NamespacedHostname;
 
-type SharedError = Arc<Error>;
-type SharedResult<T> = Result<T, SharedError>;
-type MetadataSingleflight = Arc<UnaryGroup<MetadataCacheKey, SharedResult<Arc<OidcMetadata>>>>;
-type ValidatorSingleflight = Arc<UnaryGroup<ValidatorCacheKey, SharedResult<Arc<Jwt>>>>;
-type ExchangeSingleflight = Arc<UnaryGroup<ExchangeCacheKey, SharedResult<TokenResponse>>>;
-type RefreshSingleflight = Arc<UnaryGroup<RefreshCacheKey, SharedResult<TokenResponse>>>;
-
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
 	#[error("discovery failed: {0}")]
@@ -53,21 +45,8 @@ pub enum Error {
 pub struct OidcClient {
 	// Metadata cache key is issuer + provider backend context.
 	metadata_cache: RwLock<HashMap<MetadataCacheKey, CachedMetadata>>,
-	// Per (issuer + provider backend) singleflight work gate for metadata discovery.
-	metadata_singleflight: MetadataSingleflight,
 	// Validators are specific to issuer + audiences + provider backend context.
 	validator_cache: RwLock<HashMap<ValidatorCacheKey, CachedValidator>>,
-	// Per (issuer + audiences + provider backend) singleflight work gate for JWKS/validator refresh.
-	validator_singleflight: ValidatorSingleflight,
-	// Per (token endpoint + client + code + code verifier + redirect URI + provider backend)
-	// singleflight work gate for authorization-code exchange.
-	exchange_singleflight: ExchangeSingleflight,
-	// Short-lived cache for successful authorization-code exchanges.
-	// This smooths over immediate duplicate callback requests that race after the first success.
-	exchange_result_cache: RwLock<HashMap<ExchangeCacheKey, CachedExchangeResult>>,
-	// Per (token endpoint + client + refresh token + provider backend) singleflight work gate
-	// for refresh-token exchange.
-	refresh_singleflight: RefreshSingleflight,
 }
 
 #[derive(Debug, Clone)]
@@ -83,15 +62,8 @@ struct CachedMetadata {
 	fetched_at: Instant,
 }
 
-#[derive(Debug, Clone)]
-struct CachedExchangeResult {
-	token: TokenResponse,
-	exchanged_at: Instant,
-}
-
 mod cache_keys {
 	use super::*;
-	use aws_lc_rs::digest;
 
 	#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 	pub(crate) enum ProviderBackendCacheKey {
@@ -190,70 +162,9 @@ mod cache_keys {
 		audiences.dedup();
 		audiences
 	}
-
-	#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-	pub(crate) struct ExchangeCacheKey {
-		pub(crate) token_endpoint: String,
-		pub(crate) client_id: String,
-		pub(crate) code_hash: [u8; 32],
-		pub(crate) code_verifier_hash: Option<[u8; 32]>,
-		pub(crate) redirect_uri: String,
-		pub(crate) provider_backend: ProviderBackendCacheKey,
-	}
-
-	fn hash_sensitive(value: &str) -> [u8; 32] {
-		let digest = digest::digest(&digest::SHA256, value.as_bytes());
-		let mut out = [0u8; 32];
-		out.copy_from_slice(digest.as_ref());
-		out
-	}
-
-	impl ExchangeCacheKey {
-		pub(crate) fn new(
-			token_endpoint: &str,
-			client_id: &str,
-			code: &str,
-			code_verifier: Option<&str>,
-			redirect_uri: &str,
-			provider_backend: Option<&SimpleBackendReference>,
-		) -> Self {
-			Self {
-				token_endpoint: token_endpoint.to_string(),
-				client_id: client_id.to_string(),
-				code_hash: hash_sensitive(code),
-				code_verifier_hash: code_verifier.map(hash_sensitive),
-				redirect_uri: redirect_uri.to_string(),
-				provider_backend: ProviderBackendCacheKey::from_ref(provider_backend),
-			}
-		}
-	}
-
-	#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-	pub(crate) struct RefreshCacheKey {
-		pub(crate) token_endpoint: String,
-		pub(crate) client_id: String,
-		pub(crate) refresh_token_hash: [u8; 32],
-		pub(crate) provider_backend: ProviderBackendCacheKey,
-	}
-
-	impl RefreshCacheKey {
-		pub(crate) fn new(
-			token_endpoint: &str,
-			client_id: &str,
-			refresh_token: &str,
-			provider_backend: Option<&SimpleBackendReference>,
-		) -> Self {
-			Self {
-				token_endpoint: token_endpoint.to_string(),
-				client_id: client_id.to_string(),
-				refresh_token_hash: hash_sensitive(refresh_token),
-				provider_backend: ProviderBackendCacheKey::from_ref(provider_backend),
-			}
-		}
-	}
 }
 
-use cache_keys::{ExchangeCacheKey, MetadataCacheKey, RefreshCacheKey, ValidatorCacheKey};
+use cache_keys::{MetadataCacheKey, ValidatorCacheKey};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OidcMetadata {
@@ -394,9 +305,7 @@ impl<'a> OidcJwtResolver<'a> {
 			token_endpoint: metadata.token_endpoint.clone(),
 			jwks_inline: Some(jwks_inline),
 			end_session_endpoint: metadata.end_session_endpoint.clone(),
-			token_endpoint_auth_methods_supported: metadata
-				.token_endpoint_auth_methods_supported
-				.clone(),
+			token_endpoint_auth_methods_supported: metadata.token_endpoint_auth_methods_supported.clone(),
 		})
 	}
 	pub async fn get_info(
@@ -498,8 +407,6 @@ const VALIDATOR_TTL: Duration = Duration::from_secs(300);
 const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const OIDC_TOKEN_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const OIDC_HTTP_RESPONSE_LIMIT: usize = 2_097_152;
-const EXCHANGE_RESULT_TTL: Duration = Duration::from_secs(10);
-const EXCHANGE_RESULT_CACHE_MAX_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct OidcTokenExtraFields {
@@ -580,12 +487,7 @@ impl OidcClient {
 	pub fn new() -> Self {
 		Self {
 			metadata_cache: RwLock::new(HashMap::new()),
-			metadata_singleflight: Arc::new(UnaryGroup::new()),
 			validator_cache: RwLock::new(HashMap::new()),
-			validator_singleflight: Arc::new(UnaryGroup::new()),
-			exchange_singleflight: Arc::new(UnaryGroup::new()),
-			exchange_result_cache: RwLock::new(HashMap::new()),
-			refresh_singleflight: Arc::new(UnaryGroup::new()),
 		}
 	}
 
@@ -774,82 +676,52 @@ impl OidcClient {
 	) -> Result<Arc<OidcMetadata>, Error> {
 		Self::validate_issuer_url(issuer)?;
 		let cache_key = MetadataCacheKey::from_ctx(issuer, ctx);
-		// 1. Fast Path: Read Lock
 		{
 			if let Some(entry) = self.metadata_cache.read().await.get(&cache_key)
 				&& entry.fetched_at.elapsed() < METADATA_TTL
 			{
 				return Ok(entry.metadata.clone());
 			}
-		} // Drop read lock
+		}
 
-		// 2. Singleflight: ensure only one metadata fetch per cache key at a time.
-		let shared_result = self
-			.metadata_singleflight
-			.work(&cache_key, async {
-				let result: Result<Arc<OidcMetadata>, Error> = async {
-					// 3. Re-check cache after waiting for another in-flight fetch.
-					{
-						if let Some(entry) = self.metadata_cache.read().await.get(&cache_key)
-							&& entry.fetched_at.elapsed() < METADATA_TTL
-						{
-							return Ok(entry.metadata.clone());
-						}
-					}
+		let url = format!(
+			"{}/.well-known/openid-configuration",
+			issuer.trim_end_matches('/')
+		);
+		let req = ::http::Request::builder()
+			.uri(&url)
+			.body(crate::http::Body::empty())
+			.map_err(|e| Error::Internal(e.to_string()))?;
+		let resp = tokio::time::timeout(OIDC_HTTP_TIMEOUT, Self::call_oidc_endpoint(ctx, req))
+			.await
+			.map_err(|_| {
+				Error::Discovery("oidc discovery request timed out while fetching metadata".to_string())
+			})?
+			.map_err(|e| Error::Discovery(e.to_string()))?;
+		let document: OidcDiscoveryDocument =
+			tokio::time::timeout(OIDC_HTTP_TIMEOUT, crate::json::from_response_body(resp))
+				.await
+				.map_err(|_| Error::Discovery("oidc metadata response body read timed out".to_string()))?
+				.map_err(|e| Error::Discovery(e.to_string()))?;
+		Self::validate_discovery_issuer(issuer, &document.issuer)?;
+		let metadata = document.metadata;
+		Self::validate_metadata_endpoints(&metadata)?;
+		let metadata = Arc::new(metadata);
 
-					// 4. Slow Path: Network Call (singleflight work gate is held for this issuer)
-					let url = format!(
-						"{}/.well-known/openid-configuration",
-						issuer.trim_end_matches('/')
-					);
-					let req = ::http::Request::builder()
-						.uri(&url)
-						.body(crate::http::Body::empty())
-						.map_err(|e| Error::Internal(e.to_string()))?;
-					let resp = tokio::time::timeout(OIDC_HTTP_TIMEOUT, Self::call_oidc_endpoint(ctx, req))
-						.await
-						.map_err(|_| {
-							Error::Discovery(
-								"oidc discovery request timed out while fetching metadata".to_string(),
-							)
-						})?
-						.map_err(|e| Error::Discovery(e.to_string()))?;
-					let document: OidcDiscoveryDocument =
-						tokio::time::timeout(OIDC_HTTP_TIMEOUT, crate::json::from_response_body(resp))
-							.await
-							.map_err(|_| {
-								Error::Discovery("oidc metadata response body read timed out".to_string())
-							})?
-							.map_err(|e| Error::Discovery(e.to_string()))?;
-					Self::validate_discovery_issuer(issuer, &document.issuer)?;
-					let metadata = document.metadata;
-					Self::validate_metadata_endpoints(&metadata)?;
-					let metadata = Arc::new(metadata);
-
-					// 5. Write Path: Update Cache
-					let mut w = self.metadata_cache.write().await;
-					// Optimization: In a thundering herd scenario, someone else might have updated it while we were fetching.
-					if let Some(entry) = w.get(&cache_key)
-						&& entry.fetched_at.elapsed() < METADATA_TTL
-					{
-						return Ok(entry.metadata.clone());
-					}
-					w.insert(
-						cache_key.clone(),
-						CachedMetadata {
-							metadata: metadata.clone(),
-							fetched_at: Instant::now(),
-						},
-					);
-					Ok(metadata)
-				}
-				.await;
-
-				result.map_err(Arc::new)
-			})
-			.await;
-
-		shared_result.map_err(|err| err.as_ref().clone())
+		let mut w = self.metadata_cache.write().await;
+		if let Some(entry) = w.get(&cache_key)
+			&& entry.fetched_at.elapsed() < METADATA_TTL
+		{
+			return Ok(entry.metadata.clone());
+		}
+		w.insert(
+			cache_key,
+			CachedMetadata {
+				metadata: metadata.clone(),
+				fetched_at: Instant::now(),
+			},
+		);
+		Ok(metadata)
 	}
 
 	/// Returns cached metadata for an issuer, if present, without triggering network fetches.
@@ -880,7 +752,6 @@ impl OidcClient {
 	) -> Result<Arc<Jwt>, Error> {
 		let key = ValidatorCacheKey::from_ctx(issuer, ctx, audiences.as_deref());
 
-		// 1. Fast Path: Read Lock
 		{
 			let cache = self.validator_cache.read().await;
 			if let Some(entry) = cache.get(&key) {
@@ -897,69 +768,31 @@ impl OidcClient {
 					return Ok(Arc::clone(&entry.validator));
 				}
 			}
-		} // Drop read lock
+		}
 
-		// 2. Singleflight: ensure only one JWKS fetch per cache key at a time.
-		let work_key = key.clone();
-		let key_for_load = key.clone();
-		let shared_result = self
-			.validator_singleflight
-			.work(&work_key, async move {
-				let result: Result<Arc<Jwt>, Error> = async {
-					// 3. Re-check cache after waiting for another in-flight fetch.
-					{
-						let cache = self.validator_cache.read().await;
-						if let Some(entry) = cache.get(&key_for_load) {
-							if !force_refresh && entry.last_refresh.elapsed() < VALIDATOR_TTL {
-								return Ok(Arc::clone(&entry.validator));
-							}
-							if entry.last_refresh_forced && entry.last_refresh.elapsed() < FORCE_REFRESH_INTERVAL
-							{
-								debug!(
-									"Skipping JWKS refresh for {}, already refreshed very recently",
-									issuer
-								);
-								return Ok(Arc::clone(&entry.validator));
-							}
-						}
-					}
+		let jwk_set = self.fetch_jwk_set(ctx, metadata).await?;
 
-					// 4. Slow Path: Network Call (singleflight work gate is held for this cache key)
-					let jwk_set = self.fetch_jwk_set(ctx, metadata).await?;
-					let jwk_set = self.fetch_jwk_set(ctx, metadata).await?;
+		let provider = JwtProvider::from_jwks(
+			jwk_set,
+			issuer.to_string(),
+			audiences,
+			JWTValidationOptions::default(),
+		)
+		.map_err(|e| Error::Internal(format!("failed to create JWT provider: {e}")))?;
 
-					let provider = JwtProvider::from_jwks(
-						jwk_set,
-						issuer.to_string(),
-						audiences,
-						JWTValidationOptions::default(),
-					)
-					.map_err(|e| Error::Internal(format!("failed to create JWT provider: {e}")))?;
+		let jwt = Arc::new(Jwt::from_providers(vec![provider], JwtMode::Strict));
 
-					let jwt = Arc::new(Jwt::from_providers(vec![provider], JwtMode::Strict));
+		let mut w = self.validator_cache.write().await;
+		w.insert(
+			key,
+			CachedValidator {
+				validator: Arc::clone(&jwt),
+				last_refresh: Instant::now(),
+				last_refresh_forced: force_refresh,
+			},
+		);
 
-					// 5. Write Path: Update Cache
-					let mut w = self.validator_cache.write().await;
-					// Optimization: In a thundering herd scenario, someone else might have updated it while we were fetching.
-					// Overwriting with a fresh validator is safe.
-					w.insert(
-						key_for_load,
-						CachedValidator {
-							validator: Arc::clone(&jwt),
-							last_refresh: Instant::now(),
-							last_refresh_forced: force_refresh,
-						},
-					);
-
-					Ok(jwt)
-				}
-				.await;
-
-				result.map_err(Arc::new)
-			})
-			.await;
-
-		shared_result.map_err(|err| err.as_ref().clone())
+		Ok(jwt)
 	}
 
 	async fn fetch_jwk_set(
@@ -976,14 +809,18 @@ impl OidcClient {
 			)
 			.body(crate::http::Body::empty())
 			.map_err(|e| Error::Internal(e.to_string()))?;
-		let jwks_resp = tokio::time::timeout(OIDC_HTTP_TIMEOUT, Self::call_oidc_endpoint(ctx, jwks_req))
-			.await
-			.map_err(|_| Error::Discovery("jwks fetch request timed out".to_string()))?
-			.map_err(|e| Error::Discovery(format!("JWKS fetch failed: {e}")))?;
-		tokio::time::timeout(OIDC_HTTP_TIMEOUT, crate::json::from_response_body(jwks_resp))
-			.await
-			.map_err(|_| Error::Discovery("jwks response body read timed out".to_string()))?
-			.map_err(|e| Error::Discovery(format!("JWKS parse failed: {e}")))
+		let jwks_resp =
+			tokio::time::timeout(OIDC_HTTP_TIMEOUT, Self::call_oidc_endpoint(ctx, jwks_req))
+				.await
+				.map_err(|_| Error::Discovery("jwks fetch request timed out".to_string()))?
+				.map_err(|e| Error::Discovery(format!("JWKS fetch failed: {e}")))?;
+		tokio::time::timeout(
+			OIDC_HTTP_TIMEOUT,
+			crate::json::from_response_body(jwks_resp),
+		)
+		.await
+		.map_err(|_| Error::Discovery("jwks response body read timed out".to_string()))?
+		.map_err(|e| Error::Discovery(format!("JWKS parse failed: {e}")))
 	}
 
 	fn preferred_token_auth_type(metadata: &OidcMetadata) -> Result<AuthType, Error> {
@@ -1091,103 +928,40 @@ impl OidcClient {
 		}
 	}
 
-	async fn get_cached_exchange_result(&self, key: &ExchangeCacheKey) -> Option<TokenResponse> {
-		let now = Instant::now();
-		let cache = self.exchange_result_cache.read().await;
-		cache.get(key).and_then(|entry| {
-			(now.duration_since(entry.exchanged_at) <= EXCHANGE_RESULT_TTL).then(|| entry.token.clone())
-		})
-	}
-
-	async fn put_cached_exchange_result(&self, key: ExchangeCacheKey, token: TokenResponse) {
-		let now = Instant::now();
-		let mut cache = self.exchange_result_cache.write().await;
-		cache.retain(|_, entry| now.duration_since(entry.exchanged_at) <= EXCHANGE_RESULT_TTL);
-		if cache.len() >= EXCHANGE_RESULT_CACHE_MAX_ENTRIES
-			&& let Some(oldest_key) = cache
-				.iter()
-				.min_by_key(|(_, entry)| entry.exchanged_at)
-				.map(|(existing_key, _)| existing_key.clone())
-		{
-			cache.remove(&oldest_key);
-		}
-		cache.insert(
-			key,
-			CachedExchangeResult {
-				token,
-				exchanged_at: now,
-			},
-		);
-	}
-
 	pub async fn exchange_code(
 		&self,
 		ctx: OidcCallContext<'_>,
 		req: ExchangeCodeRequest<'_>,
 	) -> Result<TokenResponse, Error> {
-		let key = ExchangeCacheKey::new(
-			&req.metadata.token_endpoint,
-			req.client_id,
-			req.code,
-			req.code_verifier,
-			req.redirect_uri,
-			ctx.provider_backend,
-		);
-		if let Some(token) = self.get_cached_exchange_result(&key).await {
-			return Ok(token);
+		let oauth_client = Self::oauth2_client(req.metadata, req.client_id, req.client_secret)?;
+		let redirect_url = oauth2::RedirectUrl::new(req.redirect_uri.to_string())
+			.map_err(|e| Error::Internal(format!("invalid redirect URI: {e}")))?;
+		let oauth_client = oauth_client.set_redirect_uri(redirect_url);
+		let mut token_req = oauth_client.exchange_code(AuthorizationCode::new(req.code.to_string()));
+
+		if let Some(cv) = req.code_verifier {
+			token_req = token_req.set_pkce_verifier(PkceCodeVerifier::new(cv.to_string()));
 		}
-		let cache_key = key.clone();
 
-		let shared_result = self
-			.exchange_singleflight
-			.work(&key, async {
-				let result: Result<TokenResponse, Error> = async {
-					let oauth_client = Self::oauth2_client(req.metadata, req.client_id, req.client_secret)?;
-					let redirect_url = oauth2::RedirectUrl::new(req.redirect_uri.to_string())
-						.map_err(|e| Error::Internal(format!("invalid redirect URI: {e}")))?;
-					let oauth_client = oauth_client.set_redirect_uri(redirect_url);
-					let mut token_req =
-						oauth_client.exchange_code(AuthorizationCode::new(req.code.to_string()));
-
-					if let Some(cv) = req.code_verifier {
-						token_req = token_req.set_pkce_verifier(PkceCodeVerifier::new(cv.to_string()));
-					}
-
-					let transport = OidcTransportContext::from_call_context(ctx);
-					let oauth_http_client = |request: OAuth2HttpRequest| {
-						let transport = transport.clone();
-						async move { Self::oauth_http_call(transport, request).await }
-					};
-					let token_response = tokio::time::timeout(
-						OIDC_TOKEN_OPERATION_TIMEOUT,
-						token_req.request_async(&oauth_http_client),
-					)
-					.await
-					.map_err(|_| Error::Exchange("token exchange timed out".to_string()))?
-					.map_err(
-						|e: RequestTokenError<OAuthHttpClientError, BasicErrorResponse>| {
-							Error::Exchange(e.to_string())
-						},
-					)?;
-					let token_response = Self::convert_token_response(token_response);
-					Self::validate_token_type(&token_response)?;
-					Ok(token_response)
-				}
-				.await;
-
-				match result {
-					Ok(token) => {
-						self
-							.put_cached_exchange_result(cache_key.clone(), token.clone())
-							.await;
-						Ok(token)
-					},
-					Err(err) => Err(Arc::new(err)),
-				}
-			})
-			.await;
-
-		shared_result.map_err(|err| err.as_ref().clone())
+		let transport = OidcTransportContext::from_call_context(ctx);
+		let oauth_http_client = |request: OAuth2HttpRequest| {
+			let transport = transport.clone();
+			async move { Self::oauth_http_call(transport, request).await }
+		};
+		let token_response = tokio::time::timeout(
+			OIDC_TOKEN_OPERATION_TIMEOUT,
+			token_req.request_async(&oauth_http_client),
+		)
+		.await
+		.map_err(|_| Error::Exchange("token exchange timed out".to_string()))?
+		.map_err(
+			|e: RequestTokenError<OAuthHttpClientError, BasicErrorResponse>| {
+				Error::Exchange(e.to_string())
+			},
+		)?;
+		let token_response = Self::convert_token_response(token_response);
+		Self::validate_token_type(&token_response)?;
+		Ok(token_response)
 	}
 
 	pub async fn refresh_token(
@@ -1195,47 +969,28 @@ impl OidcClient {
 		ctx: OidcCallContext<'_>,
 		req: RefreshTokenRequest<'_>,
 	) -> Result<TokenResponse, Error> {
-		let key = RefreshCacheKey::new(
-			&req.metadata.token_endpoint,
-			req.client_id,
-			req.refresh_token,
-			ctx.provider_backend,
-		);
-
-		let shared_result = self
-			.refresh_singleflight
-			.work(&key, async {
-				let result: Result<TokenResponse, Error> = async {
-					let oauth_client = Self::oauth2_client(req.metadata, req.client_id, req.client_secret)?;
-					let transport = OidcTransportContext::from_call_context(ctx);
-					let oauth_http_client = |request: OAuth2HttpRequest| {
-						let transport = transport.clone();
-						async move { Self::oauth_http_call(transport, request).await }
-					};
-					let refresh_token = RefreshToken::new(req.refresh_token.to_string());
-					let refresh_req = oauth_client.exchange_refresh_token(&refresh_token);
-					let token_response = tokio::time::timeout(
-						OIDC_TOKEN_OPERATION_TIMEOUT,
-						refresh_req.request_async(&oauth_http_client),
-					)
-					.await
-					.map_err(|_| Error::Exchange("token refresh timed out".to_string()))?
-					.map_err(
-						|e: RequestTokenError<OAuthHttpClientError, BasicErrorResponse>| {
-							Error::Exchange(e.to_string())
-						},
-					)?;
-					let token_response = Self::convert_token_response(token_response);
-					Self::validate_token_type(&token_response)?;
-					Ok(token_response)
-				}
-				.await;
-
-				result.map_err(Arc::new)
-			})
-			.await;
-
-		shared_result.map_err(|err| err.as_ref().clone())
+		let oauth_client = Self::oauth2_client(req.metadata, req.client_id, req.client_secret)?;
+		let transport = OidcTransportContext::from_call_context(ctx);
+		let oauth_http_client = |request: OAuth2HttpRequest| {
+			let transport = transport.clone();
+			async move { Self::oauth_http_call(transport, request).await }
+		};
+		let refresh_token = RefreshToken::new(req.refresh_token.to_string());
+		let refresh_req = oauth_client.exchange_refresh_token(&refresh_token);
+		let token_response = tokio::time::timeout(
+			OIDC_TOKEN_OPERATION_TIMEOUT,
+			refresh_req.request_async(&oauth_http_client),
+		)
+		.await
+		.map_err(|_| Error::Exchange("token refresh timed out".to_string()))?
+		.map_err(
+			|e: RequestTokenError<OAuthHttpClientError, BasicErrorResponse>| {
+				Error::Exchange(e.to_string())
+			},
+		)?;
+		let token_response = Self::convert_token_response(token_response);
+		Self::validate_token_type(&token_response)?;
+		Ok(token_response)
 	}
 
 	fn validate_token_type(token_response: &TokenResponse) -> Result<(), Error> {
@@ -1331,24 +1086,6 @@ mod tests {
 	}
 
 	#[test]
-	fn refresh_cache_key_hashes_refresh_token() {
-		let token_endpoint = "https://issuer.example.com/token";
-		let token_value = "refresh-token-secret";
-
-		let key = RefreshCacheKey::new(token_endpoint, "client-id", token_value, None);
-		let same = RefreshCacheKey::new(token_endpoint, "client-id", token_value, None);
-		let different =
-			RefreshCacheKey::new(token_endpoint, "client-id", "different-refresh-token", None);
-
-		assert_eq!(key, same);
-		assert_ne!(key, different);
-		assert!(
-			!format!("{key:?}").contains(token_value),
-			"debug output should not expose plaintext refresh token"
-		);
-	}
-
-	#[test]
 	fn metadata_cache_key_separates_backend_variants() {
 		let issuer = "https://issuer.example.com";
 		let backend_ref = SimpleBackendReference::Backend("backend-a".into());
@@ -1363,7 +1100,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn metadata_fetch_is_singleflight_per_issuer() {
+	async fn concurrent_metadata_fetches_succeed() {
 		let server = MockServer::start().await;
 		let issuer = server.uri();
 		let metadata = json!({
@@ -1376,7 +1113,6 @@ mod tests {
 		Mock::given(method("GET"))
 			.and(path("/.well-known/openid-configuration"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-			.expect(1)
 			.mount(&server)
 			.await;
 
@@ -1579,7 +1315,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn validator_fetch_is_singleflight_per_key() {
+	async fn concurrent_validator_fetches_succeed() {
 		let server = MockServer::start().await;
 		let issuer = server.uri();
 		let metadata = json!({
@@ -1592,13 +1328,11 @@ mod tests {
 		Mock::given(method("GET"))
 			.and(path("/.well-known/openid-configuration"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-			.expect(1)
 			.mount(&server)
 			.await;
 		Mock::given(method("GET"))
 			.and(path("/jwks"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(jwks_fixture()))
-			.expect(1)
 			.mount(&server)
 			.await;
 
@@ -1624,123 +1358,6 @@ mod tests {
 		while let Some(res) = set.join_next().await {
 			let (_metadata, _validator) = res.expect("task join").expect("get_info");
 		}
-	}
-
-	#[tokio::test]
-	async fn exchange_code_is_singleflight_per_key() {
-		let server = MockServer::start().await;
-		let token_response = json!({
-			"access_token": "access-token",
-			"token_type": "Bearer",
-			"expires_in": 3600
-		});
-
-		Mock::given(method("POST"))
-			.and(path("/token"))
-			.respond_with(
-				ResponseTemplate::new(200)
-					.set_delay(Duration::from_millis(150))
-					.set_body_json(token_response),
-			)
-			.expect(1)
-			.mount(&server)
-			.await;
-
-		let provider = Arc::new(OidcClient::new());
-		let client = make_test_client();
-		let metadata = OidcMetadata {
-			authorization_endpoint: format!("{}/authorize", server.uri()),
-			token_endpoint: format!("{}/token", server.uri()),
-			jwks_uri: None,
-			end_session_endpoint: None,
-			token_endpoint_auth_methods_supported: vec!["client_secret_post".to_string()],
-		};
-
-		let mut set = JoinSet::new();
-		for _ in 0..16 {
-			let provider = provider.clone();
-			let client = client.clone();
-			let metadata = metadata.clone();
-			set.spawn(async move {
-				provider
-					.exchange_code(
-						test_ctx(&client),
-						ExchangeCodeRequest {
-							metadata: &metadata,
-							code: "code-123",
-							client_id: "client-123",
-							client_secret: "secret-123",
-							redirect_uri: "http://localhost:3000/oauth2/callback",
-							code_verifier: Some("verifier-123"),
-						},
-					)
-					.await
-			});
-		}
-
-		while let Some(res) = set.join_next().await {
-			let token = res.expect("task join").expect("token exchange");
-			assert_eq!(token.access_token, "access-token");
-		}
-	}
-
-	#[tokio::test]
-	async fn exchange_code_replay_uses_recent_success_cache() {
-		let server = MockServer::start().await;
-		let token_response = json!({
-			"access_token": "access-token",
-			"token_type": "Bearer",
-			"expires_in": 3600
-		});
-
-		Mock::given(method("POST"))
-			.and(path("/token"))
-			.respond_with(ResponseTemplate::new(200).set_body_json(token_response))
-			.expect(1)
-			.mount(&server)
-			.await;
-
-		let provider = OidcClient::new();
-		let client = make_test_client();
-		let metadata = OidcMetadata {
-			authorization_endpoint: format!("{}/authorize", server.uri()),
-			token_endpoint: format!("{}/token", server.uri()),
-			jwks_uri: None,
-			end_session_endpoint: None,
-			token_endpoint_auth_methods_supported: vec!["client_secret_post".to_string()],
-		};
-
-		let first = provider
-			.exchange_code(
-				test_ctx(&client),
-				ExchangeCodeRequest {
-					metadata: &metadata,
-					code: "code-123",
-					client_id: "client-123",
-					client_secret: "secret-123",
-					redirect_uri: "http://localhost:3000/oauth2/callback",
-					code_verifier: Some("verifier-123"),
-				},
-			)
-			.await
-			.expect("first exchange should succeed");
-		assert_eq!(first.access_token, "access-token");
-
-		let replay = provider
-			.exchange_code(
-				test_ctx(&client),
-				ExchangeCodeRequest {
-					metadata: &metadata,
-					code: "code-123",
-					client_id: "client-123",
-					client_secret: "secret-123",
-					redirect_uri: "http://localhost:3000/oauth2/callback",
-					code_verifier: Some("verifier-123"),
-				},
-			)
-			.await
-			.expect("duplicate exchange should use recent success cache");
-		assert_eq!(replay.access_token, "access-token");
 	}
 
 	#[tokio::test]

@@ -2142,14 +2142,6 @@ pub struct OAuth2Policy {
 	pub redirect_uri: Option<String>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub scopes: Vec<String>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub cookie_name: Option<String>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub refreshable_cookie_max_age_seconds: Option<u64>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub sign_out_path: Option<String>,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub post_logout_redirect_uri: Option<String>,
 }
 
 #[apply(schema!)]

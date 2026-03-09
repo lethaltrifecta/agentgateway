@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,12 +31,10 @@ impl SessionState {
 		SystemTime::now() > self.expires_at
 	}
 
-	pub(super) fn cookie_max_age(
-		&self,
-		refreshable_cookie_max_age: Duration,
-	) -> cookie::time::Duration {
+	pub(super) fn cookie_max_age(&self) -> cookie::time::Duration {
 		if self.refresh_token.is_some() {
-			let seconds = i64::try_from(refreshable_cookie_max_age.as_secs()).unwrap_or(i64::MAX);
+			let seconds =
+				i64::try_from(super::DEFAULT_REFRESHABLE_COOKIE_MAX_AGE.as_secs()).unwrap_or(i64::MAX);
 			return cookie::time::Duration::seconds(seconds);
 		}
 		let remaining = self

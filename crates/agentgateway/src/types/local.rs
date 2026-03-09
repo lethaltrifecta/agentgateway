@@ -1014,18 +1014,6 @@ struct LocalOAuth2Policy {
 	/// OAuth scopes requested during browser login flow.
 	#[serde(default)]
 	scopes: Vec<String>,
-	/// Session cookie base name.
-	#[serde(default)]
-	cookie_name: Option<String>,
-	/// Max age in seconds for refreshable OAuth2 sessions (default: 604800 / 7 days, max: 2592000 / 30 days).
-	#[serde(default)]
-	refreshable_cookie_max_age_seconds: Option<u64>,
-	/// Sign-out path that clears the local OAuth2 session.
-	#[serde(default)]
-	sign_out_path: Option<String>,
-	/// Optional post-logout redirect URI sent to OIDC end_session_endpoint.
-	#[serde(default)]
-	post_logout_redirect_uri: Option<String>,
 }
 
 impl LocalOAuth2Policy {
@@ -1041,10 +1029,6 @@ impl LocalOAuth2Policy {
 			client_secret,
 			redirect_uri,
 			scopes,
-			cookie_name,
-			refreshable_cookie_max_age_seconds,
-			sign_out_path,
-			post_logout_redirect_uri,
 		} = self;
 		let client_secret = client_secret.load()?;
 		let resolve_provider_backend =
@@ -1113,10 +1097,6 @@ impl LocalOAuth2Policy {
 			resolved_provider,
 			redirect_uri: Some(redirect_uri),
 			scopes,
-			cookie_name,
-			refreshable_cookie_max_age_seconds,
-			sign_out_path,
-			post_logout_redirect_uri,
 		};
 		crate::http::oauth2::OAuth2::validate_policy(&policy)?;
 		Ok(policy)

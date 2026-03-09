@@ -92,7 +92,6 @@ pub(super) async fn enforce_authentication(
 				})
 				.into_response(),
 		)),
-<<<<<<< HEAD
 		path if path.starts_with(OAUTH_PROTECTED_RESOURCE_PREFIX) => Ok(Some(
 			protected_resource_metadata(req, auth).await.into_response(),
 		)),

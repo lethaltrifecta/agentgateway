@@ -149,10 +149,7 @@ impl OAuth2 {
 			.map_err(|e| ProxyError::from(Error::Internal(format!("failed to encode session: {e}"))))?;
 
 		let mut response_headers = self
-			.set_session_cookies(
-				cookie_value,
-				session.cookie_max_age(self.refreshable_cookie_max_age()),
-			)
+			.set_session_cookies(cookie_value, session.cookie_max_age())
 			.map_err(|err| {
 				ProxyError::OAuth2AuthenticationFailure(Error::Handshake(format!(
 					"unable to persist oauth2 session: {err}"

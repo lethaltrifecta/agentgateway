@@ -282,7 +282,6 @@ fn local_oauth2_policy_rejects_schema_and_conversion_errors() {
 		Case {
 			name: "missing provider mode",
 			value: serde_json::json!({
-				"cookieName": "test",
 				"clientId": "client-id",
 				"clientSecret": "super-secret",
 				"redirectUri": "https://issuer.example.com/_gateway/callback",
@@ -478,14 +477,13 @@ async fn split_policies_resolves_local_oauth2_issuer_mode_before_runtime() {
 }
 
 #[test]
-fn local_oauth2_policy_maps_hardening_fields() {
+fn local_oauth2_policy_maps_redirect_and_scopes() {
 	let policy: LocalOAuth2Policy = serde_json::from_value(serde_json::json!({
 		"issuer": "https://issuer.example.com",
 		"clientId": "client-id",
 		"clientSecret": "super-secret",
 		"redirectUri": "https://issuer.example.com/_gateway/callback",
-		"refreshableCookieMaxAgeSeconds": 900,
-		"postLogoutRedirectUri": "https://app.example.com/signed-out",
+		"scopes": ["openid", "profile"],
 	}))
 	.expect("policy should parse");
 
@@ -494,9 +492,8 @@ fn local_oauth2_policy_maps_hardening_fields() {
 		oauth2.redirect_uri.as_deref(),
 		Some("https://issuer.example.com/_gateway/callback")
 	);
-	assert_eq!(oauth2.refreshable_cookie_max_age_seconds, Some(900));
 	assert_eq!(
-		oauth2.post_logout_redirect_uri.as_deref(),
-		Some("https://app.example.com/signed-out")
+		oauth2.scopes,
+		vec!["openid".to_string(), "profile".to_string()]
 	);
 }

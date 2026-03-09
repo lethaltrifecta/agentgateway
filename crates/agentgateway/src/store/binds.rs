@@ -24,8 +24,8 @@ use crate::types::agent::{
 };
 use crate::types::proto::agent::resource::Kind as XdsKind;
 use crate::types::proto::agent::{
-	Backend as XdsBackend, Bind as XdsBind, Listener as XdsListener, Policy as XdsPolicy,
-	Resource as ADPResource, Route as XdsRoute, TcpRoute as XdsTcpRoute,
+	Backend as XdsBackend, Bind as XdsBind, Listener as XdsListener, Resource as ADPResource,
+	TcpRoute as XdsTcpRoute,
 };
 use crate::types::{agent, frontend};
 use crate::*;
@@ -218,7 +218,6 @@ pub struct RoutePolicies {
 	pub hostname_rewrite: Option<agent::HostRedirectOverride>,
 	pub request_mirror: Vec<filters::RequestMirror>,
 	pub direct_response: Option<filters::DirectResponse>,
-	pub oauth2: Option<Arc<http::oauth2::OAuth2>>,
 	pub cors: Option<http::cors::Cors>,
 }
 
@@ -230,7 +229,6 @@ pub struct GatewayPolicies {
 	pub transformation: Option<http::transformation_cel::Transformation>,
 	pub basic_auth: Option<http::basicauth::BasicAuthentication>,
 	pub api_key: Option<http::apikey::APIKeyAuthentication>,
-	pub oauth2: Option<Arc<http::oauth2::OAuth2>>,
 }
 
 impl GatewayPolicies {
@@ -568,11 +566,6 @@ impl Store {
 		if !authz.is_empty() {
 			pol.authorization = Some(HTTPAuthorizationSet::new(authz.into()));
 		}
-		debug_assert!(
-			pol.oauth2.is_none() || pol.jwt.is_none(),
-			"invalid state: both `jwtAuth` and `oauth2` configured for route policies"
-		);
-
 		pol
 	}
 
@@ -606,9 +599,7 @@ impl Store {
 			TrafficPolicy::APIKey(p) => {
 				pol.api_key.get_or_insert_with(|| p.clone());
 			},
-			TrafficPolicy::OAuth2(p) => {
-				pol.oauth2.get_or_insert_with(|| Arc::new(*p.clone()));
-			},
+			TrafficPolicy::OAuth2(_) => {},
 			TrafficPolicy::Transformation(p) => {
 				pol.transformation.get_or_insert_with(|| p.clone());
 			},
@@ -692,9 +683,7 @@ impl Store {
 				TrafficPolicy::ExtProc(p) => {
 					pol.ext_proc.get_or_insert_with(|| p.clone());
 				},
-				TrafficPolicy::OAuth2(p) => {
-					pol.oauth2.get_or_insert_with(|| Arc::new(*p.clone()));
-				},
+				TrafficPolicy::OAuth2(_) => {},
 				TrafficPolicy::Transformation(p) => {
 					pol.transformation.get_or_insert_with(|| p.clone());
 				},
@@ -703,12 +692,76 @@ impl Store {
 				},
 			}
 		}
-		debug_assert!(
-			pol.oauth2.is_none() || pol.jwt.is_none(),
-			"invalid state: both `jwtAuth` and `oauth2` configured for gateway policies"
-		);
-
 		pol
+	}
+
+	pub fn route_oauth2_binding(
+		&self,
+		path: &RoutePath<'_>,
+		inline: &[TrafficPolicy],
+	) -> Option<Arc<http::oauth2::StoredOAuth2Policy>> {
+		let &RoutePath { listener, route } = path;
+		let gateway = self
+			.policies_by_target
+			.get(&listener.as_gateway_target_ref());
+		let listener = self
+			.policies_by_target
+			.get(&listener.as_listener_target_ref());
+		let route_rule = self
+			.policies_by_target
+			.get(&route.as_route_rule_target_ref());
+		let route = self.policies_by_target.get(&route.as_route_target_ref());
+
+		for rule in inline {
+			if let TrafficPolicy::OAuth2(p) = rule {
+				return Some(p.clone());
+			}
+		}
+
+		let stored_keys = route_rule
+			.iter()
+			.copied()
+			.flatten()
+			.chain(route.iter().copied().flatten())
+			.chain(listener.iter().copied().flatten())
+			.chain(gateway.iter().copied().flatten());
+
+		for key in stored_keys {
+			let Some(policy_obj) = self.policies_by_key.get(key) else {
+				continue;
+			};
+			let Some(TrafficPolicy::OAuth2(p)) = policy_obj.policy.as_traffic_route_phase() else {
+				continue;
+			};
+			return Some(p.clone());
+		}
+
+		None
+	}
+
+	pub fn gateway_oauth2_binding(
+		&self,
+		name: &ListenerName,
+	) -> Option<Arc<http::oauth2::StoredOAuth2Policy>> {
+		let gateway = self.policies_by_target.get(&name.as_gateway_target_ref());
+		let listener = self.policies_by_target.get(&name.as_listener_target_ref());
+		let keys = listener
+			.iter()
+			.copied()
+			.flatten()
+			.chain(gateway.iter().copied().flatten());
+
+		for key in keys {
+			let Some(policy_obj) = self.policies_by_key.get(key) else {
+				continue;
+			};
+			let Some(TrafficPolicy::OAuth2(p)) = policy_obj.policy.as_traffic_gateway_phase() else {
+				continue;
+			};
+			return Some(p.clone());
+		}
+
+		None
 	}
 
 	// sub_backend_policies looks up the sub-backends policies. Generally, these will be queried separately
@@ -1218,49 +1271,6 @@ impl Store {
 		}
 	}
 
-	fn insert_xds(&mut self, name: Strng, res: ADPResource) -> anyhow::Result<()> {
-		trace!(%name, "insert resource {res:?}");
-		match res.kind {
-			Some(XdsKind::Bind(w)) => {
-				let key = strng::new(&w.key);
-				self.insert_xds_bind(w)?;
-				self.resources.insert(name, ResourceKind::Bind(key));
-				Ok(())
-			},
-			Some(XdsKind::Listener(w)) => {
-				let key = strng::new(&w.key);
-				self.insert_xds_listener(w)?;
-				self.resources.insert(name, ResourceKind::Listener(key));
-				Ok(())
-			},
-			Some(XdsKind::Route(w)) => {
-				let key = strng::new(&w.key);
-				self.insert_xds_route(w)?;
-				self.resources.insert(name, ResourceKind::Route(key));
-				Ok(())
-			},
-			Some(XdsKind::TcpRoute(w)) => {
-				let key = strng::new(&w.key);
-				self.insert_xds_tcp_route(w)?;
-				self.resources.insert(name, ResourceKind::TcpRoute(key));
-				Ok(())
-			},
-			Some(XdsKind::Backend(w)) => {
-				let key = strng::new(&w.key);
-				self.insert_xds_backend(w)?;
-				self.resources.insert(name, ResourceKind::Backend(key));
-				Ok(())
-			},
-			Some(XdsKind::Policy(w)) => {
-				let key = strng::new(&w.key);
-				self.insert_xds_policy(w)?;
-				self.resources.insert(name, ResourceKind::Policy(key));
-				Ok(())
-			},
-			_ => Err(anyhow::anyhow!("unknown resource type")),
-		}
-	}
-
 	fn insert_xds_bind(&mut self, raw: XdsBind) -> anyhow::Result<()> {
 		let mut bind = Bind::try_from_xds(&raw, self.ipv6_enabled)?;
 		// If XDS server pushes the same bind twice (which it shouldn't really do, but oh well),
@@ -1276,10 +1286,6 @@ impl Store {
 		let (lis, bind_name): (Listener, BindKey) = (&raw).try_into()?;
 		self.insert_listener(lis, bind_name)
 	}
-	fn insert_xds_route(&mut self, raw: XdsRoute) -> anyhow::Result<()> {
-		let (route, listener_name): (Route, ListenerKey) = (&raw).try_into()?;
-		self.insert_route(route, listener_name)
-	}
 	fn insert_xds_tcp_route(&mut self, raw: XdsTcpRoute) -> anyhow::Result<()> {
 		let (route, listener_name): (TCPRoute, ListenerKey) = (&raw).try_into()?;
 		self.insert_tcp_route(route, listener_name)
@@ -1288,11 +1294,6 @@ impl Store {
 		let key = strng::new(&raw.key);
 		let backend: BackendWithPolicies = (&raw).try_into()?;
 		self.insert_backend(key, backend);
-		Ok(())
-	}
-	fn insert_xds_policy(&mut self, raw: XdsPolicy) -> anyhow::Result<()> {
-		let policy: TargetedPolicy = (&raw).try_into()?;
-		self.insert_policy(policy)?;
 		Ok(())
 	}
 }
@@ -1346,6 +1347,53 @@ impl StoreUpdater {
 			backends,
 		}
 	}
+
+	fn insert_xds(&self, state: &mut Store, name: Strng, res: ADPResource) -> anyhow::Result<()> {
+		trace!(%name, "insert resource {res:?}");
+		match res.kind {
+			Some(XdsKind::Bind(w)) => {
+				let key = strng::new(&w.key);
+				state.insert_xds_bind(w)?;
+				state.resources.insert(name, ResourceKind::Bind(key));
+				Ok(())
+			},
+			Some(XdsKind::Listener(w)) => {
+				let key = strng::new(&w.key);
+				state.insert_xds_listener(w)?;
+				state.resources.insert(name, ResourceKind::Listener(key));
+				Ok(())
+			},
+			Some(XdsKind::Route(w)) => {
+				let key = strng::new(&w.key);
+				let (route, listener_name): (Route, ListenerKey) =
+					crate::types::agent_xds::route_from_xds(&w)?;
+				state.insert_route(route, listener_name)?;
+				state.resources.insert(name, ResourceKind::Route(key));
+				Ok(())
+			},
+			Some(XdsKind::TcpRoute(w)) => {
+				let key = strng::new(&w.key);
+				state.insert_xds_tcp_route(w)?;
+				state.resources.insert(name, ResourceKind::TcpRoute(key));
+				Ok(())
+			},
+			Some(XdsKind::Backend(w)) => {
+				let key = strng::new(&w.key);
+				state.insert_xds_backend(w)?;
+				state.resources.insert(name, ResourceKind::Backend(key));
+				Ok(())
+			},
+			Some(XdsKind::Policy(w)) => {
+				let key = strng::new(&w.key);
+				let policy = crate::types::agent_xds::targeted_policy_from_xds(&w)?;
+				state.insert_policy(policy)?;
+				state.resources.insert(name, ResourceKind::Policy(key));
+				Ok(())
+			},
+			_ => Err(anyhow::anyhow!("unknown resource type")),
+		}
+	}
+
 	pub fn sync_local(
 		&self,
 		binds: Vec<Bind>,
@@ -1408,7 +1456,7 @@ impl agent_xds::Handler<ADPResource> for StoreUpdater {
 		let mut state = self.state.write().unwrap();
 		let handle = |res: XdsUpdate<ADPResource>| {
 			match res {
-				XdsUpdate::Update(w) => state.insert_xds(w.name, w.resource)?,
+				XdsUpdate::Update(w) => self.insert_xds(&mut state, w.name, w.resource)?,
 				XdsUpdate::Remove(name) => {
 					debug!("handling delete {}", name);
 					state.remove_resource(&strng::new(name))
@@ -1532,15 +1580,11 @@ mod tests {
 			})),
 			redirect_uri: Some("https://example.com/_gateway/callback".to_string()),
 			scopes: vec!["openid".to_string()],
-			cookie_name: None,
-			refreshable_cookie_max_age_seconds: None,
-			sign_out_path: Some("/logout".to_string()),
-			post_logout_redirect_uri: None,
 		}
 	}
 
-	fn test_oauth2() -> http::oauth2::OAuth2 {
-		http::oauth2::OAuth2::new(
+	fn test_stored_oauth2() -> http::oauth2::StoredOAuth2Policy {
+		http::oauth2::StoredOAuth2Policy::new(
 			test_oauth2_policy(),
 			OAuth2AttachmentKey::targeted_policy("test-policy"),
 		)
@@ -1744,7 +1788,7 @@ mod tests {
 				key: oauth2_key.clone(),
 				name: None,
 				target,
-				policy: TrafficPolicy::OAuth2(Box::new(test_oauth2())).into(),
+				policy: TrafficPolicy::OAuth2(Arc::new(test_stored_oauth2())).into(),
 			})
 			.expect_err("mixed jwt+oauth2 on the same target must be rejected");
 		assert!(err.to_string().contains("cannot both apply to target"));
@@ -1753,19 +1797,19 @@ mod tests {
 	}
 
 	#[test]
-	fn insert_policy_accepts_oauth2_runtime() {
+	fn insert_policy_accepts_stored_oauth2() {
 		let mut store = Store::from_init(StoreInit::default());
 		let key: PolicyKey = strng::new("valid-oauth2");
 		let policy = TargetedPolicy {
 			key: key.clone(),
 			name: None,
 			target: PolicyTarget::Route(route("r", "ns", Some("HTTPRoute"))),
-			policy: TrafficPolicy::OAuth2(Box::new(test_oauth2())).into(),
+			policy: TrafficPolicy::OAuth2(Arc::new(test_stored_oauth2())).into(),
 		};
 
 		store
 			.insert_policy(policy)
-			.expect("oauth2 runtime policy should be inserted");
+			.expect("oauth2 policy binding should be inserted");
 		assert!(store.policies_by_key.contains_key(&key));
 	}
 
@@ -1786,7 +1830,7 @@ mod tests {
 			.insert_policy(gateway_traffic_policy(
 				&listener,
 				"listener-oauth2",
-				TrafficPolicy::OAuth2(Box::new(test_oauth2())),
+				TrafficPolicy::OAuth2(Arc::new(test_stored_oauth2())),
 				true,
 			))
 			.expect_err("mixed jwt+oauth2 on the same gateway target must be rejected");
@@ -1797,7 +1841,7 @@ mod tests {
 			.insert_policy(gateway_traffic_policy(
 				&listener,
 				"listener-oauth2",
-				TrafficPolicy::OAuth2(Box::new(test_oauth2())),
+				TrafficPolicy::OAuth2(Arc::new(test_stored_oauth2())),
 				true,
 			))
 			.expect("first policy should insert");
@@ -1845,7 +1889,7 @@ mod tests {
 				key: replacement_key.clone(),
 				name: None,
 				target: target.clone(),
-				policy: TrafficPolicy::OAuth2(Box::new(test_oauth2())).into(),
+				policy: TrafficPolicy::OAuth2(Arc::new(test_stored_oauth2())).into(),
 			})
 			.expect_err("conflicting replacement should be rejected");
 		assert!(err.to_string().contains("cannot both apply to target"));
@@ -1898,7 +1942,7 @@ mod tests {
 				key: strng::new("atomic-oauth2"),
 				name: None,
 				target,
-				policy: TrafficPolicy::OAuth2(Box::new(test_oauth2())).into(),
+				policy: TrafficPolicy::OAuth2(Arc::new(test_stored_oauth2())).into(),
 			},
 		];
 

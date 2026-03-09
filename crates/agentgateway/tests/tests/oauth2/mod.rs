@@ -10,7 +10,7 @@ use crate::common::oauth2::{
 };
 
 #[tokio::test]
-async fn oauth2_backend_passthrough_refresh_and_logout() {
+async fn oauth2_backend_passthrough_refreshes_session() {
 	let Some((gateway, oidc, client)) = setup_gateway(true).await else {
 		return;
 	};
@@ -72,21 +72,6 @@ async fn oauth2_backend_passthrough_refresh_and_logout() {
 	assert_eq!(
 		upstream_body.get("authorization").and_then(|v| v.as_str()),
 		Some("Bearer access-refreshed")
-	);
-
-	let logout = client
-		.get(gateway_url(&gateway, "/logout"))
-		.header(reqwest::header::COOKIE, &session_cookie)
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(logout.status(), StatusCode::OK);
-	let logout_cookies = set_cookie_values(&logout);
-	assert!(
-		logout_cookies.iter().any(|v| {
-			v.starts_with("__Host-ag-session=") && v.contains("Max-Age=0") && v.contains("HttpOnly")
-		}),
-		"logout must clear session cookie"
 	);
 
 	gateway.shutdown().await;
@@ -395,65 +380,6 @@ async fn route_scoped_oauth2_shared_callback_uses_state_to_select_owner() {
 }
 
 #[tokio::test]
-async fn route_scoped_oauth2_shared_logout_uses_session_cookie_to_select_owner() {
-	let Some((gateway, oidc, client)) =
-		setup_gateway_with_listener_and_route_oauth2_shared_endpoints(true).await
-	else {
-		return;
-	};
-
-	Mock::given(method("POST"))
-		.and(path("/token"))
-		.and(body_string_contains("grant_type=authorization_code"))
-		.and(body_string_contains("client_id=route-client"))
-		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
-			"access_token": "route-access-token",
-			"token_type": "Bearer",
-			"expires_in": 3600,
-		})))
-		.expect(1)
-		.mount(&oidc)
-		.await;
-
-	let (_, state, nonce_cookie) = start_auth(&client, &gateway, "/private/data").await;
-	let callback = complete_callback_at_path(
-		&client,
-		&gateway,
-		"/_gateway/callback",
-		"route-code-logout",
-		&state,
-		&nonce_cookie,
-	)
-	.await;
-	assert_eq!(callback.status(), StatusCode::FOUND);
-
-	let session_cookie = session_cookie_header(&set_cookie_values(&callback))
-		.expect("session cookie must be set after callback");
-	let session_cookie_name = session_cookie
-		.split('=')
-		.next()
-		.expect("session cookie must have a name")
-		.to_string();
-
-	let logout = client
-		.get(gateway_url(&gateway, "/logout"))
-		.header(reqwest::header::COOKIE, &session_cookie)
-		.send()
-		.await
-		.unwrap();
-	assert_eq!(logout.status(), StatusCode::OK);
-	let logout_cookies = set_cookie_values(&logout);
-	assert!(
-		logout_cookies.iter().any(
-			|value| value.starts_with(&format!("{session_cookie_name}=")) && value.contains("Max-Age=0")
-		),
-		"logout must clear the route-owned session cookie",
-	);
-
-	gateway.shutdown().await;
-}
-
-#[tokio::test]
 async fn oauth2_non_bearer_token_type_is_rejected() {
 	let Some((gateway, oidc, client)) = setup_gateway(true).await else {
 		return;
@@ -754,78 +680,6 @@ async fn setup_gateway_with_listener_and_route_oauth2_shared_callback(
 	Some((gw, oidc, client))
 }
 
-async fn setup_gateway_with_listener_and_route_oauth2_shared_endpoints(
-	backend_passthrough: bool,
-) -> Option<(AgentGateway, MockServer, reqwest::Client)> {
-	if !require_e2e() {
-		return None;
-	}
-
-	let oidc = MockServer::start().await;
-	let upstream = MockServer::start().await;
-
-	let issuer = oidc.uri();
-	Mock::given(method("GET"))
-		.and(path("/.well-known/openid-configuration"))
-		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
-			"issuer": issuer,
-			"authorization_endpoint": format!("{}/authorize", oidc.uri()),
-			"token_endpoint": format!("{}/token", oidc.uri()),
-			"jwks_uri": format!("{}/jwks", oidc.uri())
-		})))
-		.mount(&oidc)
-		.await;
-
-	Mock::given(method("GET"))
-		.and(path("/jwks"))
-		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
-			"keys": [
-				{
-					"use": "sig",
-					"kty": "EC",
-					"kid": "XhO06x8JjWH1wwkWkyeEUxsooGEWoEdidEpwyd_hmuI",
-					"crv": "P-256",
-					"alg": "ES256",
-					"x": "XZHF8Em5LbpqfgewAalpSEH4Ka2I2xjcxxUt2j6-lCo",
-					"y": "g3DFz45A7EOUMgmsNXatrXw1t-PG5xsbkxUs851RxSE"
-				}
-			]
-		})))
-		.mount(&oidc)
-		.await;
-
-	Mock::given(method("GET"))
-		.and(path_regex("/.*"))
-		.respond_with(|req: &wiremock::Request| {
-			let auth = req
-				.headers
-				.get(http::header::AUTHORIZATION)
-				.and_then(|v| v.to_str().ok())
-				.map(ToOwned::to_owned);
-			ResponseTemplate::new(200).set_body_json(json!({
-				"authorization": auth,
-				"path": req.url.path().to_string()
-			}))
-		})
-		.mount(&upstream)
-		.await;
-
-	let gw = AgentGateway::new(listener_and_route_oauth2_shared_endpoints_config(
-		&oidc.uri(),
-		&upstream.address().to_string(),
-		backend_passthrough,
-	))
-	.await
-	.unwrap();
-
-	let client = reqwest::Client::builder()
-		.redirect(reqwest::redirect::Policy::none())
-		.build()
-		.unwrap();
-
-	Some((gw, oidc, client))
-}
-
 pub(super) async fn start_auth(
 	client: &reqwest::Client,
 	gateway: &AgentGateway,
@@ -928,7 +782,6 @@ binds:
           scopes:
           - openid
           - profile
-          signOutPath: "/logout"
 {backend_auth_block}      backends:
       - host: {upstream}
 "#
@@ -965,7 +818,6 @@ binds:
         redirectUri: "https://example.test/_gateway/listener-callback"
         scopes:
         - openid
-        signOutPath: "/listener-logout"
     routes:
     - name: oauth2
       policies:
@@ -977,7 +829,6 @@ binds:
           scopes:
           - openid
           - profile
-          signOutPath: "/route-logout"
 {backend_auth_block}      backends:
       - host: {upstream}
 "#
@@ -1014,7 +865,6 @@ binds:
         redirectUri: "https://example.test/_gateway/callback"
         scopes:
         - openid
-        signOutPath: "/listener-logout"
     routes:
     - name: oauth2
       policies:
@@ -1026,56 +876,6 @@ binds:
           scopes:
           - openid
           - profile
-          signOutPath: "/route-logout"
-{backend_auth_block}      backends:
-      - host: {upstream}
-"#
-	)
-}
-
-fn listener_and_route_oauth2_shared_endpoints_config(
-	issuer: &str,
-	upstream: &str,
-	backend_passthrough: bool,
-) -> String {
-	let backend_auth_block = if backend_passthrough {
-		String::from(
-			r#"        backendAuth:
-          passthrough: {}
-"#,
-		)
-	} else {
-		String::new()
-	};
-
-	format!(
-		r#"config: {{}}
-binds:
-- port: $PORT
-  listeners:
-  - name: default
-    protocol: HTTP
-    policies:
-      oauth2:
-        issuer: "{issuer}"
-        clientId: "listener-client"
-        clientSecret: "listener-secret"
-        redirectUri: "https://example.test/_gateway/callback"
-        scopes:
-        - openid
-        signOutPath: "/logout"
-    routes:
-    - name: oauth2
-      policies:
-        oauth2:
-          issuer: "{issuer}"
-          clientId: "route-client"
-          clientSecret: "route-secret"
-          redirectUri: "https://example.test/_gateway/callback"
-          scopes:
-          - openid
-          - profile
-          signOutPath: "/logout"
 {backend_auth_block}      backends:
       - host: {upstream}
 "#

@@ -309,7 +309,7 @@ fn apply_route_cors_policy(
 async fn apply_effective_oauth2_policy(
 	oauth2: Option<&Arc<http::oauth2::OAuth2>>,
 	client: PolicyClient,
-	oidc: &crate::http::oidc::OidcClient,
+	oauth2_tokens: &crate::http::oauth2::OAuth2TokenService,
 	req: &mut Request,
 	response_headers: &mut HeaderMap,
 ) -> Result<(), ProxyResponse> {
@@ -318,7 +318,7 @@ async fn apply_effective_oauth2_policy(
 	};
 
 	let resp = oauth2
-		.enforce_request(&client.inputs.upstream, &client, oidc.tokens(), req)
+		.enforce_request(&client.inputs.upstream, &client, oauth2_tokens, req)
 		.await
 		.map_err(ProxyResponse::from)?;
 	if let Some(direct_response) = resp.direct_response {
@@ -373,7 +373,6 @@ async fn apply_llm_request_policies(
 pub struct HTTPProxy {
 	pub(super) bind_name: BindKey,
 	pub(super) inputs: Arc<ProxyInputs>,
-	pub(super) oidc: Arc<crate::http::oidc::OidcClient>,
 	pub(super) selected_listener: Option<Arc<Listener>>,
 	pub(super) target_address: SocketAddr,
 }
@@ -431,6 +430,19 @@ where
 }
 
 impl HTTPProxy {
+	fn materialize_oauth2_binding(
+		&self,
+		binding: Arc<http::oauth2::StoredOAuth2Policy>,
+	) -> Result<Option<Arc<http::oauth2::OAuth2>>, ProxyError> {
+		let Some(runtime_secret) = self.inputs.cfg.oauth2_runtime.clone() else {
+			return Ok(None);
+		};
+		let oauth2 = binding.materialize(runtime_secret).map_err(|e| {
+			ProxyError::Processing(anyhow::anyhow!("failed to materialize oauth2 policy: {e}"))
+		})?;
+		Ok(Some(Arc::new(oauth2)))
+	}
+
 	fn oauth2_protocol_endpoint_candidates(
 		&self,
 		selected_listener: &Arc<Listener>,
@@ -438,15 +450,17 @@ impl HTTPProxy {
 		path: &str,
 	) -> Result<Vec<OAuth2ProtocolEndpointCandidate>, ProxyError> {
 		let store = self.inputs.stores.read_binds();
-		let gateway_policies = store.gateway_policies(&selected_listener.name);
-		let gateway_attachment = gateway_policies
-			.oauth2
+		let gateway_binding = store.gateway_oauth2_binding(&selected_listener.name);
+		let gateway_attachment = gateway_binding
 			.as_ref()
 			.map(|oauth2| oauth2.attachment_key().clone());
 		let mut candidates = Vec::new();
-		if let Some(oauth2) = gateway_policies.oauth2
-			&& oauth2.matches_protocol_endpoint(path)?
+		if let Some(binding) = gateway_binding
+			&& binding.matches_protocol_endpoint(path)
 		{
+			let Some(oauth2) = self.materialize_oauth2_binding(binding)? else {
+				return Ok(candidates);
+			};
 			candidates.push(OAuth2ProtocolEndpointCandidate {
 				route_name: None,
 				oauth2,
@@ -463,16 +477,18 @@ impl HTTPProxy {
 					route: &route.name,
 					listener: &selected_listener.name,
 				};
-				let route_policies = store.route_policies(&route_path, &route.inline_policies);
-				let Some(oauth2) = route_policies.oauth2 else {
+				let Some(binding) = store.route_oauth2_binding(&route_path, &route.inline_policies) else {
 					continue;
 				};
-				if gateway_attachment.as_ref() == Some(oauth2.attachment_key()) {
+				if gateway_attachment.as_ref() == Some(binding.attachment_key()) {
 					continue;
 				}
-				if !oauth2.matches_protocol_endpoint(path)? {
+				if !binding.matches_protocol_endpoint(path) {
 					continue;
 				}
+				let Some(oauth2) = self.materialize_oauth2_binding(binding)? else {
+					continue;
+				};
 				candidates.push(OAuth2ProtocolEndpointCandidate {
 					route_name: Some(route.name.clone()),
 					oauth2,
@@ -485,6 +501,7 @@ impl HTTPProxy {
 
 	async fn maybe_handle_oauth2_protocol_endpoint(
 		&self,
+		oauth2_tokens: &crate::http::oauth2::OAuth2TokenService,
 		selected_listener: &Arc<Listener>,
 		host: &str,
 		log: &mut RequestLog,
@@ -497,34 +514,23 @@ impl HTTPProxy {
 			[] => None,
 			[candidate] => Some(candidate.clone()),
 			_ => {
-				if let Some(attachment_key) =
-					http::oauth2::OAuth2::callback_attachment_key_from_uri(req.uri())
-				{
+				if let Some(attachment_key) = self
+					.inputs
+					.cfg
+					.oauth2_runtime
+					.as_deref()
+					.and_then(|secret| {
+						http::oauth2::OAuth2::callback_attachment_key_from_uri(req.uri(), secret)
+					}) {
 					candidates
 						.iter()
 						.find(|candidate| candidate.oauth2.attachment_key().to_string() == attachment_key)
 						.cloned()
 				} else {
-					let matched_sessions = candidates
-						.iter()
-						.filter(|candidate| candidate.oauth2.observes_session_cookie(req.headers()))
-						.cloned()
-						.collect::<Vec<_>>();
-					match matched_sessions.as_slice() {
-						[candidate] => Some(candidate.clone()),
-						[] => {
-							return Err(ProxyError::AuthPolicyConflict(
-								"oauth2 protocol endpoint matched multiple policies but the request did not identify the owner",
-							))
-							.snapshot_on_err(log, req);
-						},
-						_ => {
-							return Err(ProxyError::AuthPolicyConflict(
-								"oauth2 protocol endpoint matched multiple policies and multiple session cookies were present",
-							))
-							.snapshot_on_err(log, req);
-						},
-					}
+					return Err(ProxyError::AuthPolicyConflict(
+						"oauth2 callback path matched multiple policies but the request state did not identify the owner",
+					))
+					.snapshot_on_err(log, req);
 				}
 			},
 		};
@@ -539,13 +545,12 @@ impl HTTPProxy {
 		};
 
 		log.route_name = endpoint.route_name.clone();
-
 		let direct_response = endpoint
 			.oauth2
 			.handle_protocol_endpoint(
 				&self.inputs.upstream,
 				&self.policy_client(),
-				self.oidc.as_ref().tokens(),
+				oauth2_tokens,
 				req,
 			)
 			.await
@@ -731,7 +736,13 @@ impl HTTPProxy {
 		log.listener_name = Some(selected_listener.name.clone());
 
 		if let Some(response) = self
-			.maybe_handle_oauth2_protocol_endpoint(&selected_listener, &host, log, &mut req)
+			.maybe_handle_oauth2_protocol_endpoint(
+				&self.inputs.oauth2_token_service,
+				&selected_listener,
+				&host,
+				log,
+				&mut req,
+			)
 			.await?
 		{
 			return Ok(response);
@@ -816,10 +827,20 @@ impl HTTPProxy {
 		response_policies.gateway_transformation = gateway_policies.transformation.clone();
 		response_policies.ext_proc = maybe_ext_proc;
 		response_policies.gateway_ext_proc = maybe_gateway_ext_proc;
-		let effective_oauth2 = route_policies
-			.oauth2
-			.clone()
-			.or_else(|| gateway_policies.oauth2.clone());
+		let effective_oauth2 = {
+			let store = inputs.stores.read_binds();
+			store
+				.route_oauth2_binding(&route_path, &selected_route.inline_policies)
+				.map(|binding| self.materialize_oauth2_binding(binding))
+				.or_else(|| {
+					store
+						.gateway_oauth2_binding(&selected_listener.name)
+						.map(|binding| self.materialize_oauth2_binding(binding))
+				})
+				.transpose()
+				.snapshot_on_err(log, &mut req)?
+				.flatten()
+		};
 
 		apply_route_cors_policy(&route_policies, &mut req, response_policies.headers())
 			.snapshot_on_err(log, &mut req)?;
@@ -827,7 +848,7 @@ impl HTTPProxy {
 		apply_effective_oauth2_policy(
 			effective_oauth2.as_ref(),
 			self.policy_client(),
-			self.oidc.as_ref(),
+			&self.inputs.oauth2_token_service,
 			&mut req,
 			response_policies.headers(),
 		)

@@ -566,9 +566,9 @@ impl ConfigSource {
 pub struct ProxyInputs {
 	cfg: Arc<Config>,
 	stores: Stores,
-	oauth2_runtime_cache: Arc<http::oauth2::OAuth2RuntimeCache>,
 
 	upstream: client::Client,
+	oauth2_token_service: http::oauth2::OAuth2TokenService,
 
 	metrics: Arc<metrics::Metrics>,
 
@@ -585,14 +585,31 @@ impl ProxyInputs {
 		ca: Option<Arc<CaClient>>,
 		mcp_state: mcp::App,
 	) -> Self {
-		let oauth2_runtime_cache = Arc::new(http::oauth2::OAuth2RuntimeCache::new(
-			cfg.oauth2_runtime.clone(),
-		));
+		Self::with_oauth2_token_service(
+			cfg,
+			stores,
+			metrics,
+			upstream,
+			ca,
+			mcp_state,
+			http::oauth2::OAuth2TokenService::new_runtime(),
+		)
+	}
+
+	pub(crate) fn with_oauth2_token_service(
+		cfg: Arc<Config>,
+		stores: Stores,
+		metrics: Arc<metrics::Metrics>,
+		upstream: client::Client,
+		ca: Option<Arc<CaClient>>,
+		mcp_state: mcp::App,
+		oauth2_token_service: http::oauth2::OAuth2TokenService,
+	) -> Self {
 		Self {
 			cfg,
 			stores,
-			oauth2_runtime_cache,
 			upstream,
+			oauth2_token_service,
 			metrics,
 			mcp_state,
 			ca,

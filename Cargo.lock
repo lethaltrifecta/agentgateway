@@ -135,7 +135,6 @@ dependencies = [
  "async-compression",
  "async-openai",
  "async-trait",
- "async_singleflight",
  "atomic_float",
  "aws-config",
  "aws-credential-types",
@@ -566,17 +565,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "async_singleflight"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f73e25684fbd8c3133c63435327c100f7fcd0c96a172734640b7c96f77c71f21"
-dependencies = [
- "pin-project",
- "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]

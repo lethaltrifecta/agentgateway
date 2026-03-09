@@ -208,13 +208,13 @@ pub fn test_basic_jwks() {
 }
 
 #[test]
-pub fn test_ec_jwks_without_alg_infers_curve_specific_algorithm_p256() {
+pub fn test_ec_jwks_without_alg_allows_ec_algorithm_family() {
 	let jwks = json!({
 		"keys": [
 			{
 				"use": "sig",
 				"kty": "EC",
-				"kid": "p256-kid",
+				"kid": "ec-kid",
 				"crv": "P-256",
 				"x": "XZHF8Em5LbpqfgewAalpSEH4Ka2I2xjcxxUt2j6-lCo",
 				"y": "g3DFz45A7EOUMgmsNXatrXw1t-PG5xsbkxUs851RxSE"
@@ -229,34 +229,14 @@ pub fn test_ec_jwks_without_alg_infers_curve_specific_algorithm_p256() {
 		JWTValidationOptions::default(),
 	)
 	.unwrap();
-	let validation = &provider.keys.get("p256-kid").unwrap().validation;
-	assert_eq!(validation.algorithms, vec![jsonwebtoken::Algorithm::ES256]);
-}
-
-#[test]
-pub fn test_ec_jwks_without_alg_infers_curve_specific_algorithm_p384() {
-	let jwks = json!({
-		"keys": [
-			{
-				"use": "sig",
-				"kty": "EC",
-				"kid": "p384-kid",
-				"crv": "P-384",
-				"x": "XZHF8Em5LbpqfgewAalpSEH4Ka2I2xjcxxUt2j6-lCo",
-				"y": "g3DFz45A7EOUMgmsNXatrXw1t-PG5xsbkxUs851RxSE"
-			}
+	let validation = &provider.keys.get("ec-kid").unwrap().validation;
+	assert_eq!(
+		validation.algorithms,
+		vec![
+			jsonwebtoken::Algorithm::ES256,
+			jsonwebtoken::Algorithm::ES384
 		]
-	});
-	let jwks = serde_json::from_value(jwks).unwrap();
-	let provider = Provider::from_jwks(
-		jwks,
-		"https://example.com".to_string(),
-		None,
-		JWTValidationOptions::default(),
-	)
-	.unwrap();
-	let validation = &provider.keys.get("p384-kid").unwrap().validation;
-	assert_eq!(validation.algorithms, vec![jsonwebtoken::Algorithm::ES384]);
+	);
 }
 
 #[test]

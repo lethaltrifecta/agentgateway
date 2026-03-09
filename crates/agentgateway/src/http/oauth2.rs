@@ -1,14 +1,13 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aws_lc_rs::digest::{self, SHA256};
 use aws_lc_rs::hkdf;
 use axum::response::Response;
 #[cfg(test)]
 use cookie::Cookie;
 #[cfg(test)]
 use http::StatusCode;
+#[cfg(test)]
 use secrecy::ExposeSecret;
 use tracing::{debug, warn};
 use url::Url;
@@ -20,8 +19,8 @@ use crate::http::auth::UpstreamAccessToken;
 use crate::http::jwt::Claims;
 use crate::http::jwt::{JWTValidationOptions, Jwt, Mode as JwtMode, Provider as JwtProvider};
 use crate::http::oidc::{
-	Error as OidcError, ExchangeCodeRequest, OidcCallContext, OidcClient, OidcMetadata,
-	OidcTokenService, RefreshTokenRequest, TokenResponse,
+	Error as OidcError, ExchangeCodeRequest, OidcCallContext, OidcMetadata, OidcTokenService,
+	RefreshTokenRequest, TokenResponse,
 };
 use crate::http::{PolicyResponse, Request, merge_in_headers};
 use crate::proxy::ProxyError;
@@ -49,7 +48,6 @@ const INSECURE_DEFAULT_HANDSHAKE_COOKIE_NAME_PREFIX: &str = "ag-nonce";
 const STATE_TTL: Duration = Duration::from_secs(300); // 5 minutes for login handshake
 // Keep refresh-capable sessions alive long enough to perform token refreshes.
 const DEFAULT_REFRESHABLE_COOKIE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const MAX_REFRESHABLE_COOKIE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const DEFAULT_SCOPE_PARAM: &str = "openid profile email";
 const SESSION_COOKIE_AAD: &[u8] = b"agentgateway_session_cookie";
 const HANDSHAKE_STATE_AAD: &[u8] = b"agentgateway_handshake_state";
@@ -87,7 +85,7 @@ impl ValidatedRedirectUrl {
 }
 
 #[derive(Debug, Clone)]
-struct ValidatedProviderEndpointUrl(Url);
+struct ValidatedProviderEndpointUrl;
 
 impl ValidatedProviderEndpointUrl {
 	fn parse(raw: &str, field_name: &str) -> anyhow::Result<Self> {
@@ -98,11 +96,7 @@ impl ValidatedProviderEndpointUrl {
 				"{field_name} must use https (or http on loopback hosts), include a host, must not contain a fragment, and must not include userinfo"
 			);
 		}
-		Ok(Self(parsed))
-	}
-
-	fn into_url(self) -> Url {
-		self.0
+		Ok(Self)
 	}
 }
 
@@ -124,7 +118,6 @@ pub struct OAuth2 {
 pub struct StoredOAuth2Policy {
 	config: OAuth2Policy,
 	attachment_key: OAuth2AttachmentKey,
-	policy_fingerprint: [u8; 32],
 	callback_path: String,
 }
 
@@ -140,25 +133,10 @@ pub struct OAuth2TokenService {
 	inner: OidcTokenService,
 }
 
-#[derive(Debug)]
-pub struct OAuth2RuntimeCache {
-	runtime_secret: Option<Arc<RuntimeCookieSecret>>,
-	// Internal cache namespace only. This is object identity for the configured
-	// runtime secret, not secret material and not a derived cryptographic value.
-	runtime_secret_identity: Option<usize>,
-	cache: std::sync::RwLock<HashMap<OAuth2RuntimeCacheKey, Arc<OAuth2>>>,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct OAuth2RuntimeCacheKey {
-	policy_fingerprint: [u8; 32],
-	runtime_secret_identity: usize,
-}
-
 impl OAuth2TokenService {
 	pub fn new_runtime() -> Self {
 		Self {
-			inner: Arc::new(OidcClient::new()).token_service(),
+			inner: OidcTokenService::new_runtime(),
 		}
 	}
 
@@ -181,51 +159,6 @@ impl OAuth2TokenService {
 		req: RefreshTokenRequest<'_>,
 	) -> Result<TokenResponse, OidcError> {
 		self.inner.refresh_token(ctx, req).await
-	}
-}
-
-impl OAuth2RuntimeCache {
-	pub fn new(runtime_secret: Option<Arc<RuntimeCookieSecret>>) -> Self {
-		let runtime_secret_identity = runtime_secret
-			.as_ref()
-			.map(|secret| Arc::as_ptr(secret) as usize);
-		Self {
-			runtime_secret,
-			runtime_secret_identity,
-			cache: Default::default(),
-		}
-	}
-
-	pub fn resolve(&self, policy: &StoredOAuth2Policy) -> Option<Arc<OAuth2>> {
-		let runtime_secret = self.runtime_secret.as_ref()?;
-		let cache_key = OAuth2RuntimeCacheKey {
-			policy_fingerprint: policy.fingerprint(),
-			runtime_secret_identity: self
-				.runtime_secret_identity
-				.expect("runtime secret identity must exist when runtime secret is configured"),
-		};
-		if let Some(cached) = self
-			.cache
-			.read()
-			.expect("oauth2 runtime cache lock")
-			.get(&cache_key)
-			.cloned()
-		{
-			return Some(cached);
-		}
-
-		let materialized = Arc::new(
-			policy
-				.materialize(runtime_secret.clone())
-				.expect("stored oauth2 policy should materialize at the proxy runtime boundary"),
-		);
-		let mut cache = self.cache.write().expect("oauth2 runtime cache lock");
-		Some(
-			cache
-				.entry(cache_key)
-				.or_insert_with(|| materialized.clone())
-				.clone(),
-		)
 	}
 }
 
@@ -326,39 +259,7 @@ impl OAuth2 {
 			.redirect_uri
 			.as_deref()
 			.ok_or_else(|| anyhow::anyhow!("oauth2 policy requires redirect_uri"))?;
-		let parsed_redirect_uri = ValidatedRedirectUrl::parse(redirect_uri, "redirect_uri")?;
-		if parsed_redirect_uri.as_url().scheme() == "http"
-			&& config
-				.cookie_name
-				.as_deref()
-				.is_some_and(|name| name.starts_with("__Host-"))
-		{
-			anyhow::bail!("__Host- cookie names require https redirect_uri");
-		}
-		if parsed_redirect_uri.as_url().scheme() == "http"
-			&& config
-				.cookie_name
-				.as_deref()
-				.is_some_and(|name| name.starts_with("__Secure-"))
-		{
-			anyhow::bail!("__Secure- cookie names require https redirect_uri");
-		}
-		if let Some(uri) = &config.post_logout_redirect_uri {
-			ValidatedRedirectUrl::parse(uri, "post_logout_redirect_uri")?;
-		}
-		if let Some(max_age) = config.refreshable_cookie_max_age_seconds
-			&& max_age == 0
-		{
-			anyhow::bail!("oauth2 policy refreshable_cookie_max_age_seconds must be > 0");
-		}
-		if let Some(max_age) = config.refreshable_cookie_max_age_seconds
-			&& max_age > MAX_REFRESHABLE_COOKIE_MAX_AGE.as_secs()
-		{
-			anyhow::bail!(
-				"oauth2 policy refreshable_cookie_max_age_seconds must be <= {}",
-				MAX_REFRESHABLE_COOKIE_MAX_AGE.as_secs()
-			);
-		}
+		ValidatedRedirectUrl::parse(redirect_uri, "redirect_uri")?;
 		if let Some(provider) = config.resolved_provider.as_deref() {
 			ValidatedProviderEndpointUrl::parse(
 				provider.authorization_endpoint.as_str(),
@@ -437,10 +338,7 @@ impl OAuth2 {
 			.as_ref()
 			.is_none_or(|uri| uri.as_url().scheme() == "https");
 		let cookie_namespace = attachment_key.cookie_namespace();
-		let session_cookie_name = config
-			.cookie_name
-			.clone()
-			.unwrap_or_else(|| Self::default_session_cookie_name(&cookie_namespace, cookie_secure));
+		let session_cookie_name = Self::default_session_cookie_name(&cookie_namespace, cookie_secure);
 		let handshake_cookie_base_name =
 			Self::default_handshake_cookie_base_name(&cookie_namespace, cookie_secure);
 		let cookie_scope = session_cookie_name.as_str();
@@ -529,20 +427,15 @@ impl OAuth2 {
 						.await
 					{
 						Ok(true) => match self.session_codec.encode_session(&session) {
-							Ok(encoded) => {
-								match self.set_session_cookies(
-									encoded,
-									session.cookie_max_age(self.refreshable_cookie_max_age()),
-								) {
-									Ok(headers) => {
-										updated_cookie_headers = Some(headers);
-									},
-									Err(err) => {
-										warn!(error = %err, "failed to persist refreshed oauth2 session; forcing re-authentication");
-										updated_cookie_headers = Some(self.clear_session_cookies());
-										session.expires_at = SystemTime::UNIX_EPOCH;
-									},
-								}
+							Ok(encoded) => match self.set_session_cookies(encoded, session.cookie_max_age()) {
+								Ok(headers) => {
+									updated_cookie_headers = Some(headers);
+								},
+								Err(err) => {
+									warn!(error = %err, "failed to persist refreshed oauth2 session; forcing re-authentication");
+									updated_cookie_headers = Some(self.clear_session_cookies());
+									session.expires_at = SystemTime::UNIX_EPOCH;
+								},
 							},
 							Err(err) => {
 								debug!("failed to encode refreshed session: {err}");
@@ -593,21 +486,6 @@ impl OAuth2 {
 			self.resolved_oidc_metadata()?,
 			self.resolved_jwt_validator.clone(),
 		))
-	}
-
-	fn end_session_endpoint(&self) -> Option<&str> {
-		self
-			.resolved_metadata
-			.as_ref()
-			.and_then(|metadata| metadata.end_session_endpoint.as_deref())
-	}
-
-	fn refreshable_cookie_max_age(&self) -> Duration {
-		self
-			.config
-			.refreshable_cookie_max_age_seconds
-			.map(Duration::from_secs)
-			.unwrap_or(DEFAULT_REFRESHABLE_COOKIE_MAX_AGE)
 	}
 
 	fn clear_session_cookies(&self) -> crate::http::HeaderMap {
@@ -743,11 +621,9 @@ impl StoredOAuth2Policy {
 		if OAuth2::build_resolved_metadata(&config)?.is_none() {
 			anyhow::bail!("oauth2 policy requires resolved provider metadata");
 		}
-		let policy_fingerprint = Self::compute_fingerprint(&config, &attachment_key);
 		Ok(Self {
 			config,
 			attachment_key,
-			policy_fingerprint,
 			callback_path,
 		})
 	}
@@ -757,7 +633,7 @@ impl StoredOAuth2Policy {
 	}
 
 	pub(crate) fn matches_protocol_endpoint(&self, path: &str) -> bool {
-		self.callback_path == path || self.config.sign_out_path.as_deref() == Some(path)
+		self.callback_path == path
 	}
 
 	pub(crate) fn materialize(&self, runtime: Arc<RuntimeCookieSecret>) -> anyhow::Result<OAuth2> {
@@ -771,51 +647,6 @@ impl StoredOAuth2Policy {
 			),
 		)
 	}
-
-	pub(crate) fn fingerprint(&self) -> [u8; 32] {
-		self.policy_fingerprint
-	}
-
-	fn compute_fingerprint(config: &OAuth2Policy, attachment_key: &OAuth2AttachmentKey) -> [u8; 32] {
-		#[derive(serde::Serialize)]
-		struct FingerprintView<'a> {
-			attachment_key: &'a OAuth2AttachmentKey,
-			provider_id: &'a str,
-			oidc_issuer: &'a Option<String>,
-			provider_backend: &'a Option<crate::types::agent::SimpleBackendReference>,
-			client_id: &'a str,
-			client_secret: &'a str,
-			resolved_provider: &'a Option<Box<crate::types::agent::ResolvedOAuth2Provider>>,
-			redirect_uri: &'a Option<String>,
-			scopes: &'a [String],
-			cookie_name: &'a Option<String>,
-			refreshable_cookie_max_age_seconds: &'a Option<u64>,
-			sign_out_path: &'a Option<String>,
-			post_logout_redirect_uri: &'a Option<String>,
-		}
-
-		let fingerprint = FingerprintView {
-			attachment_key,
-			provider_id: &config.provider_id,
-			oidc_issuer: &config.oidc_issuer,
-			provider_backend: &config.provider_backend,
-			client_id: &config.client_id,
-			client_secret: config.client_secret.expose_secret(),
-			resolved_provider: &config.resolved_provider,
-			redirect_uri: &config.redirect_uri,
-			scopes: &config.scopes,
-			cookie_name: &config.cookie_name,
-			refreshable_cookie_max_age_seconds: &config.refreshable_cookie_max_age_seconds,
-			sign_out_path: &config.sign_out_path,
-			post_logout_redirect_uri: &config.post_logout_redirect_uri,
-		};
-		let bytes =
-			serde_json::to_vec(&fingerprint).expect("stored oauth2 policy fingerprint must serialize");
-		let digest = digest::digest(&SHA256, &bytes);
-		let mut out = [0u8; 32];
-		out.copy_from_slice(digest.as_ref());
-		out
-	}
 }
 
 struct CallbackValidation<'a> {
@@ -826,7 +657,6 @@ struct CallbackValidation<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProtocolEndpointKind {
 	Callback,
-	Logout,
 }
 
 #[cfg(test)]
@@ -886,10 +716,6 @@ mod tests {
 			})),
 			redirect_uri: Some("https://fixed.example.com/callback".to_string()),
 			scopes: vec![],
-			cookie_name: None,
-			refreshable_cookie_max_age_seconds: None,
-			sign_out_path: None,
-			post_logout_redirect_uri: None,
 		}
 	}
 
@@ -1015,7 +841,6 @@ mod tests {
 		struct Case {
 			name: &'static str,
 			redirect_uri: Option<&'static str>,
-			cookie_name: Option<&'static str>,
 			want_err: Option<&'static str>,
 		}
 
@@ -1023,51 +848,33 @@ mod tests {
 			Case {
 				name: "requires redirect uri",
 				redirect_uri: None,
-				cookie_name: None,
 				want_err: Some("requires redirect_uri"),
 			},
 			Case {
 				name: "rejects invalid uri",
 				redirect_uri: Some("not-a-valid-uri"),
-				cookie_name: None,
 				want_err: Some("invalid redirect_uri config"),
 			},
 			Case {
 				name: "rejects non loopback http by default",
 				redirect_uri: Some("http://app.example.com/callback"),
-				cookie_name: None,
 				want_err: Some("redirect_uri must use https (or http on loopback hosts"),
 			},
 			Case {
 				name: "accepts loopback http",
 				redirect_uri: Some("http://127.0.0.1:3000/callback"),
-				cookie_name: None,
 				want_err: None,
 			},
 			Case {
 				name: "rejects non http https scheme",
 				redirect_uri: Some("ftp://example.com/callback"),
-				cookie_name: None,
 				want_err: Some("redirect_uri must use https (or http on loopback hosts"),
-			},
-			Case {
-				name: "rejects host cookie on insecure redirect",
-				redirect_uri: Some("http://127.0.0.1:3000/callback"),
-				cookie_name: Some("__Host-custom"),
-				want_err: Some("__Host- cookie names require https redirect_uri"),
-			},
-			Case {
-				name: "rejects secure cookie on insecure redirect",
-				redirect_uri: Some("http://127.0.0.1:3000/callback"),
-				cookie_name: Some("__Secure-custom"),
-				want_err: Some("__Secure- cookie names require https redirect_uri"),
 			},
 		];
 
 		for case in cases {
 			let mut config = test_config();
 			config.redirect_uri = case.redirect_uri.map(ToOwned::to_owned);
-			config.cookie_name = case.cookie_name.map(ToOwned::to_owned);
 
 			match case.want_err {
 				Some(want_err) => {
@@ -1100,96 +907,6 @@ mod tests {
 				.to_string()
 				.contains("oauth2 policy requires resolved provider metadata")
 		);
-	}
-
-	#[test]
-	fn oauth2_new_validates_post_logout_redirect_uri_rules() {
-		struct Case {
-			name: &'static str,
-			post_logout_redirect_uri: &'static str,
-			want_err: Option<&'static str>,
-		}
-
-		let cases = [
-			Case {
-				name: "rejects invalid uri",
-				post_logout_redirect_uri: "not-a-url",
-				want_err: Some("invalid post_logout_redirect_uri config"),
-			},
-			Case {
-				name: "rejects non loopback http by default",
-				post_logout_redirect_uri: "http://app.example.com/signed-out",
-				want_err: Some("post_logout_redirect_uri must use https (or http on loopback hosts"),
-			},
-			Case {
-				name: "rejects fragment",
-				post_logout_redirect_uri: "https://app.example.com/signed-out#fragment",
-				want_err: Some("must not contain a fragment"),
-			},
-			Case {
-				name: "rejects userinfo",
-				post_logout_redirect_uri: "https://user:pass@app.example.com/signed-out",
-				want_err: Some("must not include userinfo"),
-			},
-			Case {
-				name: "accepts loopback http",
-				post_logout_redirect_uri: "http://127.0.0.1:3000/signed-out",
-				want_err: None,
-			},
-			Case {
-				name: "rejects non http https scheme",
-				post_logout_redirect_uri: "ftp://app.example.com/signed-out",
-				want_err: Some("post_logout_redirect_uri must use https (or http on loopback hosts"),
-			},
-		];
-
-		for case in cases {
-			let mut config = test_config();
-			config.post_logout_redirect_uri = Some(case.post_logout_redirect_uri.to_string());
-
-			match case.want_err {
-				Some(want_err) => {
-					let err =
-						OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).unwrap_err();
-					assert!(
-						err.to_string().contains(want_err),
-						"case {:?}: unexpected error: {err}",
-						case.name
-					);
-				},
-				None => {
-					assert!(
-						OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).is_ok(),
-						"case {:?} should succeed",
-						case.name
-					);
-				},
-			}
-		}
-	}
-
-	#[test]
-	fn oauth2_new_validates_refreshable_cookie_max_age() {
-		let cases = [
-			("zero", 0, "refreshable_cookie_max_age_seconds must be > 0"),
-			(
-				"too large",
-				MAX_REFRESHABLE_COOKIE_MAX_AGE.as_secs() + 1,
-				"refreshable_cookie_max_age_seconds must be <=",
-			),
-		];
-
-		for (name, max_age, want_err) in cases {
-			let mut config = test_config();
-			config.refreshable_cookie_max_age_seconds = Some(max_age);
-
-			let err = OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).unwrap_err();
-			assert!(
-				err.to_string().contains(want_err),
-				"case {:?}: unexpected error: {err}",
-				name
-			);
-		}
 	}
 
 	#[test]
@@ -1479,7 +1196,6 @@ mod tests {
 		let mut config = test_config();
 		config.oidc_issuer = None;
 		config.provider_id = format!("{}/authorize", server.uri());
-		config.cookie_name = Some("__Host-shared-session".to_string());
 		config.resolved_provider = Some(Box::new(crate::types::agent::ResolvedOAuth2Provider {
 			authorization_endpoint: format!("{}/authorize", server.uri()),
 			token_endpoint: format!("{}/token", server.uri()),
@@ -1551,38 +1267,6 @@ mod tests {
 			ProxyError::OAuth2AuthenticationFailure(Error::Handshake(_))
 		));
 		assert!(err.to_string().contains("different oauth2 policy"));
-	}
-
-	#[test]
-	fn refreshable_cookie_max_age_uses_policy_override() {
-		let mut oauth2 = test_oauth2();
-		oauth2.config.refreshable_cookie_max_age_seconds = Some(1800);
-		let session = SessionState {
-			access_token: "token".to_string(),
-			refresh_token: Some("refresh".to_string()),
-			expires_at: SystemTime::now() + Duration::from_secs(30),
-			nonce: None,
-			id_token: None,
-		};
-		assert_eq!(
-			oauth2.refreshable_cookie_max_age(),
-			Duration::from_secs(1800)
-		);
-		assert_eq!(
-			session.cookie_max_age(oauth2.refreshable_cookie_max_age()),
-			cookie::time::Duration::seconds(1800),
-		);
-	}
-
-	#[test]
-	fn refreshable_cookie_max_age_accepts_upper_bound() {
-		let mut oauth2 = test_oauth2();
-		oauth2.config.refreshable_cookie_max_age_seconds =
-			Some(MAX_REFRESHABLE_COOKIE_MAX_AGE.as_secs());
-		assert_eq!(
-			oauth2.refreshable_cookie_max_age(),
-			MAX_REFRESHABLE_COOKIE_MAX_AGE
-		);
 	}
 
 	#[test]
@@ -1927,234 +1611,5 @@ mod tests {
 			.is_empty(),
 			"reauth response should also set a new handshake cookie"
 		);
-	}
-
-	#[test]
-	fn logout_redirects_to_end_session_endpoint_with_id_token_hint() {
-		let oauth2 = test_oauth2();
-		let cookie_name = oauth2.session_cookie_name();
-		let session = SessionState {
-			access_token: "token".to_string(),
-			refresh_token: Some("refresh-token".to_string()),
-			expires_at: SystemTime::now() + Duration::from_secs(3600),
-			nonce: Some("nonce".to_string()),
-			id_token: Some("id-token-value".to_string()),
-		};
-		let encoded = oauth2.session_codec.encode_session(&session).unwrap();
-		let mut headers = http::HeaderMap::new();
-		headers.insert(
-			http::header::COOKIE,
-			HeaderValue::from_str(&format!("{cookie_name}={encoded}")).unwrap(),
-		);
-
-		let policy = oauth2
-			.handle_logout(&headers, Some("https://issuer.example.com/logout?foo=bar"))
-			.expect("logout should succeed");
-		let response = policy
-			.direct_response
-			.expect("logout response should be present");
-		assert_eq!(response.status(), StatusCode::FOUND);
-		let location = response
-			.headers()
-			.get(http::header::LOCATION)
-			.and_then(|v| v.to_str().ok())
-			.expect("logout redirect location should be set");
-		let parsed = Url::parse(location).expect("redirect location should be a valid URL");
-		assert_eq!(parsed.scheme(), "https");
-		assert_eq!(parsed.host_str(), Some("issuer.example.com"));
-		assert_eq!(parsed.path(), "/logout");
-		let query = parsed.query_pairs().into_owned().collect::<Vec<_>>();
-		assert!(query.contains(&("foo".to_string(), "bar".to_string())));
-		assert!(query.contains(&("client_id".to_string(), "client-id".to_string())));
-		assert!(query.contains(&("id_token_hint".to_string(), "id-token-value".to_string())));
-	}
-
-	#[test]
-	fn logout_redirect_includes_post_logout_redirect_uri_when_configured() {
-		let mut config = test_config();
-		config.post_logout_redirect_uri = Some("https://app.example.com/signed-out".to_string());
-		let oauth2 = OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).unwrap();
-		let cookie_name = oauth2.session_cookie_name();
-		let session = SessionState {
-			access_token: "token".to_string(),
-			refresh_token: Some("refresh-token".to_string()),
-			expires_at: SystemTime::now() + Duration::from_secs(3600),
-			nonce: Some("nonce".to_string()),
-			id_token: Some("id-token-value".to_string()),
-		};
-		let encoded = oauth2.session_codec.encode_session(&session).unwrap();
-		let mut headers = http::HeaderMap::new();
-		headers.insert(
-			http::header::COOKIE,
-			HeaderValue::from_str(&format!("{cookie_name}={encoded}")).unwrap(),
-		);
-
-		let policy = oauth2
-			.handle_logout(&headers, Some("https://issuer.example.com/logout"))
-			.expect("logout should succeed");
-		let response = policy
-			.direct_response
-			.expect("logout response should be present");
-		let location = response
-			.headers()
-			.get(http::header::LOCATION)
-			.and_then(|v| v.to_str().ok())
-			.expect("logout redirect location should be set");
-		let parsed = Url::parse(location).expect("redirect location should be a valid URL");
-		let query = parsed.query_pairs().into_owned().collect::<Vec<_>>();
-		assert!(query.contains(&(
-			"post_logout_redirect_uri".to_string(),
-			"https://app.example.com/signed-out".to_string()
-		)));
-	}
-
-	#[test]
-	fn logout_with_invalid_end_session_endpoint_falls_back_to_local_only() {
-		let oauth2 = test_oauth2();
-		let cookie_name = oauth2.session_cookie_name();
-		let session = SessionState {
-			access_token: "token".to_string(),
-			refresh_token: Some("refresh-token".to_string()),
-			expires_at: SystemTime::now() + Duration::from_secs(3600),
-			nonce: Some("nonce".to_string()),
-			id_token: Some("id-token-value".to_string()),
-		};
-		let encoded = oauth2.session_codec.encode_session(&session).unwrap();
-		let mut headers = http::HeaderMap::new();
-		headers.insert(
-			http::header::COOKIE,
-			HeaderValue::from_str(&format!("{cookie_name}={encoded}")).unwrap(),
-		);
-
-		let policy = oauth2
-			.handle_logout(&headers, Some("::invalid-url::"))
-			.expect("logout should succeed");
-		let response = policy
-			.direct_response
-			.expect("logout response should be present");
-		assert_eq!(response.status(), StatusCode::OK);
-	}
-
-	#[test]
-	fn logout_with_non_https_end_session_endpoint_falls_back_to_local_only() {
-		let oauth2 = test_oauth2();
-		let cookie_name = oauth2.session_cookie_name();
-		let session = SessionState {
-			access_token: "token".to_string(),
-			refresh_token: Some("refresh-token".to_string()),
-			expires_at: SystemTime::now() + Duration::from_secs(3600),
-			nonce: Some("nonce".to_string()),
-			id_token: Some("id-token-value".to_string()),
-		};
-		let encoded = oauth2.session_codec.encode_session(&session).unwrap();
-		let mut headers = http::HeaderMap::new();
-		headers.insert(
-			http::header::COOKIE,
-			HeaderValue::from_str(&format!("{cookie_name}={encoded}")).unwrap(),
-		);
-
-		let policy = oauth2
-			.handle_logout(&headers, Some("http://issuer.example.com/logout"))
-			.expect("logout should succeed");
-		let response = policy
-			.direct_response
-			.expect("logout response should be present");
-		assert_eq!(response.status(), StatusCode::OK);
-	}
-
-	#[test]
-	fn logout_with_userinfo_end_session_endpoint_falls_back_to_local_only() {
-		let oauth2 = test_oauth2();
-		let cookie_name = oauth2.session_cookie_name();
-		let session = SessionState {
-			access_token: "token".to_string(),
-			refresh_token: Some("refresh-token".to_string()),
-			expires_at: SystemTime::now() + Duration::from_secs(3600),
-			nonce: Some("nonce".to_string()),
-			id_token: Some("id-token-value".to_string()),
-		};
-		let encoded = oauth2.session_codec.encode_session(&session).unwrap();
-		let mut headers = http::HeaderMap::new();
-		headers.insert(
-			http::header::COOKIE,
-			HeaderValue::from_str(&format!("{cookie_name}={encoded}")).unwrap(),
-		);
-
-		let policy = oauth2
-			.handle_logout(
-				&headers,
-				Some("https://user:pass@issuer.example.com/logout"),
-			)
-			.expect("logout should succeed");
-		let response = policy
-			.direct_response
-			.expect("logout response should be present");
-		assert_eq!(response.status(), StatusCode::OK);
-	}
-
-	#[test]
-	fn logout_redirect_replaces_reserved_query_params() {
-		let mut config = test_config();
-		config.post_logout_redirect_uri = Some("https://app.example.com/signed-out".to_string());
-		let oauth2 = OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).unwrap();
-		let cookie_name = oauth2.session_cookie_name();
-		let session = SessionState {
-			access_token: "token".to_string(),
-			refresh_token: Some("refresh-token".to_string()),
-			expires_at: SystemTime::now() + Duration::from_secs(3600),
-			nonce: Some("nonce".to_string()),
-			id_token: Some("id-token-value".to_string()),
-		};
-		let encoded = oauth2.session_codec.encode_session(&session).unwrap();
-		let mut headers = http::HeaderMap::new();
-		headers.insert(
-			http::header::COOKIE,
-			HeaderValue::from_str(&format!("{cookie_name}={encoded}")).unwrap(),
-		);
-
-		let policy = oauth2
-			.handle_logout(
-				&headers,
-				Some(
-					"https://issuer.example.com/logout?foo=bar&client_id=old&id_token_hint=old&post_logout_redirect_uri=https://old.example.com",
-				),
-			)
-			.expect("logout should succeed");
-		let response = policy
-			.direct_response
-			.expect("logout response should be present");
-		assert_eq!(response.status(), StatusCode::FOUND);
-		let location = response
-			.headers()
-			.get(http::header::LOCATION)
-			.and_then(|v| v.to_str().ok())
-			.expect("logout redirect location should be set");
-		let parsed = Url::parse(location).expect("redirect location should be a valid URL");
-		let query = parsed.query_pairs().into_owned().collect::<Vec<_>>();
-		assert_eq!(
-			query.iter().filter(|(k, _)| k == "client_id").count(),
-			1,
-			"client_id should be replaced, not duplicated"
-		);
-		assert_eq!(
-			query.iter().filter(|(k, _)| k == "id_token_hint").count(),
-			1,
-			"id_token_hint should be replaced, not duplicated"
-		);
-		assert_eq!(
-			query
-				.iter()
-				.filter(|(k, _)| k == "post_logout_redirect_uri")
-				.count(),
-			1,
-			"post_logout_redirect_uri should be replaced, not duplicated"
-		);
-		assert!(query.contains(&("foo".to_string(), "bar".to_string())));
-		assert!(query.contains(&("client_id".to_string(), "client-id".to_string())));
-		assert!(query.contains(&("id_token_hint".to_string(), "id-token-value".to_string())));
-		assert!(query.contains(&(
-			"post_logout_redirect_uri".to_string(),
-			"https://app.example.com/signed-out".to_string()
-		)));
 	}
 }
