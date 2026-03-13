@@ -42,7 +42,7 @@ pub enum Error {
 }
 
 #[derive(Debug)]
-pub struct OidcClient {
+struct OidcClient {
 	// Metadata cache key is issuer + provider backend context.
 	metadata_cache: RwLock<HashMap<MetadataCacheKey, CachedMetadata>>,
 	// Validators are specific to issuer + audiences + provider backend context.
@@ -260,32 +260,6 @@ pub struct RefreshTokenRequest<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct OidcMetadataResolver<'a> {
-	client: &'a OidcClient,
-}
-
-impl<'a> OidcMetadataResolver<'a> {
-	pub async fn get_metadata(
-		self,
-		ctx: OidcCallContext<'_>,
-		issuer: &str,
-	) -> Result<Arc<OidcMetadata>, Error> {
-		self.client.get_metadata(ctx, issuer).await
-	}
-
-	pub async fn get_cached_metadata(
-		self,
-		issuer: &str,
-		provider_backend: Option<&SimpleBackendReference>,
-	) -> Option<Arc<OidcMetadata>> {
-		self
-			.client
-			.get_cached_metadata(issuer, provider_backend)
-			.await
-	}
-}
-
-#[derive(Clone, Copy)]
 pub struct OidcJwtResolver<'a> {
 	client: &'a OidcClient,
 }
@@ -328,6 +302,31 @@ impl<'a> OidcJwtResolver<'a> {
 			.client
 			.validate_token(ctx, issuer, audiences, token)
 			.await
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct OidcProviderResolver {
+	client: Arc<OidcClient>,
+}
+
+impl OidcProviderResolver {
+	pub fn new_runtime() -> Self {
+		Self {
+			client: Arc::new(OidcClient::new()),
+		}
+	}
+
+	pub fn jwt_resolver(&self) -> OidcJwtResolver<'_> {
+		self.client.jwt()
+	}
+
+	pub async fn resolve_oauth2_provider(
+		&self,
+		ctx: OidcCallContext<'_>,
+		issuer: &str,
+	) -> Result<ResolvedOAuth2Provider, Error> {
+		self.client.jwt().resolve_oauth2_provider(ctx, issuer).await
 	}
 }
 
@@ -444,22 +443,12 @@ impl OidcClient {
 		}
 	}
 
-	pub fn metadata(&self) -> OidcMetadataResolver<'_> {
-		OidcMetadataResolver { client: self }
-	}
-
 	pub fn jwt(&self) -> OidcJwtResolver<'_> {
 		OidcJwtResolver { client: self }
 	}
 
 	pub fn tokens(&self) -> OidcTokenClient<'_> {
 		OidcTokenClient { client: self }
-	}
-
-	pub fn token_service(self: &Arc<Self>) -> OidcTokenService {
-		OidcTokenService {
-			client: self.clone(),
-		}
 	}
 
 	fn validate_issuer_url(issuer: &str) -> Result<(), Error> {
@@ -671,10 +660,11 @@ impl OidcClient {
 		Ok(metadata)
 	}
 
+	#[cfg(test)]
 	/// Returns cached metadata for an issuer, if present, without triggering network fetches.
 	///
-	/// This is useful on best-effort paths (for example logout) where we prefer low-latency
-	/// behavior over blocking on discovery.
+	/// This is useful for validating cache behavior in tests without forcing another
+	/// network fetch.
 	pub async fn get_cached_metadata(
 		&self,
 		issuer: &str,

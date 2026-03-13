@@ -47,20 +47,20 @@ use secrecy::SecretString;
 mod tests;
 
 #[derive(Clone, Debug)]
-pub struct LocalConfigNormalizer {
-	oidc: Arc<crate::http::oidc::OidcClient>,
+pub struct LocalConfigResolver {
+	oidc_resolver: crate::http::oidc::OidcProviderResolver,
 }
 
-impl Default for LocalConfigNormalizer {
+impl Default for LocalConfigResolver {
 	fn default() -> Self {
 		Self::new()
 	}
 }
 
-impl LocalConfigNormalizer {
+impl LocalConfigResolver {
 	pub fn new() -> Self {
 		Self {
-			oidc: Arc::new(crate::http::oidc::OidcClient::new()),
+			oidc_resolver: crate::http::oidc::OidcProviderResolver::new_runtime(),
 		}
 	}
 
@@ -77,7 +77,7 @@ impl LocalConfigNormalizer {
 		let local_config: LocalConfig = serdes::yamlviajson::from_str(&s)?;
 		convert(
 			client,
-			self.oidc.clone(),
+			self.oidc_resolver.clone(),
 			gateway_name,
 			config,
 			local_config,
@@ -93,7 +93,7 @@ impl NormalizedLocalConfig {
 		gateway_name: ListenerTarget,
 		s: &str,
 	) -> anyhow::Result<NormalizedLocalConfig> {
-		LocalConfigNormalizer::new()
+		LocalConfigResolver::new()
 			.normalize(config, client, gateway_name, s)
 			.await
 	}
@@ -1146,7 +1146,7 @@ impl LocalOAuth2Policy {
 	async fn into_resolved_policy(
 		self,
 		client: &Client,
-		oidc: Arc<crate::http::oidc::OidcClient>,
+		oidc_resolver: crate::http::oidc::OidcProviderResolver,
 	) -> anyhow::Result<crate::types::agent::OAuth2Policy> {
 		let mut policy = self.into_policy()?;
 		if policy.resolved_provider.is_some() {
@@ -1157,8 +1157,7 @@ impl LocalOAuth2Policy {
 			.oidc_issuer
 			.clone()
 			.ok_or_else(|| anyhow!("oauth2 issuer-based local policy requires an oidc issuer"))?;
-		let resolved_provider = oidc
-			.jwt()
+		let resolved_provider = oidc_resolver
 			.resolve_oauth2_provider(
 				crate::http::oidc::OidcCallContext::new(client, None, policy.provider_backend.as_ref()),
 				&issuer,
@@ -1178,7 +1177,7 @@ impl LocalOAuth2Policy {
 	) -> anyhow::Result<crate::http::oauth2::StoredOAuth2Policy> {
 		let attachment_key = ctx.oauth2_attachment_key()?;
 		let policy = self
-			.into_resolved_policy(&client, services.oidc.clone())
+			.into_resolved_policy(&client, services.oidc_resolver.clone())
 			.await?;
 		crate::http::oauth2::StoredOAuth2Policy::new(policy, attachment_key)
 	}
@@ -1186,12 +1185,12 @@ impl LocalOAuth2Policy {
 
 #[derive(Clone)]
 pub(crate) struct PolicyBuildServices {
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc_resolver: crate::http::oidc::OidcProviderResolver,
 }
 
 impl PolicyBuildServices {
-	pub(crate) fn new(oidc: Arc<crate::http::oidc::OidcClient>) -> Self {
-		Self { oidc }
+	pub(crate) fn new(oidc_resolver: crate::http::oidc::OidcProviderResolver) -> Self {
+		Self { oidc_resolver }
 	}
 }
 
@@ -1589,7 +1588,7 @@ struct TCPFilterOrPolicy {
 
 async fn convert(
 	client: client::Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc_resolver: crate::http::oidc::OidcProviderResolver,
 	gateway: ListenerTarget,
 	config: &crate::Config,
 	i: LocalConfig,
@@ -1606,7 +1605,7 @@ async fn convert(
 		mcp,
 	} = i;
 	merge_deprecated_frontend_policies(config, &mut frontend_policies)?;
-	let services = PolicyBuildServices::new(oidc);
+	let services = PolicyBuildServices::new(oidc_resolver);
 	let mut all_policies = vec![];
 	let mut all_backends = vec![];
 	let mut all_binds = vec![];
@@ -2576,7 +2575,9 @@ async fn split_policies(
 	}
 	if let Some(p) = mcp_authentication {
 		// Translate local MCP authn into runtime authn with a ready JWT validator.
-		let authn: McpAuthentication = p.translate(client.clone(), services.oidc.jwt()).await?;
+		let authn: McpAuthentication = p
+			.translate(client.clone(), services.oidc_resolver.jwt_resolver())
+			.await?;
 		backend_policies.push(BackendPolicy::McpAuthentication(authn));
 		// Do NOT inject a separate route-level JwtAuth; MCP router handles validation using jwt_validator.
 	}
@@ -2600,7 +2601,8 @@ async fn split_policies(
 	}
 	if let Some(p) = jwt_auth {
 		route_policies.push(TrafficPolicy::JwtAuth(
-			p.try_into(client.clone(), services.oidc.jwt()).await?,
+			p.try_into(client.clone(), services.oidc_resolver.jwt_resolver())
+				.await?,
 		));
 	}
 	if let Some(p) = basic_auth {
@@ -2648,11 +2650,11 @@ async fn split_policies(
 #[cfg(test)]
 pub(crate) async fn split_policies_for_test(
 	client: Client,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc_resolver: crate::http::oidc::OidcProviderResolver,
 	pol: FilterOrPolicy,
 ) -> Result<ResolvedPolicies, Error> {
 	let ctx = PolicyBuildContext::listener_policy("test-listener");
-	let services = PolicyBuildServices::new(oidc);
+	let services = PolicyBuildServices::new(oidc_resolver);
 	split_policies(client, &services, &ctx, pol).await
 }
 

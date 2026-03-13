@@ -299,7 +299,7 @@ pub async fn tls_mock() -> (MockServer, MockTlsCertificates) {
 
 pub struct TestBind {
 	pi: Arc<ProxyInputs>,
-	oidc: Arc<crate::http::oidc::OidcClient>,
+	oidc_resolver: crate::http::oidc::OidcProviderResolver,
 	drain_rx: DrainWatcher,
 	_drain_tx: DrainTrigger,
 
@@ -372,8 +372,8 @@ impl TestBind {
 	pub fn inputs(&self) -> Arc<ProxyInputs> {
 		self.pi.clone()
 	}
-	pub fn oidc(&self) -> Arc<crate::http::oidc::OidcClient> {
-		self.oidc.clone()
+	pub fn oidc_resolver(&self) -> crate::http::oidc::OidcProviderResolver {
+		self.oidc_resolver.clone()
 	}
 	pub fn with_route(self, r: Route) -> Self {
 		self
@@ -589,7 +589,7 @@ impl TestBind {
 	pub async fn attach_route(&mut self, p: serde_json::Value) {
 		let pol: local::LocalRoute = serde_json::from_value(p).unwrap();
 		self.routes += 1;
-		let services = local::PolicyBuildServices::new(self.oidc.clone());
+		let services = local::PolicyBuildServices::new(self.oidc_resolver.clone());
 		let (route, backends) = local::convert_route(
 			self.pi.upstream.clone(),
 			&services,
@@ -616,9 +616,10 @@ impl TestBind {
 	}
 	pub async fn attach_route_policy(&mut self, p: serde_json::Value) {
 		let pol: local::FilterOrPolicy = serde_json::from_value(p).unwrap();
-		let pols = local::split_policies_for_test(self.pi.upstream.clone(), self.oidc.clone(), pol)
-			.await
-			.unwrap();
+		let pols =
+			local::split_policies_for_test(self.pi.upstream.clone(), self.oidc_resolver.clone(), pol)
+				.await
+				.unwrap();
 		for v in pols.route_policies.into_iter() {
 			self.policies += 1;
 			self.insert_policy(TargetedPolicy {
@@ -636,9 +637,10 @@ impl TestBind {
 	}
 	pub async fn attached_backend_policy(&mut self, addr: &SocketAddr, p: serde_json::Value) {
 		let pol: local::FilterOrPolicy = serde_json::from_value(p).unwrap();
-		let pols = local::split_policies_for_test(self.pi.upstream.clone(), self.oidc.clone(), pol)
-			.await
-			.unwrap();
+		let pols =
+			local::split_policies_for_test(self.pi.upstream.clone(), self.oidc_resolver.clone(), pol)
+				.await
+				.unwrap();
 		for v in pols.backend_policies.into_iter() {
 			self.policies += 1;
 			self.insert_policy(TargetedPolicy {
@@ -769,7 +771,6 @@ pub fn setup_proxy_test(cfg: &str) -> anyhow::Result<TestBind> {
 	agent_core::telemetry::testing::setup_test_logging();
 	let config = crate::config::parse_config(cfg.to_string(), None)?;
 	let encoder = config.session_encoder.clone();
-	let oidc = Arc::new(crate::http::oidc::OidcClient::new());
 	let stores = Stores::from_init(crate::store::StoresInit {
 		ipv6_enabled: config.ipv6_enabled,
 	});
@@ -785,11 +786,11 @@ pub fn setup_proxy_test(cfg: &str) -> anyhow::Result<TestBind> {
 		client.clone(),
 		None,
 		mcp::App::new(stores.clone(), encoder),
-		crate::http::oauth2::OAuth2TokenService::from_oidc(oidc.token_service()),
+		crate::http::oauth2::OAuth2TokenService::new_runtime(),
 	));
 	Ok(TestBind {
 		pi,
-		oidc,
+		oidc_resolver: crate::http::oidc::OidcProviderResolver::new_runtime(),
 		drain_rx,
 		_drain_tx: drain_tx,
 

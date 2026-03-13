@@ -140,11 +140,6 @@ impl OAuth2TokenService {
 		}
 	}
 
-	#[cfg(any(test, feature = "internal_benches"))]
-	pub(crate) fn from_oidc(inner: OidcTokenService) -> Self {
-		Self { inner }
-	}
-
 	pub async fn exchange_code(
 		&self,
 		ctx: OidcCallContext<'_>,
@@ -672,8 +667,6 @@ mod tests {
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	use super::*;
-	use crate::http::oidc::OidcClient;
-
 	const TEST_POLICY_KEY: &str = "test-policy";
 
 	fn test_attachment_key() -> crate::types::agent::OAuth2AttachmentKey {
@@ -1033,8 +1026,7 @@ mod tests {
 		let oauth2 = OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).unwrap();
 		let client = make_test_client();
 		let policy_client = make_test_policy_client();
-		let oidc = Arc::new(OidcClient::new());
-		let oidc_tokens = OAuth2TokenService::from_oidc(oidc.token_service());
+		let oidc_tokens = OAuth2TokenService::new_runtime();
 		let mut req = Request::new(crate::http::Body::empty());
 		*req.uri_mut() = "/private/data".parse().unwrap();
 		req
@@ -1091,8 +1083,7 @@ mod tests {
 		let oauth2 = OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).unwrap();
 		let client = make_test_client();
 		let policy_client = make_test_policy_client();
-		let oidc = Arc::new(OidcClient::new());
-		let oidc_tokens = OAuth2TokenService::from_oidc(oidc.token_service());
+		let oidc_tokens = OAuth2TokenService::new_runtime();
 
 		let mut initial_req = Request::new(crate::http::Body::empty());
 		*initial_req.uri_mut() = "/private/data".parse().unwrap();
@@ -1217,8 +1208,7 @@ mod tests {
 		.unwrap();
 		let client = make_test_client();
 		let policy_client = make_test_policy_client();
-		let oidc = Arc::new(OidcClient::new());
-		let oidc_tokens = OAuth2TokenService::from_oidc(oidc.token_service());
+		let oidc_tokens = OAuth2TokenService::new_runtime();
 
 		let mut initial_req = Request::new(crate::http::Body::empty());
 		*initial_req.uri_mut() = "/private/data".parse().unwrap();
@@ -1495,8 +1485,7 @@ mod tests {
 		let oauth2 = OAuth2::new(config, test_attachment_key(), test_oauth_cookie_secret()).unwrap();
 		let client = make_test_client();
 		let policy_client = make_test_policy_client();
-		let oidc = Arc::new(OidcClient::new());
-		let oidc_tokens = OAuth2TokenService::from_oidc(oidc.token_service());
+		let oidc_tokens = OAuth2TokenService::new_runtime();
 		let session = SessionState {
 			access_token: "access-expired".to_string(),
 			refresh_token: Some("refresh-token".to_string()),
@@ -1560,8 +1549,7 @@ mod tests {
 		let cookie_name = oauth2.session_cookie_name();
 		let client = make_test_client();
 		let policy_client = make_test_policy_client();
-		let oidc = Arc::new(OidcClient::new());
-		let oidc_tokens = OAuth2TokenService::from_oidc(oidc.token_service());
+		let oidc_tokens = OAuth2TokenService::new_runtime();
 		let session = SessionState {
 			access_token: "access-expired".to_string(),
 			refresh_token: Some("refresh-token".to_string()),

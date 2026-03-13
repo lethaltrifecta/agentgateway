@@ -71,7 +71,7 @@ impl StateManager {
 					gateway_namespace: xds.namespace.clone(),
 					listener_name: None,
 				},
-				normalizer: crate::types::local::LocalConfigNormalizer::new(),
+				normalizer: crate::types::local::LocalConfigResolver::new(),
 			};
 			Box::pin(local_client.run()).await?;
 		}
@@ -98,7 +98,7 @@ pub struct LocalClient {
 	pub stores: Stores,
 	pub client: Client,
 	pub gateway: ListenerTarget,
-	normalizer: crate::types::local::LocalConfigNormalizer,
+	normalizer: crate::types::local::LocalConfigResolver,
 }
 
 impl LocalClient {

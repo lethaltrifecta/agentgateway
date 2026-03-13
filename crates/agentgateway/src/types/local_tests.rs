@@ -19,8 +19,8 @@ fn make_test_client() -> crate::client::Client {
 	crate::client::Client::new(&cfg, None, Default::default(), None)
 }
 
-fn make_local_oidc() -> Arc<crate::http::oidc::OidcClient> {
-	Arc::new(crate::http::oidc::OidcClient::new())
+fn make_local_oidc() -> crate::http::oidc::OidcProviderResolver {
+	crate::http::oidc::OidcProviderResolver::new_runtime()
 }
 
 fn test_oauth2_runtime() -> Arc<crate::http::oauth2::RuntimeCookieSecret> {
