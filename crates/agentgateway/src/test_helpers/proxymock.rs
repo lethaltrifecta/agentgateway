@@ -589,9 +589,10 @@ impl TestBind {
 	pub async fn attach_route(&mut self, p: serde_json::Value) {
 		let pol: local::LocalRoute = serde_json::from_value(p).unwrap();
 		self.routes += 1;
+		let services = local::PolicyBuildServices::new(self.oidc.clone());
 		let (route, backends) = local::convert_route(
 			self.pi.upstream.clone(),
-			self.oidc.jwt_service(),
+			&services,
 			pol,
 			self.routes,
 			LISTENER_KEY,
@@ -615,10 +616,9 @@ impl TestBind {
 	}
 	pub async fn attach_route_policy(&mut self, p: serde_json::Value) {
 		let pol: local::FilterOrPolicy = serde_json::from_value(p).unwrap();
-		let pols =
-			local::split_policies_for_test(self.pi.upstream.clone(), self.oidc.jwt_service(), pol)
-				.await
-				.unwrap();
+		let pols = local::split_policies_for_test(self.pi.upstream.clone(), self.oidc.clone(), pol)
+			.await
+			.unwrap();
 		for v in pols.route_policies.into_iter() {
 			self.policies += 1;
 			self.insert_policy(TargetedPolicy {
@@ -636,10 +636,9 @@ impl TestBind {
 	}
 	pub async fn attached_backend_policy(&mut self, addr: &SocketAddr, p: serde_json::Value) {
 		let pol: local::FilterOrPolicy = serde_json::from_value(p).unwrap();
-		let pols =
-			local::split_policies_for_test(self.pi.upstream.clone(), self.oidc.jwt_service(), pol)
-				.await
-				.unwrap();
+		let pols = local::split_policies_for_test(self.pi.upstream.clone(), self.oidc.clone(), pol)
+			.await
+			.unwrap();
 		for v in pols.backend_policies.into_iter() {
 			self.policies += 1;
 			self.insert_policy(TargetedPolicy {

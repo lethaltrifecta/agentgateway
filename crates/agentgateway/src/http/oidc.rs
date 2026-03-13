@@ -19,7 +19,7 @@ use url::Url;
 
 use crate::client::Client;
 use crate::http::jwt::{
-	Claims, JWTValidationOptions, Jwt, Mode as JwtMode, Provider as JwtProvider, TokenError,
+	JWTValidationOptions, Jwt, Mode as JwtMode, Provider as JwtProvider, TokenError,
 };
 use crate::proxy::httpproxy::PolicyClient;
 use crate::types::agent::{ResolvedOAuth2Provider, SimpleBackendReference};
@@ -331,53 +331,6 @@ impl<'a> OidcJwtResolver<'a> {
 	}
 }
 
-#[derive(Debug, Clone)]
-pub struct OidcJwtService {
-	client: Arc<OidcClient>,
-}
-
-impl OidcJwtService {
-	pub fn new_runtime() -> Self {
-		Self {
-			client: Arc::new(OidcClient::new()),
-		}
-	}
-
-	pub fn resolver(&self) -> OidcJwtResolver<'_> {
-		self.client.jwt()
-	}
-
-	pub async fn resolve_oauth2_provider(
-		&self,
-		ctx: OidcCallContext<'_>,
-		issuer: &str,
-	) -> Result<ResolvedOAuth2Provider, Error> {
-		self.client.jwt().resolve_oauth2_provider(ctx, issuer).await
-	}
-
-	pub async fn get_info(
-		&self,
-		ctx: OidcCallContext<'_>,
-		issuer: &str,
-		audiences: Option<Vec<String>>,
-	) -> Result<(Arc<OidcMetadata>, Arc<Jwt>), Error> {
-		self.client.jwt().get_info(ctx, issuer, audiences).await
-	}
-
-	pub async fn validate_token(
-		&self,
-		ctx: OidcCallContext<'_>,
-		issuer: &str,
-		audiences: Option<Vec<String>>,
-		token: &str,
-	) -> Result<Claims, Error> {
-		self
-			.resolver()
-			.validate_token(ctx, issuer, audiences, token)
-			.await
-	}
-}
-
 #[derive(Clone, Copy)]
 pub struct OidcTokenClient<'a> {
 	client: &'a OidcClient,
@@ -501,12 +454,6 @@ impl OidcClient {
 
 	pub fn tokens(&self) -> OidcTokenClient<'_> {
 		OidcTokenClient { client: self }
-	}
-
-	pub fn jwt_service(self: &Arc<Self>) -> OidcJwtService {
-		OidcJwtService {
-			client: self.clone(),
-		}
 	}
 
 	pub fn token_service(self: &Arc<Self>) -> OidcTokenService {

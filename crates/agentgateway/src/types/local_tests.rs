@@ -19,6 +19,10 @@ fn make_test_client() -> crate::client::Client {
 	crate::client::Client::new(&cfg, None, Default::default(), None)
 }
 
+fn make_local_oidc() -> Arc<crate::http::oidc::OidcClient> {
+	Arc::new(crate::http::oidc::OidcClient::new())
+}
+
 fn test_oauth2_runtime() -> Arc<crate::http::oauth2::RuntimeCookieSecret> {
 	Arc::new(
 		crate::http::oauth2::parse_runtime_cookie_secret(
@@ -42,7 +46,6 @@ async fn test_config_parsing(test_name: &str) {
 	let normalized = NormalizedLocalConfig::from(
 		&config,
 		client,
-		Arc::new(crate::http::oidc::OidcClient::new()).jwt_service(),
 		ListenerTarget {
 			gateway_name: "name".into(),
 			gateway_namespace: "ns".into(),
@@ -280,6 +283,23 @@ fn local_oauth2_policy_rejects_schema_and_conversion_errors() {
 			parse_should_fail: true,
 		},
 		Case {
+			name: "issuer with provider backend",
+			value: serde_json::json!({
+				"issuer": "https://issuer.example.com",
+				"providerBackend": {
+					"service": {
+						"name": "default/oidc.default.svc.cluster.local",
+						"port": 443
+					}
+				},
+				"clientId": "client-id",
+				"clientSecret": "super-secret",
+				"redirectUri": "https://issuer.example.com/_gateway/callback",
+			}),
+			want_err: "local issuer mode does not support provider_backend",
+			parse_should_fail: false,
+		},
+		Case {
 			name: "missing provider mode",
 			value: serde_json::json!({
 				"clientId": "client-id",
@@ -335,7 +355,7 @@ redirectUri: https://issuer.example.com/_gateway/callback
 
 	let resolved = split_policies(
 		make_test_client(),
-		Arc::new(crate::http::oidc::OidcClient::new()).jwt_service(),
+		&PolicyBuildServices::new(make_local_oidc()),
 		&PolicyBuildContext::inline_route("test/route", 0),
 		filter_or_policy,
 	)
@@ -377,7 +397,7 @@ redirectUri: https://issuer.example.com/_gateway/callback
 
 	let resolved = split_policies(
 		make_test_client(),
-		Arc::new(crate::http::oidc::OidcClient::new()).jwt_service(),
+		&PolicyBuildServices::new(make_local_oidc()),
 		&PolicyBuildContext::listener_policy("listener-a"),
 		filter_or_policy,
 	)
@@ -442,7 +462,7 @@ async fn split_policies_resolves_local_oauth2_issuer_mode_before_runtime() {
 
 	let resolved = split_policies(
 		make_test_client(),
-		Arc::new(crate::http::oidc::OidcClient::new()).jwt_service(),
+		&PolicyBuildServices::new(make_local_oidc()),
 		&PolicyBuildContext::inline_route("test/route", 0),
 		filter_or_policy,
 	)

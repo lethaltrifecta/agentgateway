@@ -46,11 +46,28 @@ use secrecy::SecretString;
 #[path = "local_tests.rs"]
 mod tests;
 
-impl NormalizedLocalConfig {
-	pub async fn from(
+#[derive(Clone, Debug)]
+pub struct LocalConfigNormalizer {
+	oidc: Arc<crate::http::oidc::OidcClient>,
+}
+
+impl Default for LocalConfigNormalizer {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl LocalConfigNormalizer {
+	pub fn new() -> Self {
+		Self {
+			oidc: Arc::new(crate::http::oidc::OidcClient::new()),
+		}
+	}
+
+	pub async fn normalize(
+		&self,
 		config: &crate::Config,
 		client: client::Client,
-		oidc: crate::http::oidc::OidcJwtService,
 		gateway_name: ListenerTarget,
 		s: &str,
 	) -> anyhow::Result<NormalizedLocalConfig> {
@@ -58,8 +75,27 @@ impl NormalizedLocalConfig {
 		let s = s.replace("# yaml-language-server: $schema", "#");
 		let s = shellexpand::full(&s)?;
 		let local_config: LocalConfig = serdes::yamlviajson::from_str(&s)?;
-		let t = convert(client, oidc, gateway_name, config, local_config).await?;
-		Ok(t)
+		convert(
+			client,
+			self.oidc.clone(),
+			gateway_name,
+			config,
+			local_config,
+		)
+		.await
+	}
+}
+
+impl NormalizedLocalConfig {
+	pub async fn from(
+		config: &crate::Config,
+		client: client::Client,
+		gateway_name: ListenerTarget,
+		s: &str,
+	) -> anyhow::Result<NormalizedLocalConfig> {
+		LocalConfigNormalizer::new()
+			.normalize(config, client, gateway_name, s)
+			.await
 	}
 }
 
@@ -1051,6 +1087,11 @@ impl LocalOAuth2Policy {
 					}))
 			};
 		let resolved_provider_backend = resolve_provider_backend(provider_backend)?;
+		if issuer.is_some() && resolved_provider_backend.is_some() {
+			anyhow::bail!(
+				"oauth2 local issuer mode does not support provider_backend; use explicit authorizationEndpoint/tokenEndpoint in local config"
+			);
+		}
 		if issuer.is_some()
 			&& (end_session_endpoint.is_some() || !token_endpoint_auth_methods_supported.is_empty())
 		{
@@ -1105,7 +1146,7 @@ impl LocalOAuth2Policy {
 	async fn into_resolved_policy(
 		self,
 		client: &Client,
-		oidc: crate::http::oidc::OidcJwtService,
+		oidc: Arc<crate::http::oidc::OidcClient>,
 	) -> anyhow::Result<crate::types::agent::OAuth2Policy> {
 		let mut policy = self.into_policy()?;
 		if policy.resolved_provider.is_some() {
@@ -1117,6 +1158,7 @@ impl LocalOAuth2Policy {
 			.clone()
 			.ok_or_else(|| anyhow!("oauth2 issuer-based local policy requires an oidc issuer"))?;
 		let resolved_provider = oidc
+			.jwt()
 			.resolve_oauth2_provider(
 				crate::http::oidc::OidcCallContext::new(client, None, policy.provider_backend.as_ref()),
 				&issuer,
@@ -1144,11 +1186,11 @@ impl LocalOAuth2Policy {
 
 #[derive(Clone)]
 pub(crate) struct PolicyBuildServices {
-	oidc: crate::http::oidc::OidcJwtService,
+	oidc: Arc<crate::http::oidc::OidcClient>,
 }
 
 impl PolicyBuildServices {
-	fn new(oidc: crate::http::oidc::OidcJwtService) -> Self {
+	pub(crate) fn new(oidc: Arc<crate::http::oidc::OidcClient>) -> Self {
 		Self { oidc }
 	}
 }
@@ -1547,7 +1589,7 @@ struct TCPFilterOrPolicy {
 
 async fn convert(
 	client: client::Client,
-	oidc: crate::http::oidc::OidcJwtService,
+	oidc: Arc<crate::http::oidc::OidcClient>,
 	gateway: ListenerTarget,
 	config: &crate::Config,
 	i: LocalConfig,
@@ -1558,12 +1600,13 @@ async fn convert(
 		binds,
 		policies,
 		workloads,
-		services,
+		services: discovery_services,
 		backends,
 		llm,
 		mcp,
 	} = i;
 	merge_deprecated_frontend_policies(config, &mut frontend_policies)?;
+	let services = PolicyBuildServices::new(oidc);
 	let mut all_policies = vec![];
 	let mut all_backends = vec![];
 	let mut all_binds = vec![];
@@ -1573,7 +1616,7 @@ async fn convert(
 		for (idx, l) in b.listeners.into_iter().enumerate() {
 			let (l, pol, backends) = convert_listener(
 				client.clone(),
-				oidc.clone(),
+				&services,
 				idx,
 				l,
 				bind_name.clone(),
@@ -1602,7 +1645,7 @@ async fn convert(
 
 	for p in policies {
 		let ctx = PolicyBuildContext::targeted_policy(p.name.to_string());
-		let res = split_policies(client.clone(), oidc.clone(), &ctx, p.policy).await?;
+		let res = split_policies(client.clone(), &services, &ctx, p.policy).await?;
 		if (res.route_policies.len() + res.backend_policies.len()) != 1 {
 			anyhow::bail!("'policies' must contain exactly 1 policy")
 		}
@@ -1640,7 +1683,7 @@ async fn convert(
 	if let Some(llm_config) = llm {
 		let (llm_bind, llm_policies, llm_backends) = convert_llm_config(
 			client.clone(),
-			oidc.clone(),
+			&services,
 			config,
 			gateway.clone(),
 			llm_config,
@@ -1653,7 +1696,7 @@ async fn convert(
 	if let Some(mcp_config) = mcp {
 		let (mcp_bind, mcp_policies, mcp_backends) = convert_mcp_config(
 			client.clone(),
-			oidc.clone(),
+			&services,
 			config,
 			gateway.clone(),
 			mcp_config,
@@ -1672,7 +1715,7 @@ async fn convert(
 		policies: all_policies,
 		backends: all_backends.into_iter().collect(),
 		workloads,
-		services,
+		services: discovery_services,
 	})
 }
 
@@ -1709,7 +1752,7 @@ fn llm_model_name_header_match(model_name: &str) -> anyhow::Result<HeaderValueMa
 
 async fn convert_llm_config(
 	client: client::Client,
-	oidc: crate::http::oidc::OidcJwtService,
+	services: &PolicyBuildServices,
 	config: &crate::Config,
 	gateway: ListenerTarget,
 	llm_config: LocalLLMConfig,
@@ -2027,7 +2070,7 @@ json(request.body).model
 		let route_ctx = PolicyBuildContext::default();
 		let route_pols = split_policies(
 			client.clone(),
-			oidc.clone(),
+			services,
 			&route_ctx,
 			FilterOrPolicy {
 				authorization: pol.authorization.clone(),
@@ -2036,7 +2079,7 @@ json(request.body).model
 		)
 		.await?;
 		let gateway_ctx = PolicyBuildContext::listener_policy(listener_key.clone());
-		let pols = split_policies(client.clone(), oidc, &gateway_ctx, pol.gateway.into()).await?;
+		let pols = split_policies(client.clone(), services, &gateway_ctx, pol.gateway.into()).await?;
 
 		let pc = pols.route_policies.len();
 		for (idx, pol) in pols.route_policies.into_iter().enumerate() {
@@ -2103,7 +2146,7 @@ json(request.body).model
 
 async fn convert_mcp_config(
 	client: client::Client,
-	oidc: crate::http::oidc::OidcJwtService,
+	services: &PolicyBuildServices,
 	config: &crate::Config,
 	gateway: ListenerTarget,
 	mcp_config: LocalSimpleMcpConfig,
@@ -2118,7 +2161,7 @@ async fn convert_mcp_config(
 
 	let resolved_policies = if let Some(pol) = policies {
 		let ctx = PolicyBuildContext::inline_route("mcp:default", 0);
-		split_policies(client.clone(), oidc, &ctx, pol).await?
+		split_policies(client.clone(), services, &ctx, pol).await?
 	} else {
 		ResolvedPolicies::default()
 	};
@@ -2207,7 +2250,7 @@ fn detect_bind_protocol(listeners: &ListenerSet) -> BindProtocol {
 
 async fn convert_listener(
 	client: client::Client,
-	oidc: crate::http::oidc::OidcJwtService,
+	services: &PolicyBuildServices,
 	idx: usize,
 	l: LocalListener,
 	bind_key: Strng,
@@ -2272,8 +2315,7 @@ async fn convert_listener(
 
 	let mut rs = RouteSet::default();
 	for (idx, l) in routes.into_iter().flatten().enumerate() {
-		let (route, backends) =
-			convert_route(client.clone(), oidc.clone(), l, idx, key.clone()).await?;
+		let (route, backends) = convert_route(client.clone(), services, l, idx, key.clone()).await?;
 		all_backends.extend_from_slice(&backends);
 		rs.insert(route)
 	}
@@ -2295,7 +2337,7 @@ async fn convert_listener(
 
 	if let Some(pol) = policies {
 		let ctx = PolicyBuildContext::listener_policy(key.clone());
-		let pols = split_policies(client.clone(), oidc.clone(), &ctx, pol.into()).await?;
+		let pols = split_policies(client.clone(), services, &ctx, pol.into()).await?;
 		for (idx, pol) in pols.route_policies.into_iter().enumerate() {
 			let key = if matches!(&pol, TrafficPolicy::OAuth2(_)) {
 				strng::format!("listener/{key}/oauth2")
@@ -2324,7 +2366,7 @@ async fn convert_listener(
 
 pub(crate) async fn convert_route(
 	client: client::Client,
-	oidc: crate::http::oidc::OidcJwtService,
+	services: &PolicyBuildServices,
 	lr: LocalRoute,
 	idx: usize,
 	listener_key: ListenerKey,
@@ -2376,7 +2418,7 @@ pub(crate) async fn convert_route(
 	}
 	let resolved = if let Some(pol) = policies {
 		let ctx = PolicyBuildContext::inline_route(key.clone(), 0);
-		split_policies(client, oidc, &ctx, pol).await?
+		split_policies(client, services, &ctx, pol).await?
 	} else {
 		ResolvedPolicies::default()
 	};
@@ -2461,11 +2503,10 @@ async fn split_frontend_policies(
 }
 async fn split_policies(
 	client: Client,
-	oidc: crate::http::oidc::OidcJwtService,
+	services: &PolicyBuildServices,
 	ctx: &PolicyBuildContext,
 	pol: FilterOrPolicy,
 ) -> Result<ResolvedPolicies, Error> {
-	let services = PolicyBuildServices::new(oidc);
 	let mut resolved = ResolvedPolicies::default();
 	let ResolvedPolicies {
 		backend_policies,
@@ -2535,9 +2576,7 @@ async fn split_policies(
 	}
 	if let Some(p) = mcp_authentication {
 		// Translate local MCP authn into runtime authn with a ready JWT validator.
-		let authn: McpAuthentication = p
-			.translate(client.clone(), services.oidc.resolver())
-			.await?;
+		let authn: McpAuthentication = p.translate(client.clone(), services.oidc.jwt()).await?;
 		backend_policies.push(BackendPolicy::McpAuthentication(authn));
 		// Do NOT inject a separate route-level JwtAuth; MCP router handles validation using jwt_validator.
 	}
@@ -2561,7 +2600,7 @@ async fn split_policies(
 	}
 	if let Some(p) = jwt_auth {
 		route_policies.push(TrafficPolicy::JwtAuth(
-			p.try_into(client.clone(), services.oidc.resolver()).await?,
+			p.try_into(client.clone(), services.oidc.jwt()).await?,
 		));
 	}
 	if let Some(p) = basic_auth {
@@ -2583,7 +2622,7 @@ async fn split_policies(
 		route_policies.push(TrafficPolicy::ExtAuthz(p))
 	}
 	if let Some(p) = oauth2 {
-		let oauth2 = p.into_stored_policy(client.clone(), &services, ctx).await?;
+		let oauth2 = p.into_stored_policy(client.clone(), services, ctx).await?;
 		route_policies.push(TrafficPolicy::OAuth2(Arc::new(oauth2)))
 	}
 	if let Some(p) = ext_proc {
@@ -2609,11 +2648,12 @@ async fn split_policies(
 #[cfg(test)]
 pub(crate) async fn split_policies_for_test(
 	client: Client,
-	oidc: crate::http::oidc::OidcJwtService,
+	oidc: Arc<crate::http::oidc::OidcClient>,
 	pol: FilterOrPolicy,
 ) -> Result<ResolvedPolicies, Error> {
 	let ctx = PolicyBuildContext::listener_policy("test-listener");
-	split_policies(client, oidc, &ctx, pol).await
+	let services = PolicyBuildServices::new(oidc);
+	split_policies(client, &services, &ctx, pol).await
 }
 
 async fn convert_tcp_route(
