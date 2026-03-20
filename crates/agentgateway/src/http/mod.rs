@@ -1,4 +1,5 @@
 pub mod filters;
+pub mod health;
 pub mod timeout;
 
 mod buflist;
@@ -15,6 +16,7 @@ pub mod backendtls;
 pub mod basicauth;
 pub mod compression;
 pub mod csrf;
+pub mod envoy_proto_common;
 pub mod ext_authz;
 pub mod ext_proc;
 pub mod outlierdetection;
@@ -181,7 +183,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tower_serve_static::private::mime;
 use url::Url;
 
-use crate::cel::{BackendContext, LLMContext, RequestStartTime, SourceContext};
+use crate::cel::{BackendContext, LLMContext, RequestTime, SourceContext};
 use crate::client::PoolKey;
 use crate::proxy::{ProxyError, ProxyResponse};
 use crate::transport::BufferLimit;
@@ -762,6 +764,9 @@ impl Debug for DebugExtensions<'_> {
 		if let Some(e) = ext.get::<crate::llm::bedrock::AwsRegion>() {
 			d.field("AwsRegion", e);
 		}
+		if let Some(e) = ext.get::<crate::llm::bedrock::AwsServiceName>() {
+			d.field("AwsServiceName", e);
+		}
 		if let Some(e) = ext.get::<crate::client::ResolvedDestination>() {
 			d.field("ResolvedDestination", e);
 		}
@@ -798,8 +803,8 @@ impl Debug for DebugExtensions<'_> {
 		if let Some(e) = ext.get::<SourceContext>() {
 			d.field("SourceContext", e);
 		}
-		if let Some(e) = ext.get::<RequestStartTime>() {
-			d.field("RequestStartTime", e);
+		if let Some(e) = ext.get::<RequestTime>() {
+			d.field("RequestTime", e);
 		}
 		d.finish()
 	}

@@ -10,7 +10,6 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller/ambient"
 	"istio.io/istio/pkg/cluster"
-	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/network"
@@ -19,12 +18,12 @@ import (
 	"istio.io/istio/pkg/util/sets"
 	"istio.io/istio/pkg/workloadapi"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayx "sigs.k8s.io/gateway-api/apisx/v1alpha1"
 
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
@@ -38,6 +37,7 @@ import (
 	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/agentgatewaysyncer/krtxds"
 	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/agentgatewaysyncer/nack"
 	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/agentgatewaysyncer/status"
+	"github.com/agentgateway/agentgateway/controller/pkg/kgateway/wellknown"
 	"github.com/agentgateway/agentgateway/controller/pkg/logging"
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/krtutil"
 	krtpkg "github.com/agentgateway/agentgateway/controller/pkg/utils/krtutil"
@@ -79,12 +79,10 @@ type Syncer struct {
 	gatewayCollectionOptions []translator.GatewayCollectionConfigOption
 
 	customResourceCollections   func(cfg CustomResourceCollectionsConfig)
-	workloadAddressProviderFunc func(model.WorkloadInfo) *workloadapi.Address
-	serviceAddressProviderFunc  func(model.ServiceInfo) *workloadapi.Address
+	buildAddressCollectionsFunc AgentgatewayAddressBuilderFunc
 }
 
 func NewAgwSyncer(
-	ctx context.Context,
 	controllerName string,
 	client apiclient.Client,
 	agwCollections *plugins.AgwCollections,
@@ -104,10 +102,10 @@ func NewAgwSyncer(
 		statusCollections:        status.NewStatusCollections(extraGVKs),
 		NackPublisher:            nack.NewPublisher(client),
 		gatewayCollectionOptions: []translator.GatewayCollectionConfigOption{
-			translator.WithGatewayTransformationFunc(cfg.GatewayTransformationFunc)},
+			translator.WithGatewayTransformationFunc(cfg.GatewayTransformationFunc),
+		},
 		customResourceCollections:   cfg.CustomResourceCollections,
-		workloadAddressProviderFunc: cfg.WorkloadAddressProviderFunc,
-		serviceAddressProviderFunc:  cfg.ServiceAddressProviderFunc,
+		buildAddressCollectionsFunc: cfg.BuildAddressCollectionsFunc,
 	}
 	logger.Debug("init agentgateway Syncer", "controllername", controllerName)
 
@@ -120,8 +118,9 @@ func (s *Syncer) StatusCollections() *status.StatusCollections {
 }
 
 type OutputCollections struct {
-	Resources krt.Collection[agwir.AgwResource]
-	Addresses krt.Collection[Address]
+	Resources  krt.Collection[agwir.AgwResource]
+	Addresses  krt.Collection[Address]
+	References plugins.ReferenceIndex
 }
 
 type CustomResourceCollectionsConfig struct {
@@ -141,8 +140,7 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 	// Build core collections for irs
 	gatewayClasses := translator.GatewayClassesCollection(s.agwCollections.GatewayClasses, krtopts)
 	refGrants := translator.BuildReferenceGrants(translator.ReferenceGrantsCollection(s.agwCollections.ReferenceGrants, krtopts))
-	listenerSetStatus, listenerSets := s.buildListenerSetCollection(gatewayClasses, refGrants, krtopts)
-	status.RegisterStatus(s.statusCollections, listenerSetStatus, translator.GetStatus)
+	listenerSetInitialStatus, listenerSets := s.buildListenerSetCollection(gatewayClasses, refGrants, krtopts)
 	if s.customResourceCollections != nil {
 		s.customResourceCollections(CustomResourceCollectionsConfig{
 			ControllerName:    s.controllerName,
@@ -161,7 +159,7 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 	gatewayInitialStatus, gateways := s.buildGatewayCollection(gatewayClasses, listenerSets, refGrants, krtopts)
 
 	// Build Agw resources for gateway
-	agwResources, routeAttachments, policyStatuses, backendStatuses := s.buildAgwResources(gateways, refGrants, krtopts)
+	agwResources, routeAttachments, ancestorCollection, policyStatuses, backendStatuses := s.buildAgwResources(gateways, refGrants, krtopts)
 	status.RegisterStatus(s.statusCollections, backendStatuses, translator.GetStatus)
 	for _, col := range policyStatuses {
 		status.RegisterStatus(s.statusCollections, col, translator.GetStatus)
@@ -170,33 +168,47 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 	gatewayFinalStatus := s.buildFinalGatewayStatus(gatewayInitialStatus, routeAttachments, krtopts)
 	status.RegisterStatus(s.statusCollections, gatewayFinalStatus, translator.GetStatus)
 
+	listenerSetFinalStatus := s.buildFinalListenerSetStatus(gateways, listenerSetInitialStatus, routeAttachments, krtopts)
+	status.RegisterStatus(s.statusCollections, listenerSetFinalStatus, translator.GetStatus)
+
 	// Build address collections
-	addresses := s.buildAddressCollections(krtopts)
+	addressBuilder := s.buildAddressCollectionsFunc
+	if addressBuilder == nil {
+		addressBuilder = defaultBuildAddressCollections
+	}
+	addresses, hasSynced := addressBuilder(s.agwCollections, krtopts)
 
 	// Build XDS collection
 	s.buildXDSCollection(agwResources, addresses, krtopts)
 
 	// Set up sync dependencies
-	s.setupSyncDependencies(agwResources, addresses)
+	s.setupSyncDependencies(agwResources, addresses, hasSynced)
 
 	s.Outputs.Resources = agwResources
 	s.Outputs.Addresses = addresses
+	s.Outputs.References = ancestorCollection
 }
 
 func (s *Syncer) buildFinalGatewayStatus(
 	gatewayStatuses krt.StatusCollection[*gwv1.Gateway, gwv1.GatewayStatus],
-	routeAttachments krt.Collection[*translator.RouteAttachment],
+	routeAttachments krt.Collection[*plugins.RouteAttachment],
 	krtopts krtutil.KrtOptions,
 ) krt.StatusCollection[*gwv1.Gateway, gwv1.GatewayStatus] {
-	routeAttachmentsIndex := krt.NewIndex(routeAttachments, "to", func(o *translator.RouteAttachment) []types.NamespacedName {
-		return []types.NamespacedName{o.To}
+	routeAttachmentsIndex := krt.NewIndex(routeAttachments, "to", func(o *plugins.RouteAttachment) []utils.TypedNamespacedName {
+		return []utils.TypedNamespacedName{o.To}
 	})
 	return krt.NewCollection(
 		gatewayStatuses,
 		func(ctx krt.HandlerContext, i krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus]) *krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus] {
-			tcpRoutes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, config.NamespacedName(i.Obj)))
+			routes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, utils.TypedNamespacedName{
+				Kind: wellknown.GatewayGVK.Kind,
+				NamespacedName: types.NamespacedName{
+					Namespace: i.Obj.Namespace,
+					Name:      i.Obj.Name,
+				},
+			}))
 			counts := map[string]int32{}
-			for _, r := range tcpRoutes {
+			for _, r := range routes {
 				counts[r.ListenerName]++
 			}
 			status := i.Status.DeepCopy()
@@ -209,6 +221,132 @@ func (s *Syncer) buildFinalGatewayStatus(
 				Status: *status,
 			}
 		}, krtopts.ToOptions("GatewayFinalStatus")...)
+}
+
+func (s *Syncer) buildFinalListenerSetStatus(
+	gateways krt.Collection[*translator.GatewayListener],
+	listenerSetStatus krt.StatusCollection[*gwv1.ListenerSet, gwv1.ListenerSetStatus],
+	routeAttachments krt.Collection[*plugins.RouteAttachment],
+	krtopts krtutil.KrtOptions,
+) krt.StatusCollection[*gwv1.ListenerSet, gwv1.ListenerSetStatus] {
+	routeAttachmentsIndex := krt.NewIndex(routeAttachments, "to", func(o *plugins.RouteAttachment) []utils.TypedNamespacedName {
+		return []utils.TypedNamespacedName{o.To}
+	})
+
+	gatewayIndex := krt.NewIndex(gateways, "gateway-parent-section-name", func(gwl *translator.GatewayListener) []utils.SectionedNamespacedName {
+		return []utils.SectionedNamespacedName{{
+			NamespacedName: types.NamespacedName{
+				Namespace: gwl.ParentObject.Namespace,
+				Name:      gwl.ParentObject.Name,
+			},
+			SectionName: gwl.ParentInfo.SectionName,
+		}}
+	}).AsCollection(append(krtopts.ToOptions("gatewayIndex"), utils.SectionedNamespacedNameIndexCollectionFunc)...)
+	return krt.NewCollection(listenerSetStatus,
+		func(ctx krt.HandlerContext, i krt.ObjectWithStatus[*gwv1.ListenerSet, gwv1.ListenerSetStatus]) *krt.ObjectWithStatus[*gwv1.ListenerSet, gwv1.ListenerSetStatus] {
+			// Skip if listenerset not allowed
+			if len(i.Status.Conditions) == 0 || i.Status.Conditions[0].Reason == string(gwv1.ListenerSetReasonNotAllowed) {
+				return &i
+			}
+
+			invalidListenerCount := 0
+			lsStatus := i.Status.DeepCopy()
+			routes := krt.Fetch(ctx, routeAttachments, krt.FilterIndex(routeAttachmentsIndex, utils.TypedNamespacedName{
+				Kind: wellknown.ListenerSetGVK.Kind,
+				NamespacedName: types.NamespacedName{
+					Namespace: i.Obj.Namespace,
+					Name:      i.Obj.Name,
+				},
+			}))
+			counts := map[string]int32{}
+			for _, r := range routes {
+				counts[r.ListenerName]++
+			}
+			for idx, l := range i.Obj.Spec.Listeners {
+				gatewayListener := krt.FetchOne(ctx, gatewayIndex, krt.FilterKey(utils.SectionedNamespacedName{
+					NamespacedName: types.NamespacedName{
+						Namespace: i.Obj.Namespace,
+						Name:      string(i.Obj.Name),
+					},
+					SectionName: l.Name,
+				}.String()))
+				if len(gatewayListener.Objects) == 0 {
+					continue
+				}
+
+				obj := gatewayListener.Objects[0]
+				if !obj.Valid {
+					invalidListenerCount++
+				} else {
+					if obj.Conflict == translator.ListenerConflictHostname {
+						invalidListenerCount++
+						ListenerMessageHostnameConflict := "Found conflicting hostnames on listeners, all listeners on a single port must have unique hostnames"
+						ReportListenerSetListenerConflicts(&lsStatus.Listeners[idx], i.Obj, string(gwv1.ListenerReasonHostnameConflict), ListenerMessageHostnameConflict)
+					} else if obj.Conflict == translator.ListenerConflictProtocol {
+						invalidListenerCount++
+						ListenerMessageProtocolConflict := "Found conflicting protocols on listeners, a single port can only contain listeners with compatible protocols"
+						ReportListenerSetListenerConflicts(&lsStatus.Listeners[idx], i.Obj, string(gwv1.ListenerReasonProtocolConflict), ListenerMessageProtocolConflict)
+					}
+				}
+				lsStatus.Listeners[idx].AttachedRoutes = counts[string(l.Name)]
+			}
+
+			if invalidListenerCount > 0 {
+				listenerSetAccepted := invalidListenerCount < len(i.Obj.Spec.Listeners)
+				ReportListenerSetWithConflicts(lsStatus, i.Obj, listenerSetAccepted)
+			}
+			return &krt.ObjectWithStatus[*gwv1.ListenerSet, gwv1.ListenerSetStatus]{
+				Obj:    i.Obj,
+				Status: *lsStatus,
+			}
+		}, krtopts.ToOptions("ListenerSetFinalStatus")...)
+}
+
+func ReportListenerSetWithConflicts(status *gwv1.ListenerSetStatus, obj *gwv1.ListenerSet, accepted bool) {
+	condition := metav1.ConditionFalse
+	if accepted {
+		condition = metav1.ConditionTrue
+	}
+	programmedReason := gwv1.ListenerSetReasonListenersNotValid
+	if accepted {
+		programmedReason = gwv1.ListenerSetReasonProgrammed
+	}
+	// In case any listeners are invalid, this status should be set even if the gateway / listenerset is accepted
+	// https://github.com/kubernetes-sigs/gateway-api/blob/8fe8316f5792a7830a49c800f89fe689e0df042e/apisx/v1alpha1/xlistenerset_types.go#L396
+	gatewayConditions := map[string]*translator.Condition{
+		string(gwv1.GatewayConditionAccepted): {
+			Status: condition,
+			Reason: string(gwv1.ListenerSetReasonListenersNotValid),
+		},
+		string(gwv1.GatewayConditionProgrammed): {
+			Status: condition,
+			Reason: string(programmedReason),
+		},
+	}
+
+	status.Conditions = translator.SetConditions(obj.Generation, status.Conditions, gatewayConditions)
+}
+
+func ReportListenerSetListenerConflicts(status *gwv1.ListenerEntryStatus, obj *gwv1.ListenerSet, reason string, message string) {
+	gatewayConditions := map[string]*translator.Condition{
+		string(gwv1.ListenerConditionConflicted): {
+			Status:  metav1.ConditionTrue,
+			Reason:  reason,
+			Message: message,
+		},
+		string(gwv1.GatewayConditionAccepted): {
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: message,
+		},
+		string(gwv1.GatewayConditionProgrammed): {
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: message,
+		},
+	}
+
+	status.Conditions = translator.SetConditions(obj.Generation, status.Conditions, gatewayConditions)
 }
 
 func (s *Syncer) buildGatewayCollection(
@@ -238,32 +376,25 @@ func (s *Syncer) buildListenerSetCollection(
 	refGrants translator.ReferenceGrants,
 	krtopts krtutil.KrtOptions,
 ) (
-	krt.StatusCollection[*gatewayx.XListenerSet, gatewayx.ListenerSetStatus],
+	krt.StatusCollection[*gwv1.ListenerSet, gwv1.ListenerSetStatus],
 	krt.Collection[translator.ListenerSet],
 ) {
-	return translator.ListenerSetCollection(
-		s.controllerName,
-		s.agwCollections.XListenerSets,
-		s.agwCollections.Gateways,
-		gatewayClasses,
-		s.agwCollections.Namespaces,
-		refGrants,
-		s.agwCollections.Secrets,
-		s.agwCollections.ConfigMaps,
-		krtopts,
-	)
+	return krt.NewStatusManyCollection(s.agwCollections.ListenerSets,
+		func(ctx krt.HandlerContext, obj *gwv1.ListenerSet) (*gwv1.ListenerSetStatus, []translator.ListenerSet) {
+			return translator.ListenerSetBuilder(
+				ctx, obj,
+				s.controllerName,
+				s.agwCollections.Gateways,
+				gatewayClasses,
+				s.agwCollections.Namespaces,
+				refGrants,
+				s.agwCollections.Secrets,
+				s.agwCollections.ConfigMaps,
+			)
+		}, krtopts.ToOptions("ListenerSets")...)
 }
 
-func (s *Syncer) buildAgwResources(
-	gateways krt.Collection[*translator.GatewayListener],
-	refGrants translator.ReferenceGrants,
-	krtopts krtutil.KrtOptions,
-) (
-	krt.Collection[agwir.AgwResource],
-	krt.Collection[*translator.RouteAttachment],
-	PolicyStatusCollections,
-	krt.StatusCollection[*agentgateway.AgentgatewayBackend, agentgateway.AgentgatewayBackendStatus],
-) {
+func (s *Syncer) buildAgwResources(gateways krt.Collection[*translator.GatewayListener], refGrants translator.ReferenceGrants, krtopts krtutil.KrtOptions) (krt.Collection[agwir.AgwResource], krt.Collection[*plugins.RouteAttachment], plugins.ReferenceIndex, PolicyStatusCollections, krt.StatusCollection[*agentgateway.AgentgatewayBackend, agentgateway.AgentgatewayBackendStatus]) {
 	// filter gateway collections to only include gateways which use a built-in gateway class
 	// (resources for additional gateway classes should be created by the downstream providing them)
 	filteredGateways := krt.NewCollection(gateways, func(ctx krt.HandlerContext, gw *translator.GatewayListener) **translator.GatewayListener {
@@ -281,14 +412,14 @@ func (s *Syncer) buildAgwResources(
 	binds := krt.NewManyCollection(ports, func(ctx krt.HandlerContext, object krt.IndexObject[string, *translator.GatewayListener]) []agwir.AgwResource {
 		port, _ := strconv.Atoi(object.Key)
 		uniq := sets.New[types.NamespacedName]()
-		var protocol = api.Bind_Protocol(0)
+		protocol := api.Bind_Protocol(0)
 		for _, gw := range object.Objects {
 			uniq.Insert(types.NamespacedName{
 				Namespace: gw.ParentGateway.Namespace,
 				Name:      gw.ParentGateway.Name,
 			})
 			// TODO: better handle conflicts of protocols. For now, we arbitrarily treat TLS > plain
-			if gw.Valid {
+			if gw.Conflict == "" {
 				protocol = max(protocol, s.getBindProtocol(gw))
 			}
 		}
@@ -333,16 +464,31 @@ func (s *Syncer) buildAgwResources(
 	if s.agwPlugins.AddResourceExtension != nil && s.agwPlugins.AddResourceExtension.Routes != nil {
 		agwRoutes = krt.JoinCollection([]krt.Collection[agwir.AgwResource]{agwRoutes, s.agwPlugins.AddResourceExtension.Routes})
 	}
+	routeAttachmentsIndex := krt.NewIndex(routeAttachments, "from", func(o *plugins.RouteAttachment) []utils.TypedNamespacedName {
+		return []utils.TypedNamespacedName{o.From}
+	}).AsCollection(append(krtopts.ToOptions("RouteAttachments"), utils.TypedNamespacedNameIndexCollectionFunc)...)
 
-	agwPolicies, policyStatuses := AgwPolicyCollection(s.agwPlugins, ancestorBackends, krtopts)
+	ancestorsIndex := krt.NewIndex(ancestorBackends, "ancestors", func(o *utils.AncestorBackend) []utils.TypedNamespacedName {
+		return []utils.TypedNamespacedName{o.Backend}
+	})
+	ancestorCollection := ancestorsIndex.AsCollection(append(krtopts.ToOptions("AncestorBackend"), utils.TypedNamespacedNameIndexCollectionFunc)...)
+	referenceIndex := plugins.BuildReferenceIndex(ancestorCollection, routeAttachmentsIndex)
+	agwPolicies, policyReferences, policyStatuses := AgwPolicyCollection(s.agwPlugins, referenceIndex, krtopts)
+	backendPolicyReferences := s.newAgwBackendPolicyReferences(s.agwCollections.Backends, krtopts)
+	joinedPolicyReferences := krt.JoinCollection([]krt.Collection[*plugins.PolicyAttachment]{policyReferences, backendPolicyReferences}, krtopts.ToOptions("JoinPolicyAttachment")...)
+	policyReferencesIndex := krt.NewIndex(joinedPolicyReferences, "policyReferences", func(o *plugins.PolicyAttachment) []utils.TypedNamespacedName {
+		return []utils.TypedNamespacedName{o.Backend}
+	})
+	policyReferencesIndexCollection := policyReferencesIndex.AsCollection(append(krtopts.ToOptions("PolicyReferencesIndex"), utils.TypedNamespacedNameIndexCollectionFunc)...)
+	referenceIndex = referenceIndex.WithPolicyAttachments(policyReferencesIndexCollection)
 
 	// Create an agentgateway backend collection from the kgateway backend resources
-	agwBackendStatus, agwBackends := s.newAgwBackendCollection(s.agwCollections.Backends, krtopts)
+	agwBackendStatus, agwBackends := s.newAgwBackendCollection(s.agwCollections.Backends, referenceIndex, krtopts)
 
 	// Join all Agw resources
 	allAgwResources := krt.JoinCollection([]krt.Collection[agwir.AgwResource]{binds, listeners, agwRoutes, agwPolicies, agwBackends}, krtopts.ToOptions("Resources")...)
 
-	return allAgwResources, routeAttachments, policyStatuses, agwBackendStatus
+	return allAgwResources, routeAttachments, referenceIndex, policyStatuses, agwBackendStatus
 }
 
 // buildListenerFromGateway creates a listener resource from a gateway
@@ -369,8 +515,23 @@ func (s *Syncer) buildListenerFromGateway(obj *translator.GatewayListener) *agwi
 	}, translator.AgwListener{l}))
 }
 
+// newAgwBackendPolicyReferences creates the ADP backend collection for agent gateway resources
+func (s *Syncer) newAgwBackendPolicyReferences(
+	finalBackends krt.Collection[*agentgateway.AgentgatewayBackend],
+	krtopts krtutil.KrtOptions,
+) krt.Collection[*plugins.PolicyAttachment] {
+	policyReferences := krt.NewManyCollection(finalBackends, func(ctx krt.HandlerContext, backend *agentgateway.AgentgatewayBackend) []*plugins.PolicyAttachment {
+		return agentgatewaybackend.BuildAgwBackendReferences(backend)
+	}, krtopts.ToOptions("BackendPolicyAttachments")...)
+	return policyReferences
+}
+
 // newAgwBackendCollection creates the ADP backend collection for agent gateway resources
-func (s *Syncer) newAgwBackendCollection(finalBackends krt.Collection[*agentgateway.AgentgatewayBackend], krtopts krtutil.KrtOptions) (
+func (s *Syncer) newAgwBackendCollection(
+	finalBackends krt.Collection[*agentgateway.AgentgatewayBackend],
+	references plugins.ReferenceIndex,
+	krtopts krtutil.KrtOptions,
+) (
 	krt.StatusCollection[*agentgateway.AgentgatewayBackend, agentgateway.AgentgatewayBackendStatus],
 	krt.Collection[agwir.AgwResource],
 ) {
@@ -382,7 +543,7 @@ func (s *Syncer) newAgwBackendCollection(finalBackends krt.Collection[*agentgate
 			Krt:         ctx,
 			Collections: s.agwCollections,
 		}
-		return agentgatewaybackend.TranslateAgwBackend(pc, backend)
+		return agentgatewaybackend.TranslateAgwBackend(pc, backend, references)
 	}, krtopts.ToOptions("Backends")...)
 }
 
@@ -398,6 +559,9 @@ func (s *Syncer) getProtocolAndTLSConfig(obj *translator.GatewayListener) (api.P
 		}
 		if len(obj.TLSInfo.CaCert) > 0 {
 			tlsConfig.Root = obj.TLSInfo.CaCert
+		}
+		if obj.TLSInfo.MtlsFallbackEnabled {
+			tlsConfig.MtlsMode = api.TLSConfig_ALLOW_INSECURE_FALLBACK
 		}
 	}
 
@@ -443,8 +607,9 @@ func (s *Syncer) getBindProtocol(obj *translator.GatewayListener) api.Bind_Proto
 	}
 }
 
-func (s *Syncer) buildAddressCollections(krtopts krtutil.KrtOptions) krt.Collection[Address] {
-	cols := s.agwCollections
+// defaultBuildAddressCollections is the default implementation for building address collections
+// using the istio ambient builder. It can be passed via WithBuildAddressCollections to the syncer.
+func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtutil.KrtOptions) (krt.Collection[Address], func() bool) {
 	opts := krtopts.ToIstio()
 	clusterId := cluster.ID(cols.ClusterID)
 	Networks := ambient.BuildNetworkCollections(cols.Namespaces, cols.Gateways, ambient.Options{
@@ -464,8 +629,17 @@ func (s *Syncer) buildAddressCollections(krtopts krtutil.KrtOptions) krt.Collect
 			return ""
 		},
 	}
-	// Dummy empty mesh config
-	meshConfig := krt.NewStatic[ambient.MeshConfig](&ambient.MeshConfig{MeshConfig: mesh.DefaultMeshConfig()}, true, krtopts.ToOptions("MeshConfig")...)
+
+	meshConfigMapName := GetMeshConfigMapName(cols.IstioRevision)
+	meshConfig := krt.NewSingleton(func(ctx krt.HandlerContext) *ambient.MeshConfig {
+		cm := krt.FetchOne(ctx, cols.ConfigMaps, krt.FilterObjectName(types.NamespacedName{Namespace: cols.IstioNamespace, Name: meshConfigMapName}))
+		if flattened := ptr.Flatten(cm); flattened != nil {
+			if mc := ParseMeshConfigFromConfigMap(flattened); mc != nil {
+				return &ambient.MeshConfig{MeshConfig: mc}
+			}
+		}
+		return &ambient.MeshConfig{MeshConfig: mesh.DefaultMeshConfig()}
+	}, krtopts.ToOptions("IstioMeshConfig")...)
 
 	waypoints := builder.WaypointsCollection(clusterId, cols.Gateways, cols.GatewayClasses, cols.Pods, opts)
 	services := builder.ServicesCollection(
@@ -479,15 +653,14 @@ func (s *Syncer) buildAddressCollections(krtopts krtutil.KrtOptions) krt.Collect
 		true,
 	)
 	// Istio doesn't include InferencePools, but we need them; add our own after the Istio build
-	inferencePoolsInfo := krt.NewCollection(cols.InferencePools, inferencePoolBuilder(),
+	inferencePoolsInfo := krt.NewCollection(cols.InferencePools, InferencePoolBuilder(),
 		krtopts.ToOptions("InferencePools")...)
 	services = krt.JoinCollection([]krt.Collection[model.ServiceInfo]{services, inferencePoolsInfo}, krt.WithJoinUnchecked())
 
-	// TODO: add InferencePools
 	nodeLocality := ambient.NodesCollection(cols.Nodes, opts.WithName("NodeLocality")...)
 	workloads := builder.WorkloadsCollection(
 		cols.Pods,
-		nodeLocality, // NodeLocality,
+		nodeLocality,
 		meshConfig,
 		// Authz/Authn are not use for agentgateway, ignore
 		krt.NewStaticCollection[model.WorkloadAuthorization](nil, nil),
@@ -501,32 +674,15 @@ func (s *Syncer) buildAddressCollections(krtopts krtutil.KrtOptions) krt.Collect
 		opts,
 	)
 
-	// Build address collections
 	workloadAddresses := krt.MapCollection(workloads, func(t model.WorkloadInfo) Address {
-		// If AsAddress is not populated and we have a provider function, use it to populate AsAddress
-		// This is called after WorkloadInfo objects are created from Kubernetes resources by Istio's
-		// ambient workload builder, but before they are wrapped in Address structs for XDS.
-		if t.AsAddress.Address == nil && s.workloadAddressProviderFunc != nil {
-			if addr := s.workloadAddressProviderFunc(t); addr != nil {
-				setWorkloadAddress(&t, addr)
-			}
-		}
 		return Address{Workload: &t}
 	})
 	svcAddresses := krt.MapCollection(services, func(t model.ServiceInfo) Address {
-		// If AsAddress is not populated and we have a provider function, use it to populate AsAddress
-		// This is called after ServiceInfo objects are created from Kubernetes resources by Istio's
-		// ambient service builder, but before they are wrapped in Address structs for XDS.
-		if t.AsAddress.Address == nil && s.serviceAddressProviderFunc != nil {
-			if addr := s.serviceAddressProviderFunc(t); addr != nil {
-				setServiceAddress(&t, addr)
-			}
-		}
 		return Address{Service: &t}
 	})
 
 	adpAddresses := krt.JoinCollection([]krt.Collection[Address]{svcAddresses, workloadAddresses}, krtopts.ToOptions("Addresses")...)
-	return adpAddresses
+	return adpAddresses, func() bool { return true }
 }
 
 func (s *Syncer) buildXDSCollection(
@@ -545,11 +701,16 @@ func (s *Syncer) buildXDSCollection(
 func (s *Syncer) setupSyncDependencies(
 	agwResources krt.Collection[agwir.AgwResource],
 	addresses krt.Collection[Address],
+	additionalSync func() bool,
 ) {
+	if additionalSync == nil {
+		additionalSync = func() bool { return true }
+	}
 	s.waitForSync = []cache.InformerSynced{
 		agwResources.HasSynced,
 		addresses.HasSynced,
 		s.NackPublisher.HasSynced,
+		additionalSync,
 	}
 }
 

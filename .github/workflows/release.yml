@@ -13,16 +13,27 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version number (without v prefix)'
+        required: true
+        type: string
+      extra_tag:
+        description: 'Additional Docker image tag to push (e.g. latest-dev)'
+        required: false
+        default: ''
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
   CI: true
   RUST_VERSION: "1.93.1"
-  GO_VERSION: "1.25.7"
+  GO_VERSION: "1.26.1"
   REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/agentgateway
   CONTROLLER_REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/controller
   # Note: /charts is added to this
-  CHART_REGISTRY_IMAGE_BASE: ghcr.io/${{ github.repository_owner }}
+  CHART_REGISTRY_IMAGE_BASE: ghcr.io/${{ github.repository }}
 
 jobs:
   setup:
@@ -37,8 +48,8 @@ jobs:
         id: version
         run: |
           # Determine version source
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
           else
             VERSION="${{ github.ref_name }}"
           fi
@@ -152,7 +163,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=semver,pattern=v{{version}},value=${{ env.VERSION }}
+            type=raw,value=v${{ env.VERSION }}
+            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
@@ -161,11 +173,15 @@ jobs:
             $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
 
       - name: Sign the container image
-        run: cosign sign --yes ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+        run: cosign sign --yes ${{ env.REGISTRY_IMAGE }}:v${{ env.VERSION }}
+
+      - name: Sign the extra tag
+        if: ${{ inputs.extra_tag != '' }}
+        run: cosign sign --yes ${{ env.REGISTRY_IMAGE }}:${{ inputs.extra_tag }}
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:v${{ env.VERSION }}
 
   musl-build-image:
     runs-on: ${{ matrix.os }}
@@ -274,7 +290,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=semver,pattern=v{{version}},value=${{ env.VERSION }}
+            type=raw,value=v${{ env.VERSION }}
+            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests-musl
@@ -283,11 +300,15 @@ jobs:
             $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
 
       - name: Sign the container image
-        run: cosign sign --yes ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}-musl
+        run: cosign sign --yes ${{ env.REGISTRY_IMAGE }}:v${{ env.VERSION }}-musl
+
+      - name: Sign the extra tag
+        if: ${{ inputs.extra_tag != '' }}
+        run: cosign sign --yes ${{ env.REGISTRY_IMAGE }}:${{ inputs.extra_tag }}-musl
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}-musl
+          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:v${{ env.VERSION }}-musl
 
   build-controller-image:
     runs-on: ${{ matrix.os }}
@@ -427,7 +448,8 @@ jobs:
         with:
           images: ${{ env.CONTROLLER_REGISTRY_IMAGE }}
           tags: |
-            type=semver,pattern=v{{version}},value=${{ env.VERSION }}
+            type=raw,value=v${{ env.VERSION }}
+            type=raw,value=${{ inputs.extra_tag }},enable=${{ inputs.extra_tag != '' }}
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/controller-digests
@@ -436,11 +458,15 @@ jobs:
             $(find . -type f -exec sh -c 'printf "${{ env.CONTROLLER_REGISTRY_IMAGE }}@sha256:%s " "$(basename "$1")"' _ {} \;)
 
       - name: Sign the container image
-        run: cosign sign --yes ${{ env.CONTROLLER_REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+        run: cosign sign --yes ${{ env.CONTROLLER_REGISTRY_IMAGE }}:v${{ env.VERSION }}
+
+      - name: Sign the extra tag
+        if: ${{ inputs.extra_tag != '' }}
+        run: cosign sign --yes ${{ env.CONTROLLER_REGISTRY_IMAGE }}:${{ inputs.extra_tag }}
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.CONTROLLER_REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${{ env.CONTROLLER_REGISTRY_IMAGE }}:v${{ env.VERSION }}
 
   push-helm-charts:
     runs-on: ubuntu-latest
@@ -465,10 +491,12 @@ jobs:
           IMAGE_REGISTRY: ${{ env.CHART_REGISTRY_IMAGE_BASE }}
 
   build:
-    if: ${{ github.event_name == 'push' || ! github.event.inputs.skip_gh_release }}
+    if: ${{ github.event_name != 'workflow_call' && (github.event_name == 'push' || ! github.event.inputs.skip_gh_release) }}
     needs:
       - setup
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     env:
       VERSION: ${{ needs.setup.outputs.version }}
     strategy:
@@ -527,7 +555,7 @@ jobs:
           target/${{ matrix.target }}/release/agentgateway.exe
 
   release:
-    if: ${{ github.event_name == 'push' || ! github.event.inputs.skip_gh_release }}
+    if: ${{ github.event_name != 'workflow_call' && (github.event_name == 'push' || ! github.event.inputs.skip_gh_release) }}
     needs:
     - setup
     - push-image
@@ -574,9 +602,7 @@ jobs:
           * `cr.agentgateway.dev/controller:v${{ env.VERSION }}`
 
           **Helm charts** are available:
-          * `cr.agentgateway.dev/charts/agentgateway:${{ env.VERSION }}`
           * `cr.agentgateway.dev/charts/agentgateway:v${{ env.VERSION }}`
-          * `cr.agentgateway.dev/charts/agentgateway-crds:${{ env.VERSION }}`
           * `cr.agentgateway.dev/charts/agentgateway-crds:v${{ env.VERSION }}`
 
           **Binaries** are available below.

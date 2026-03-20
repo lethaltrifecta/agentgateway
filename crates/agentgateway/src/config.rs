@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::{cmp, env};
 
 use agent_core::durfmt;
+use agent_core::env::ENV;
 use agent_core::prelude::*;
 use secrecy::ExposeSecret;
 use serde::de::DeserializeOwned;
@@ -12,10 +13,10 @@ use serde::de::DeserializeOwned;
 use crate::control::caclient;
 use crate::telemetry::log::{LoggingFields, MetricFields};
 use crate::telemetry::trc;
-use crate::types::discovery::Identity;
+use crate::types::discovery::{Identity, WaypointIdentity};
 use crate::{
-	Address, Config, ConfigSource, NestedRawConfig, RawLoggingLevel, StringOrInt, ThreadingMode,
-	XDSConfig, cel, client, serdes, telemetry,
+	Address, Config, ConfigSource, DnsLookupFamily, NestedRawConfig, RawLoggingLevel, StringOrInt,
+	ThreadingMode, XDSConfig, cel, client, serdes, telemetry,
 };
 
 pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Result<Config> {
@@ -44,7 +45,24 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 		.or(filename)
 		.map(ConfigSource::File);
 
-	let (resolver_cfg, resolver_opts) = hickory_resolver::system_conf::read_system_conf()?;
+	let dns = raw.dns.unwrap_or_default();
+	let dns_lookup_family = match env::var("DNS_LOOKUP_FAMILY") {
+		Ok(val) => Some(DnsLookupFamily::from_env_str(&val)?),
+		Err(_) => None,
+	}
+	.or(dns.lookup_family)
+	.unwrap_or_default();
+	let dns_edns0: Option<bool> = parse("DNS_EDNS0")?.or(dns.edns0);
+	let (resolver_cfg, resolver_opts) = {
+		let (cfg, opts) = hickory_resolver::system_conf::read_system_conf().unwrap_or_else(|e| {
+			warn!(err=?e, "failed to read system DNS config, using defaults");
+			(
+				hickory_resolver::config::ResolverConfig::default(),
+				hickory_resolver::config::ResolverOpts::default(),
+			)
+		});
+		resolve_dns_config(cfg, opts, dns_lookup_family, ipv6_enabled, dns_edns0)
+	};
 	let cluster: String = parse("CLUSTER_ID")?
 		.or(raw.cluster_id.clone())
 		.unwrap_or("Kubernetes".to_string());
@@ -110,12 +128,10 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 	};
 
 	let self_addr = if !xds.namespace.is_empty() && !xds.gateway.is_empty() {
-		// TODO: this is bad
-		Some(strng::format!(
-			"{}.{}.svc.cluster.local",
-			xds.gateway,
-			xds.namespace
-		))
+		Some(WaypointIdentity {
+			gateway: xds.gateway.clone(),
+			namespace: xds.namespace.clone(),
+		})
 	} else {
 		None
 	};
@@ -225,9 +241,13 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 		ThreadingMode::default()
 	};
 
-	let session_encoder = match raw.session {
-		None => crate::http::sessionpersistence::Encoder::base64(),
-		Some(s) => crate::http::sessionpersistence::Encoder::aes(s.key.expose_secret())?,
+	let session_encoder = if let Some(key) = parse::<String>("SESSION_KEY")? {
+		crate::http::sessionpersistence::Encoder::aes(key.trim())?
+	} else {
+		match raw.session.as_ref() {
+			None => crate::http::sessionpersistence::Encoder::base64(),
+			Some(session) => crate::http::sessionpersistence::Encoder::aes(session.key.expose_secret())?,
+		}
 	};
 
 	Ok(crate::Config {
@@ -264,48 +284,77 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 				None => Duration::from_secs(5),
 			},
 		},
-		tracing: trc::Config {
-			endpoint: otlp,
-			headers: otlp_headers,
-			protocol: otlp_protocol,
+		tracing: raw
+			.tracing
+			.clone()
+			.map(|t| {
+				Ok::<_, anyhow::Error>(trc::DeprecatedConfig {
+					endpoint: otlp.clone(),
+					headers: otlp_headers.clone(),
+					protocol: otlp_protocol,
 
-			fields: raw
-				.tracing
+					fields: t
+						.fields
+						.clone()
+						.map(|fields| {
+							Ok::<_, anyhow::Error>(LoggingFields {
+								remove: Arc::new(fields.remove.into_iter().collect()),
+								add: Arc::new(
+									fields
+										.add
+										.iter()
+										.map(|(k, v)| cel::Expression::new_strict(v).map(|v| (k.clone(), Arc::new(v))))
+										.collect::<Result<_, _>>()?,
+								),
+							})
+						})
+						.transpose()?
+						.unwrap_or_default(),
+					random_sampling: t
+						.random_sampling
+						.as_ref()
+						.map(|c| c.0.as_str())
+						.map(cel::Expression::new_strict)
+						.transpose()?
+						.map(Arc::new),
+					client_sampling: t
+						.client_sampling
+						.as_ref()
+						.map(|c| c.0.as_str())
+						.map(cel::Expression::new_strict)
+						.transpose()?
+						.map(Arc::new),
+					path: t.path.clone().unwrap_or_else(|| "/v1/traces".to_string()),
+				})
+			})
+			.transpose()?,
+		metrics: telemetry::log::MetricsConfig {
+			excluded_metrics: raw
+				.metrics
 				.as_ref()
-				.and_then(|f| f.fields.clone())
-				.map(|fields| {
-					Ok::<_, anyhow::Error>(LoggingFields {
-						remove: Arc::new(fields.remove.into_iter().collect()),
-						add: Arc::new(
-							fields
+				.map(|f| {
+					f.remove
+						.clone()
+						.into_iter()
+						.collect::<frozen_collections::FzHashSet<String>>()
+				})
+				.unwrap_or_default(),
+			metric_fields: Arc::new(
+				raw
+					.metrics
+					.and_then(|f| f.fields)
+					.map(|fields| {
+						Ok::<_, anyhow::Error>(MetricFields {
+							add: fields
 								.add
 								.iter()
 								.map(|(k, v)| cel::Expression::new_strict(v).map(|v| (k.clone(), Arc::new(v))))
 								.collect::<Result<_, _>>()?,
-						),
+						})
 					})
-				})
-				.transpose()?
-				.unwrap_or_default(),
-			random_sampling: raw
-				.tracing
-				.as_ref()
-				.and_then(|t| t.random_sampling.as_ref().map(|c| c.0.as_str()))
-				.map(cel::Expression::new_strict)
-				.transpose()?
-				.map(Arc::new),
-			client_sampling: raw
-				.tracing
-				.as_ref()
-				.and_then(|t| t.client_sampling.as_ref().map(|c| c.0.as_str()))
-				.map(cel::Expression::new_strict)
-				.transpose()?
-				.map(Arc::new),
-			path: raw
-				.tracing
-				.as_ref()
-				.and_then(|t| t.path.clone())
-				.unwrap_or_else(|| "/v1/traces".to_string()),
+					.transpose()?
+					.unwrap_or_default(),
+			),
 		},
 		logging: telemetry::log::Config {
 			filter: raw
@@ -342,54 +391,18 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 				})
 				.transpose()?
 				.unwrap_or_default(),
-			excluded_metrics: raw
-				.metrics
-				.as_ref()
-				.map(|f| {
-					f.remove
-						.clone()
-						.into_iter()
-						.collect::<frozen_collections::FzHashSet<String>>()
-				})
-				.unwrap_or_default(),
-			metric_fields: Arc::new(
-				raw
-					.metrics
-					.and_then(|f| f.fields)
-					.map(|fields| {
-						Ok::<_, anyhow::Error>(MetricFields {
-							add: fields
-								.add
-								.iter()
-								.map(|(k, v)| cel::Expression::new_strict(v).map(|v| (k.clone(), Arc::new(v))))
-								.collect::<Result<_, _>>()?,
-						})
-					})
-					.transpose()?
-					.unwrap_or_default(),
-			),
 		},
 		dns: client::Config {
-			// TODO: read from file
 			resolver_cfg,
 			resolver_opts,
 		},
 		proxy_metadata: crate::ProxyMetadata {
-			instance_ip: std::env::var("INSTANCE_IP").unwrap_or_else(|_| "1.1.1.1".to_string()),
-			pod_name: std::env::var("POD_NAME").unwrap_or_else(|_| "".to_string()),
-			pod_namespace: std::env::var("NAMESPACE").unwrap_or_else(|_| "".to_string()),
-			node_name: std::env::var("NODE_NAME").unwrap_or_else(|_| "".to_string()),
-			role: format!(
-				"{ns}~{name}",
-				ns = std::env::var("NAMESPACE").unwrap_or_else(|_| "".to_string()),
-				name = std::env::var("GATEWAY").unwrap_or_else(|_| "".to_string())
-			),
-			node_id: format!(
-				"agentgateway~{ip}~{pod_name}.{ns}~{ns}.svc.cluster.local",
-				ip = std::env::var("INSTANCE_IP").unwrap_or_else(|_| "1.1.1.1".to_string()),
-				pod_name = std::env::var("POD_NAME").unwrap_or_else(|_| "".to_string()),
-				ns = std::env::var("NAMESPACE").unwrap_or_else(|_| "".to_string())
-			),
+			instance_ip: ENV.instance_ip.clone(),
+			pod_name: ENV.pod_name.clone(),
+			pod_namespace: ENV.pod_namespace.clone(),
+			node_name: ENV.node_name.clone(),
+			role: ENV.role.clone(),
+			node_id: ENV.node_id.clone(),
 		},
 		session_encoder,
 		hbone: Arc::new(agent_hbone::Config {
@@ -408,11 +421,9 @@ pub fn parse_config(contents: String, filename: Option<PathBuf>) -> anyhow::Resu
 			frame_size: parse("HTTP2_FRAME_SIZE")?
 				.or(raw.hbone.as_ref().and_then(|h| h.frame_size))
 				.unwrap_or(1024u32 * 1024),
-
 			pool_max_streams_per_conn: parse("POOL_MAX_STREAMS_PER_CONNECTION")?
 				.or(raw.hbone.as_ref().and_then(|h| h.pool_max_streams_per_conn))
 				.unwrap_or(100u16),
-
 			pool_unused_release_timeout: parse_duration("POOL_UNUSED_RELEASE_TIMEOUT")?
 				.or(
 					raw
@@ -544,6 +555,50 @@ fn parse_otlp_headers(
 	}
 }
 
+/// If the resolved config has no nameservers, fall back to defaults while
+/// preserving the original resolver options. Applies the configured
+/// `DnsLookupFamily` as the IP lookup strategy. When `edns0` is `Some`, it
+/// overrides the resolver's EDNS0 setting; when `None`, the system-provided
+/// (or default) value is preserved.
+fn resolve_dns_config(
+	cfg: hickory_resolver::config::ResolverConfig,
+	mut opts: hickory_resolver::config::ResolverOpts,
+	dns_lookup_family: DnsLookupFamily,
+	ipv6_enabled: bool,
+	edns0: Option<bool>,
+) -> (
+	hickory_resolver::config::ResolverConfig,
+	hickory_resolver::config::ResolverOpts,
+) {
+	let resolved_cfg = if cfg.name_servers().is_empty() {
+		warn!(
+			"no DNS nameservers found in system config, using defaults. /etc/hosts entries will still be resolved"
+		);
+		hickory_resolver::config::ResolverConfig::default()
+	} else {
+		cfg
+	};
+	let nameservers: Vec<_> = resolved_cfg
+		.name_servers()
+		.iter()
+		.map(|ns| ns.to_string())
+		.collect();
+
+	let ip_strategy = dns_lookup_family.to_lookup_strategy(ipv6_enabled);
+	opts.ip_strategy = ip_strategy;
+	if let Some(edns0) = edns0 {
+		opts.edns0 = edns0;
+	}
+	info!(
+		nameservers = ?nameservers,
+		dns_lookup_family = ?dns_lookup_family,
+		ip_strategy = ?ip_strategy,
+		edns0 = opts.edns0,
+		"using DNS nameservers"
+	);
+	(resolved_cfg, opts)
+}
+
 fn get_cpu_count() -> anyhow::Result<usize> {
 	// Allow overriding the count with an env var. This can be used to pass the CPU limit on Kubernetes
 	// from the downward API.
@@ -560,10 +615,18 @@ fn get_cpu_count() -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::env;
+	use std::sync::{LazyLock, Mutex};
+
+	static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+	fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+		ENV_LOCK.lock().expect("env mutex poisoned")
+	}
 
 	#[test]
 	fn test_parse_otlp_headers() {
-		use std::env;
+		let _env_lock = lock_env();
 
 		unsafe {
 			// Test JSON format
@@ -610,5 +673,172 @@ mod tests {
 
 		// Test missing env var
 		assert_eq!(parse_otlp_headers("NONEXISTENT_VAR").unwrap(), None);
+	}
+
+	#[test]
+	fn session_key_env_overrides_inline_session_config() {
+		let _env_lock = lock_env();
+
+		let env_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+		let inline_key = "f1e1d1c1b1a1918171615141312111000f0e0d0c0b0a09080706050403020100";
+
+		unsafe {
+			env::set_var("SESSION_KEY", env_key);
+		}
+
+		let config = parse_config(
+			format!(
+				r#"
+config:
+  session:
+    key: "{inline_key}"
+"#
+			),
+			None,
+		)
+		.expect("config should parse");
+
+		let state = crate::http::sessionpersistence::SessionState::HTTP(
+			crate::http::sessionpersistence::HTTPSessionState {
+				backend: "127.0.0.1:8080".parse().expect("socket addr"),
+			},
+		);
+		let encoded = state.encode(&config.session_encoder).expect("encode state");
+
+		let env_encoder =
+			crate::http::sessionpersistence::Encoder::aes(env_key).expect("encoder from env");
+		let inline_encoder =
+			crate::http::sessionpersistence::Encoder::aes(inline_key).expect("inline encoder");
+
+		assert!(crate::http::sessionpersistence::SessionState::decode(&encoded, &env_encoder).is_ok());
+		assert!(
+			crate::http::sessionpersistence::SessionState::decode(&encoded, &inline_encoder).is_err()
+		);
+
+		unsafe {
+			env::remove_var("SESSION_KEY");
+		}
+	}
+
+	#[test]
+	fn resolve_dns_config_uses_defaults_when_nameservers_empty() {
+		let empty_cfg = hickory_resolver::config::ResolverConfig::from_parts(
+			None,
+			vec![],
+			hickory_resolver::config::NameServerConfigGroup::new(),
+		);
+		let mut custom_opts = hickory_resolver::config::ResolverOpts::default();
+		custom_opts.ndots = 42;
+
+		let (resolved_cfg, resolved_opts) = resolve_dns_config(
+			empty_cfg,
+			custom_opts,
+			DnsLookupFamily::default(),
+			true,
+			None,
+		);
+
+		assert!(
+			!resolved_cfg.name_servers().is_empty(),
+			"should fall back to default config with nameservers"
+		);
+		assert_eq!(resolved_opts.ndots, 42, "should preserve original opts");
+	}
+
+	#[test]
+	fn resolve_dns_config_keeps_valid_config() {
+		let valid_cfg = hickory_resolver::config::ResolverConfig::default();
+		let mut custom_opts = hickory_resolver::config::ResolverOpts::default();
+		custom_opts.ndots = 7;
+
+		let original_count = valid_cfg.name_servers().len();
+		let (resolved_cfg, resolved_opts) = resolve_dns_config(
+			valid_cfg,
+			custom_opts,
+			DnsLookupFamily::default(),
+			true,
+			None,
+		);
+
+		assert_eq!(
+			resolved_cfg.name_servers().len(),
+			original_count,
+			"should keep original nameservers"
+		);
+		assert_eq!(resolved_opts.ndots, 7, "should preserve original opts");
+	}
+
+	#[rstest::rstest]
+	#[case(
+		DnsLookupFamily::V4Only,
+		true,
+		hickory_resolver::config::LookupIpStrategy::Ipv4Only
+	)]
+	#[case(
+		DnsLookupFamily::V6Only,
+		false,
+		hickory_resolver::config::LookupIpStrategy::Ipv6Only
+	)]
+	#[case(
+		DnsLookupFamily::Auto,
+		false,
+		hickory_resolver::config::LookupIpStrategy::Ipv4Only
+	)]
+	#[case(
+		DnsLookupFamily::Auto,
+		true,
+		hickory_resolver::config::LookupIpStrategy::Ipv4thenIpv6
+	)]
+	fn resolve_dns_config_ip_strategy(
+		#[case] family: DnsLookupFamily,
+		#[case] ipv6_enabled: bool,
+		#[case] expected: hickory_resolver::config::LookupIpStrategy,
+	) {
+		let cfg = hickory_resolver::config::ResolverConfig::default();
+		let opts = hickory_resolver::config::ResolverOpts::default();
+
+		let (_, resolved_opts) = resolve_dns_config(cfg, opts, family, ipv6_enabled, None);
+
+		assert_eq!(resolved_opts.ip_strategy, expected);
+	}
+
+	#[rstest::rstest]
+	#[case(false, None, false)]
+	#[case(false, Some(true), true)]
+	#[case(true, Some(false), false)]
+	fn resolve_dns_config_edns0(
+		#[case] initial_edns0: bool,
+		#[case] edns0_param: Option<bool>,
+		#[case] expected: bool,
+	) {
+		let cfg = hickory_resolver::config::ResolverConfig::default();
+		let mut opts = hickory_resolver::config::ResolverOpts::default();
+		opts.edns0 = initial_edns0;
+
+		let (_, resolved_opts) =
+			resolve_dns_config(cfg, opts, DnsLookupFamily::default(), true, edns0_param);
+
+		assert_eq!(resolved_opts.edns0, expected);
+	}
+
+	#[test]
+	fn session_key_env_enables_aes_session_encoder() {
+		let _env_lock = lock_env();
+
+		let session_key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+		unsafe {
+			env::set_var("SESSION_KEY", session_key);
+		}
+
+		let config = parse_config("{}".to_string(), None).expect("config should parse");
+		assert!(matches!(
+			config.session_encoder,
+			crate::http::sessionpersistence::Encoder::Aes(_)
+		));
+
+		unsafe {
+			env::remove_var("SESSION_KEY");
+		}
 	}
 }

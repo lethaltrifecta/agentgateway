@@ -84,6 +84,46 @@ impl fmt::Display for NamespacedHostname {
 	}
 }
 
+/// Structured identity for a waypoint proxy, used for self-verification
+/// when routing HBONE waypoint traffic.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WaypointIdentity {
+	pub gateway: Strng,
+	pub namespace: Strng,
+}
+
+impl WaypointIdentity {
+	/// Returns the full Kubernetes FQDN for this waypoint.
+	pub fn hostname(&self) -> Strng {
+		strng::format!("{}.{}.svc.cluster.local", self.gateway, self.namespace)
+	}
+
+	/// Checks whether this waypoint identity matches a NamespacedHostname waypoint destination.
+	/// The hostname from xDS is always a FQDN (e.g., "waypoint.ns.svc.cluster.local").
+	pub fn matches_hostname(&self, nh: &NamespacedHostname) -> bool {
+		nh.hostname == self.hostname()
+	}
+
+	/// Checks whether this waypoint identity matches an Address-based waypoint destination
+	/// by looking up this waypoint's own service VIPs.
+	pub fn matches_address(
+		&self,
+		addr: &NetworkAddress,
+		get_self_vips: impl FnOnce(&Strng, &Strng) -> Option<Vec<NetworkAddress>>,
+	) -> bool {
+		match get_self_vips(&self.namespace, &self.hostname()) {
+			Some(vips) => vips.contains(addr),
+			None => {
+				warn!(
+					"waypoint {}.{} cannot find own service for address verification",
+					self.gateway, self.namespace
+				);
+				false
+			},
+		}
+	}
+}
+
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct NetworkAddress {
 	pub network: Strng,
@@ -443,6 +483,15 @@ impl Service {
 	pub fn port_is_http1(&self, port: u16) -> bool {
 		matches!(self.app_protocols.get(&port), Some(AppProtocol::Http11))
 	}
+	pub fn port_is_tcp(&self, port: u16) -> bool {
+		matches!(
+			self.app_protocols.get(&port),
+			Some(AppProtocol::Tcp | AppProtocol::Tls)
+		)
+	}
+	pub fn port_is_tls(&self, port: u16) -> bool {
+		matches!(self.app_protocols.get(&port), Some(AppProtocol::Tls))
+	}
 	pub fn namespaced_hostname(&self) -> NamespacedHostname {
 		NamespacedHostname {
 			namespace: self.namespace.clone(),
@@ -464,6 +513,8 @@ pub enum AppProtocol {
 	Http11,
 	Http2,
 	Grpc,
+	Tls,
+	Tcp,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -570,28 +621,25 @@ impl From<workload::WorkloadStatus> for HealthStatus {
 		}
 	}
 }
-impl From<&PortList> for HashMap<u16, u16> {
-	fn from(value: &PortList) -> Self {
-		value
-			.ports
-			.iter()
-			.map(|p| (p.service_port as u16, p.target_port as u16))
-			.collect()
-	}
+
+pub fn ports_from_xds(value: &PortList) -> HashMap<u16, u16> {
+	value
+		.ports
+		.iter()
+		.map(|p| (p.service_port as u16, p.target_port as u16))
+		.collect()
 }
 
-impl From<HashMap<u16, u16>> for PortList {
-	fn from(value: HashMap<u16, u16>) -> Self {
-		PortList {
-			ports: value
-				.iter()
-				.map(|(k, v)| Port {
-					service_port: *k as u32,
-					app_protocol: 0,
-					target_port: *v as u32,
-				})
-				.collect(),
-		}
+pub fn port_list_from_ports(value: HashMap<u16, u16>) -> PortList {
+	PortList {
+		ports: value
+			.iter()
+			.map(|(k, v)| Port {
+				service_port: *k as u32,
+				app_protocol: 0,
+				target_port: *v as u32,
+			})
+			.collect(),
 	}
 }
 
@@ -622,17 +670,15 @@ impl TryFrom<&XdsGatewayAddress> for GatewayAddress {
 	}
 }
 
-impl TryFrom<XdsWorkload> for Workload {
-	type Error = ProtoError;
-	fn try_from(resource: XdsWorkload) -> Result<Self, Self::Error> {
-		let (w, _): (Workload, HashMap<String, PortList>) = resource.try_into()?;
+impl Workload {
+	pub fn try_from_xds(resource: XdsWorkload) -> Result<Self, ProtoError> {
+		let (w, _) = Self::try_from_xds_with_services(resource)?;
 		Ok(w)
 	}
-}
 
-impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
-	type Error = ProtoError;
-	fn try_from(resource: XdsWorkload) -> Result<Self, Self::Error> {
+	pub fn try_from_xds_with_services(
+		resource: XdsWorkload,
+	) -> Result<(Self, HashMap<String, PortList>), ProtoError> {
 		let wp = match &resource.waypoint {
 			Some(w) => Some(GatewayAddress::try_from(w)?),
 			None => None,
@@ -784,7 +830,7 @@ impl TryFrom<&XdsService> for Service {
 			.iter()
 			.map(|p| {
 				let ap = workload::AppProtocol::try_from(p.app_protocol)?;
-				let ap = <Option<AppProtocol>>::from(ap);
+				let ap = app_protocol_from_xds(ap);
 				Ok(ap.map(|ap| (p.service_port as u16, ap)))
 			})
 			.filter_map(|v| match v {
@@ -793,16 +839,15 @@ impl TryFrom<&XdsService> for Service {
 				Err(e) => Some(Err(e)),
 			})
 			.collect::<Result<HashMap<_, _>, ProtoError>>()?;
-		let ip_families = workload::IpFamilies::try_from(s.ip_families)?.into();
+		let ip_families = ip_family_from_xds(workload::IpFamilies::try_from(s.ip_families)?);
 		let svc = Service {
 			name: Strng::from(&s.name),
 			namespace: Strng::from(&s.namespace),
 			hostname: Strng::from(&s.hostname),
 			vips: nw_addrs,
-			ports: (&PortList {
+			ports: ports_from_xds(&PortList {
 				ports: s.ports.clone(),
-			})
-				.into(),
+			}),
 			app_protocols,
 			endpoints: Default::default(), // Will be populated once inserted into the store.
 			subject_alt_names: s.subject_alt_names.iter().map(strng::new).collect(),
@@ -814,25 +859,23 @@ impl TryFrom<&XdsService> for Service {
 	}
 }
 
-impl From<workload::IpFamilies> for Option<IpFamily> {
-	fn from(value: workload::IpFamilies) -> Self {
-		match value {
-			workload::IpFamilies::Automatic => None,
-			workload::IpFamilies::Ipv4Only => Some(IpFamily::IPv4),
-			workload::IpFamilies::Ipv6Only => Some(IpFamily::IPv6),
-			workload::IpFamilies::Dual => Some(IpFamily::Dual),
-		}
+pub fn ip_family_from_xds(value: workload::IpFamilies) -> Option<IpFamily> {
+	match value {
+		workload::IpFamilies::Automatic => None,
+		workload::IpFamilies::Ipv4Only => Some(IpFamily::IPv4),
+		workload::IpFamilies::Ipv6Only => Some(IpFamily::IPv6),
+		workload::IpFamilies::Dual => Some(IpFamily::Dual),
 	}
 }
 
-impl From<workload::AppProtocol> for Option<AppProtocol> {
-	fn from(value: workload::AppProtocol) -> Self {
-		match value {
-			workload::AppProtocol::Unknown => None,
-			workload::AppProtocol::Http11 => Some(AppProtocol::Http11),
-			workload::AppProtocol::Http2 => Some(AppProtocol::Http2),
-			workload::AppProtocol::Grpc => Some(AppProtocol::Grpc),
-		}
+pub fn app_protocol_from_xds(value: workload::AppProtocol) -> Option<AppProtocol> {
+	match value {
+		workload::AppProtocol::Unknown => None,
+		workload::AppProtocol::Http11 => Some(AppProtocol::Http11),
+		workload::AppProtocol::Tls => Some(AppProtocol::Tls),
+		workload::AppProtocol::Http2 => Some(AppProtocol::Http2),
+		workload::AppProtocol::Grpc => Some(AppProtocol::Grpc),
+		workload::AppProtocol::Tcp => Some(AppProtocol::Tcp),
 	}
 }
 

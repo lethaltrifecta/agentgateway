@@ -20,7 +20,6 @@ use hyper::rt::Timer;
 use hyper::{Method, Request, Response, Uri, Version};
 use tracing::{debug, trace, warn};
 
-use super::connect::capture::CaptureConnectionExtension;
 use super::connect::{Alpn, Connect, Connected, Connection};
 use super::pool::{self, Ver};
 use crate::common::future::poll_fn;
@@ -259,10 +258,6 @@ where
 			.map_err(TrySendError::Nope)?;
 		let mut req = Request::from_parts(parts, body);
 
-		if let Some(conn) = req.extensions_mut().get_mut::<CaptureConnectionExtension>() {
-			conn.set(&pooled.conn_info);
-		}
-
 		if pooled.is_http1() {
 			if req.version() == Version::HTTP_2 {
 				// This means we negotiated down in ALPN
@@ -275,7 +270,10 @@ where
 				req.headers_mut().entry(HOST).or_insert_with(|| {
 					let hostname = uri.host().expect("authority implies host");
 					if let Some(port) = get_non_default_port(&uri) {
-						let s = format!("{hostname}:{port}");
+						let mut s = String::with_capacity(hostname.len() + port.as_str().len() + 1);
+						s.push_str(hostname);
+						s.push(':');
+						s.push_str(port.as_str());
 						HeaderValue::from_str(&s)
 					} else {
 						HeaderValue::from_str(hostname)

@@ -82,6 +82,19 @@ fn json_field() {
 }
 
 #[test]
+fn unvalidated_jwt_payload() {
+	let expr = r#"unvalidatedJwtPayload("eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjMiLCJhZG1pbiI6dHJ1ZX0.")"#;
+	assert(json!({"sub": "123", "admin": true}), expr);
+	// This payload contains a `-` in the encoded JWT segment, so it verifies we use
+	// base64url decoding rather than standard base64.
+	let expr = r#"unvalidatedJwtPayload("eyJhbGciOiJub25lIn0.eyJkYXRhIjoifn5-In0.").data"#;
+	assert(json!("~~~"), expr);
+
+	assert_fails(r#"unvalidatedJwtPayload("not-a-jwt")"#);
+	assert_fails(r#"unvalidatedJwtPayload("a.b.c")"#);
+}
+
+#[test]
 fn random() {
 	let expr = r#"int(random() * 10.0)"#;
 	let v = eval_with_optimizations_check(expr, false)
@@ -97,8 +110,25 @@ fn random() {
 fn base64() {
 	let expr = r#"base64.encode('hello')"#;
 	assert(json!("aGVsbG8="), expr);
+	// Test old format
+	let expr = r#"base64Encode('hello')"#;
+	assert(json!("aGVsbG8="), expr);
+
+	let expr = r#"string(base64.decode("aGVsbG8="))"#;
+	assert(json!("hello"), expr);
+
 	let expr = r#"string(base64.decode(base64.encode("hello")))"#;
 	assert(json!("hello"), expr);
+	// Test old format as well
+	let expr = r#"string(base64Decode(base64Encode("hello")))"#;
+	assert(json!("hello"), expr);
+
+	// Unadded
+	let expr = r#"string(base64.decode('Zg=='))"#;
+	assert(json!("f"), expr);
+	// Padded
+	let expr = r#"string(base64.decode('Zg'))"#;
+	assert(json!("f"), expr);
 }
 
 #[test]
@@ -107,6 +137,59 @@ fn map_values() {
 	assert(json!({"a": 2, "b": 4}), expr);
 	let expr = r#"vars.mapValues(v, v +  ' hi')"#;
 	assert(json!({"bar": "world hi", "foo": "hello hi"}), expr);
+}
+
+#[test]
+fn filter_keys() {
+	// Basic: keep only key "a"
+	assert(
+		json!({"a": 1}),
+		r#"{"a": 1, "b": 2}.filterKeys(k, k == "a")"#,
+	);
+	// Prefix allowlist (primary use case)
+	assert(
+		json!({"model": "gpt", "messages": []}),
+		r#"{"model": "gpt", "messages": [], "secret": "x"}.filterKeys(k, k == "model" || k == "messages")"#,
+	);
+	// Prefix removal via inverted predicate (replaces removeKeys)
+	assert(
+		json!({"model": "y"}),
+		r#"{"anthropic_ver": "x", "model": "y"}.filterKeys(k, !k.startsWith("anthropic_"))"#,
+	);
+	// No keys match — empty result
+	assert(json!({}), r#"{"a": 1}.filterKeys(k, k == "z")"#);
+	// All keys match — all kept
+	assert(
+		json!({"a": 1, "b": 2}),
+		r#"{"a": 1, "b": 2}.filterKeys(k, true)"#,
+	);
+	// None match (false) — empty result
+	assert(json!({}), r#"{"a": 1, "b": 2}.filterKeys(k, false)"#);
+	// Nested values preserved
+	assert(
+		json!({"a": {"x": 1}}),
+		r#"{"a": {"x": 1}, "b": 2}.filterKeys(k, k != "b")"#,
+	);
+	// Chaining filterKeys with itself
+	assert(
+		json!({"a": 1}),
+		r#"{"a": 1, "b": 2, "c": 3}.filterKeys(k, k != "c").filterKeys(k, k == "a")"#,
+	);
+	// Chaining with mapValues
+	assert(
+		json!({"a": 2}),
+		r#"{"a": 1, "secret": 99}.filterKeys(k, k != "secret").mapValues(v, v * 2)"#,
+	);
+	// Empty map input
+	assert(json!({}), r#"{}.filterKeys(k, true)"#);
+	// Predicate that errors propagates failure
+	assert_fails(r#"{"a": 1}.filterKeys(k, k / 0)"#);
+	// Dynamic variable receiver
+	assert(json!({"bar": "world"}), r#"vars.filterKeys(k, k != "foo")"#);
+	// Non-bool predicate fails
+	assert_fails(r#"{"a": 1}.filterKeys(k, 42)"#);
+	// Non-map receiver fails
+	assert_fails(r#"[1, 2].filterKeys(k, true)"#);
 }
 
 #[test]
@@ -122,6 +205,28 @@ fn default() {
 
 	// default() should not materialize
 	eval_non_static("default(a.b, vars)", |r| {
+		assert_matches!(r, Value::Dynamic(_));
+	})
+	.unwrap();
+}
+
+#[test]
+fn coalesce() {
+	let expr = r#"coalesce(a, "b")"#;
+	assert(json!("b"), expr);
+	let expr = r#"coalesce({"a":1}["b"], {"a":2}["a"], 3)"#;
+	assert(json!(2), expr);
+	let expr = r#"coalesce(fail("bad"), 1 / 0, "fallback")"#;
+	assert(json!("fallback"), expr);
+	let expr = r#"coalesce(null, "fallback")"#;
+	assert(json!("fallback"), expr);
+	let expr = r#"coalesce(null)"#;
+	assert(json!(null), expr);
+	assert_fails(r#"coalesce(fail("bad"), 1 / 0)"#);
+	assert_fails(r#"coalesce()"#);
+
+	// coalesce() should not materialize the selected value
+	eval_non_static("coalesce(fail('bad'), vars)", |r| {
 		assert_matches!(r, Value::Dynamic(_));
 	})
 	.unwrap();
@@ -336,7 +441,7 @@ fn assert(want: serde_json::Value, expr: &str) {
 	assert_eq!(
 		want,
 		eval(expr)
-			.unwrap_or_else(|_| panic!("{expr}"))
+			.unwrap_or_else(|e| panic!("{expr}: {e}"))
 			.json()
 			.unwrap(),
 		"expression: {expr}"

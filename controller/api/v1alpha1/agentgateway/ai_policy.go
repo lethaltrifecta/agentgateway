@@ -21,7 +21,7 @@ import (
 // ```yaml
 //
 //	name: openai-opt
-//	namespace: kgateway-system
+//	namespace: agentgateway-system
 //
 // spec:
 //

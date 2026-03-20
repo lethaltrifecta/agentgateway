@@ -41,9 +41,9 @@ fn build_test_request() -> crate::http::Request {
 		protocol: BackendProtocol::http,
 	};
 	req.extensions_mut().insert(backend);
-	req
-		.extensions_mut()
-		.insert(RequestStartTime("now".to_string()));
+	req.extensions_mut().insert(RequestTime(
+		chrono::DateTime::parse_from_rfc3339("2000-01-01T12:00:00Z").unwrap(),
+	));
 
 	// Add LLM context
 	let llm = LLMContext {
@@ -78,6 +78,15 @@ fn test_snapshot_matches_ref() {
 	let ref_executor = Executor::new_request(&req);
 
 	assert_eq!(exec_to_json(&ref_executor), exec_to_json(&snapshot_exec));
+}
+
+#[test]
+fn test_request_start_time_is_native_timestamp() {
+	let req = build_test_request();
+	let executor = Executor::new_request(&req);
+	let expr = Expression::new_strict("request.startTime.getFullYear() == 2000").unwrap();
+
+	assert!(executor.eval_bool(&expr));
 }
 
 #[test]
@@ -137,6 +146,18 @@ fn test_executor_serde_complete() {
 
 	let json3 = exec_to_json(&executor2);
 	assert_eq!(json1, json3, "Round-trip serialization mismatch");
+}
+
+#[test]
+fn test_env() {
+	let exec = full_example_executor();
+	let executor = exec.as_executor();
+	let expr = Expression::new_strict(
+		"env.podName == 'pod-1' && env.namespace == 'ns-1' && env.gateway == 'gw-1'",
+	)
+	.unwrap();
+
+	assert!(executor.eval_bool(&expr));
 }
 
 fn exec_to_json(exec: &Executor) -> serde_json::Value {

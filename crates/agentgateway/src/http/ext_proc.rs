@@ -18,16 +18,16 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cel::{Executor, Expression, RequestSnapshot};
 use crate::client::ResolvedDestination;
+use crate::http::envoy_proto_common;
 use crate::http::ext_proc::proto::{
 	BodyMutation, BodyResponse, HeaderMutation, HeaderValueOption, HeadersResponse, HttpBody,
 	HttpHeaders, HttpTrailers, ImmediateResponse, Metadata, ProcessingRequest, ProcessingResponse,
 	processing_response,
 };
-use crate::http::filters::BackendRequestTimeout;
-use crate::http::{HeaderName, HeaderOrPseudo, HeaderValue, PolicyResponse};
+use crate::http::{HeaderName, HeaderOrPseudo, PolicyResponse};
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
-use crate::types::agent::SimpleBackendReference;
+use crate::types::agent::{BackendPolicy, SimpleBackendReference};
 use crate::*;
 
 /// The namespace key used for ext_proc attributes in ProcessingRequest.attributes
@@ -62,7 +62,10 @@ pub struct ExtProcDynamicMetadata(serde_json::Map<String, JsonValue>);
 #[allow(warnings)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub mod proto {
-	tonic::include_proto!("envoy.service.ext_proc.v3");
+	pub use protos::envoy::service::common::v3::{
+		HeaderValue, HeaderValueOption, HttpStatus, Metadata, StatusCode, header_value_option,
+	};
+	pub use protos::envoy::service::ext_proc::v3::*;
 }
 
 #[apply(schema!)]
@@ -90,6 +93,7 @@ impl InferenceRouting {
 		InferencePoolRouter {
 			ext_proc: Some(ExtProcInstance::new(
 				client,
+				Vec::new(),
 				self.target.clone(),
 				self.failure_mode,
 				None,
@@ -141,6 +145,14 @@ pub struct ExtProc {
 	/// Reference to the external processing service backend
 	#[serde(flatten)]
 	pub target: Arc<SimpleBackendReference>,
+	/// Policies to connect to the backend
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[serde(deserialize_with = "crate::types::local::de_from_local_backend_policy")]
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "Option<crate::types::local::SimpleLocalBackendPolicies>")
+	)]
+	pub policies: Vec<BackendPolicy>,
 	/// Behavior when the ext_proc service is unavailable or returns an error
 	#[serde(default)]
 	pub failure_mode: FailureMode,
@@ -163,6 +175,7 @@ impl ExtProc {
 		ExtProcRequest {
 			ext_proc: Some(ExtProcInstance::new(
 				client,
+				self.policies.clone(),
 				self.target.clone(),
 				self.failure_mode,
 				self.metadata_context.clone(),
@@ -242,6 +255,7 @@ struct ExtProcInstance {
 impl ExtProcInstance {
 	fn new(
 		client: PolicyClient,
+		policies: Vec<BackendPolicy>,
 		target: Arc<SimpleBackendReference>,
 		failure_mode: FailureMode,
 		metadata_context: Option<HashMap<String, HashMap<String, Arc<cel::Expression>>>>,
@@ -252,7 +266,7 @@ impl ExtProcInstance {
 		let chan = GrpcReferenceChannel {
 			target,
 			client,
-			timeout: None,
+			policies: Arc::new(policies),
 		};
 		let mut c = proto::external_processor_client::ExternalProcessorClient::new(chan);
 		let (tx_req, rx_req) = tokio::sync::mpsc::channel(10);
@@ -716,7 +730,7 @@ impl ExtProcInstance {
 
 		// Merge new fields into existing metadata
 		for (key, value) in &metadata.fields {
-			let json_val = serde_json::to_value(value).map_err(|e| {
+			let json_val = envoy_proto_common::prost_value_to_json(value).map_err(|e| {
 				Error::MetadataConversion(format!("failed to convert key '{}': {}", key, e))
 			})?;
 			dynamic_metadata.0.insert(key.clone(), json_val);
@@ -823,9 +837,7 @@ fn apply_header_with_action(
 	hk: &HeaderName,
 	hvo: &HeaderValueOption,
 ) -> Result<(), Error> {
-	use crate::http::ext_proc::proto::header_value_option::HeaderAppendAction;
-
-	let Some(ref h) = hvo.header else {
+	let Some(_) = hvo.header else {
 		return Ok(());
 	};
 
@@ -836,56 +848,7 @@ fn apply_header_with_action(
 		return Ok(());
 	}
 
-	let hv = if h.raw_value.is_empty() {
-		HeaderValue::from_bytes(h.value.as_bytes())
-	} else {
-		HeaderValue::from_bytes(&h.raw_value)
-	};
-	let Ok(hv) = hv else {
-		warn!("Invalid header value for key: {}", hk);
-		return Ok(());
-	};
-
-	// Determine the action to take.
-	// If append_action is explicitly set (non-zero), use it.
-	// If append_action is default (0), fallback to deprecated append (default=false to overwrite).
-	let action = if hvo.append_action == 0 {
-		match hvo.append {
-			Some(true) => HeaderAppendAction::AppendIfExistsOrAdd,
-			_ => HeaderAppendAction::OverwriteIfExistsOrAdd,
-		}
-	} else {
-		match HeaderAppendAction::try_from(hvo.append_action) {
-			Ok(action) => action,
-			Err(_) => {
-				warn!(
-					"Unexpected header append_action `{:?}` falling back to APPEND_IF_EXISTS_OR_ADD",
-					hvo.append_action
-				);
-				HeaderAppendAction::AppendIfExistsOrAdd
-			},
-		}
-	};
-
-	match action {
-		HeaderAppendAction::AppendIfExistsOrAdd => {
-			headers.append(hk, hv);
-		},
-		HeaderAppendAction::AddIfAbsent => {
-			if !headers.contains_key(hk) {
-				headers.insert(hk, hv);
-			}
-		},
-		HeaderAppendAction::OverwriteIfExistsOrAdd => {
-			headers.insert(hk, hv);
-		},
-		HeaderAppendAction::OverwriteIfExists => {
-			if headers.contains_key(hk) {
-				headers.insert(hk, hv);
-			}
-		},
-	}
-
+	let _ = envoy_proto_common::apply_header_value_option(headers, hk, hvo);
 	Ok(())
 }
 
@@ -920,14 +883,9 @@ fn apply_header_mutations_request(
 				Ok(HeaderOrPseudo::Header(hk)) => {
 					apply_header_with_action(req.headers_mut(), &hk, set)?;
 				},
-				Ok(pseudo) => {
-					let raw = if !h.raw_value.is_empty() {
-						h.raw_value.as_slice()
-					} else {
-						h.value.as_bytes()
-					};
+				Ok(_) => {
 					let mut rr = crate::http::RequestOrResponse::Request(req);
-					let _ = crate::http::apply_header_or_pseudo(&mut rr, &pseudo, raw);
+					let _ = envoy_proto_common::apply_pseudo_header_option(&mut rr, set);
 				},
 				Err(_) => {},
 			}
@@ -950,14 +908,9 @@ fn apply_header_mutations_response(
 				Ok(crate::http::HeaderOrPseudo::Header(hk)) => {
 					apply_header_with_action(resp.headers_mut(), &hk, set)?;
 				},
-				Ok(pseudo) => {
-					let raw = if !h.raw_value.is_empty() {
-						h.raw_value.as_slice()
-					} else {
-						h.value.as_bytes()
-					};
+				Ok(_) => {
 					let mut rr = crate::http::RequestOrResponse::Response(resp);
-					let _ = crate::http::apply_header_or_pseudo(&mut rr, &pseudo, raw);
+					let _ = envoy_proto_common::apply_pseudo_header_option(&mut rr, set);
 				},
 				Err(_) => {},
 			}
@@ -1073,7 +1026,7 @@ fn eval_expression(exec: &Executor, v: &Expression) -> Result<prost_wkt_types::V
 	let js = res
 		.json()
 		.map_err(|_| ProxyError::Processing(cel::Error::JsonConvert.into()))?;
-	serde_json::from_value(js).map_err(|e| ProxyError::Processing(e.into()))
+	envoy_proto_common::json_to_prost_value(js)
 }
 
 fn eval_to_struct(
@@ -1098,25 +1051,27 @@ fn eval_to_struct(
 pub struct GrpcReferenceChannel {
 	pub target: Arc<SimpleBackendReference>,
 	pub client: PolicyClient,
-	pub timeout: Option<Duration>,
+	pub policies: Arc<Vec<BackendPolicy>>,
 }
 
 impl tower::Service<::http::Request<tonic::body::Body>> for GrpcReferenceChannel {
 	type Response = http::Response;
-	type Error = anyhow::Error;
+	type Error = ProxyError;
 	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
 	fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		Ok(()).into()
 	}
 
-	fn call(&mut self, mut req: ::http::Request<tonic::body::Body>) -> Self::Future {
-		if let Some(timeout) = self.timeout {
-			req.extensions_mut().insert(BackendRequestTimeout(timeout));
-		};
+	fn call(&mut self, req: ::http::Request<tonic::body::Body>) -> Self::Future {
 		let client = self.client.clone();
 		let target = self.target.clone();
+		let policies = self.policies.clone();
 		let req = req.map(http::Body::new);
-		Box::pin(async move { Ok(client.call_reference(req, &target).await?) })
+		Box::pin(async move {
+			client
+				.call_reference_with_policies(req, &target, policies.as_slice())
+				.await
+		})
 	}
 }

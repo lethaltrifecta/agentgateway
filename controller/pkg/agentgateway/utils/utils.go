@@ -8,6 +8,7 @@ import (
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/ptr"
 	"k8s.io/apimachinery/pkg/types"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/agentgateway/agentgateway/api"
 	"github.com/agentgateway/agentgateway/controller/pkg/utils/kubeutils"
@@ -30,11 +31,10 @@ func InternalGatewayName(gwNamespace, gwName, lName string) string {
 // InternalRouteRuleKey returns the name of the internal Route Rule corresponding to the
 // specified route. If ruleName is not specified, returns the internal name without the route rule.
 // Format: routeNs/routeName.ruleName
-func InternalRouteRuleKey(routeNamespace, routeName, ruleName string) string {
-	if ruleName == "" {
-		return fmt.Sprintf("%s/%s", routeNamespace, routeName)
-	}
-	return fmt.Sprintf("%s/%s.%s", routeNamespace, routeName, ruleName)
+func InternalRouteRuleKey(routeNamespace, routeName string, ruleName int) string {
+	// Pad the number format, as this is used for sorting order on conflicts within the same rule
+	// Routes can only have 16 rules, so we only need 2 digits.
+	return fmt.Sprintf("%s/%s.%02d", routeNamespace, routeName, ruleName)
 }
 
 // InternalMCPStaticBackendName returns the name of the internal MCP Static Backend corresponding to the
@@ -185,6 +185,29 @@ type TypedNamespacedName struct {
 
 func (n TypedNamespacedName) String() string {
 	return n.Kind + "/" + n.NamespacedName.String()
+}
+
+var SectionedNamespacedNameIndexCollectionFunc = krt.WithIndexCollectionFromString(func(s string) SectionedNamespacedName {
+	parts := strings.Split(s, "/")
+	if len(parts) != 3 {
+		panic("invalid SectionedNamespacedName: " + s)
+	}
+	return SectionedNamespacedName{
+		NamespacedName: types.NamespacedName{
+			Namespace: parts[0],
+			Name:      parts[1],
+		},
+		SectionName: gwv1.SectionName(parts[2]),
+	}
+})
+
+type SectionedNamespacedName struct {
+	types.NamespacedName
+	SectionName gwv1.SectionName
+}
+
+func (n SectionedNamespacedName) String() string {
+	return n.NamespacedName.String() + "/" + string(n.SectionName)
 }
 
 type AncestorBackend struct {

@@ -12,7 +12,7 @@ use crate::http::auth::BackendAuth;
 use crate::http::authorization::HTTPAuthorizationSet;
 use crate::http::backendtls::BackendTLS;
 use crate::http::ext_proc::InferenceRouting;
-use crate::http::{ext_authz, ext_proc, filters, remoteratelimit, retry, timeout};
+use crate::http::{ext_authz, ext_proc, filters, health, remoteratelimit, retry, timeout};
 use crate::llm::policy::ResponseGuard;
 use crate::mcp::McpAuthorizationSet;
 use crate::proxy::httpproxy::PolicyClient;
@@ -20,7 +20,7 @@ use crate::store::Event;
 use crate::types::agent::{
 	A2aPolicy, Backend, BackendKey, BackendPolicy, BackendTargetRef, BackendWithPolicies, Bind,
 	BindKey, FrontendPolicy, Listener, ListenerKey, ListenerName, McpAuthentication, PolicyKey,
-	PolicyTarget, Route, RouteKey, RouteName, TCPRoute, TargetedPolicy, TrafficPolicy,
+	PolicyTarget, Route, RouteKey, RouteName, TCPRoute, TargetedPolicy, TracingPolicy, TrafficPolicy,
 };
 use crate::types::proto::agent::resource::Kind as XdsKind;
 use crate::types::proto::agent::{
@@ -66,6 +66,7 @@ pub struct FrontendPolices {
 	pub tcp: Option<frontend::TCP>,
 	pub access_log: Option<frontend::LoggingPolicy>,
 	pub tracing: Option<Arc<crate::types::agent::TracingPolicy>>,
+	pub access_log_otlp: Option<Arc<crate::types::agent::AccessLogPolicy>>,
 }
 
 impl FrontendPolices {
@@ -82,6 +83,9 @@ impl FrontendPolices {
 			},
 			FrontendPolicy::AccessLog(p) => {
 				self.access_log.get_or_insert_with(|| p.clone());
+				if let Some(alp) = &p.access_log_policy {
+					self.access_log_otlp.get_or_insert_with(|| alp.clone());
+				}
 			},
 			FrontendPolicy::Tracing(p) => {
 				self.tracing.get_or_insert_with(|| p.clone());
@@ -93,6 +97,8 @@ impl FrontendPolices {
 			filter,
 			add: fields_add,
 			remove: _,
+			otlp: _,
+			access_log_policy: _,
 		}) = &self.access_log
 		else {
 			return;
@@ -120,13 +126,17 @@ pub struct BackendPolicies {
 
 	pub http: Option<types::backend::HTTP>,
 	pub tcp: Option<types::backend::TCP>,
+	pub tunnel: Option<types::backend::Tunnel>,
 
 	pub request_header_modifier: Option<filters::HeaderModifier>,
 	pub response_header_modifier: Option<filters::HeaderModifier>,
 	pub request_redirect: Option<filters::RequestRedirect>,
 	pub request_mirror: Vec<filters::RequestMirror>,
+	pub transformation: Option<http::transformation_cel::Transformation>,
 
 	pub session_persistence: Option<http::sessionpersistence::Policy>,
+
+	pub health: Option<health::Policy>,
 
 	/// Internal-only override for destination endpoint selection.
 	/// Used for stateful MCP routing (session affinity).
@@ -148,6 +158,7 @@ impl BackendPolicies {
 			inference_routing: other.inference_routing.or(self.inference_routing),
 			http: other.http.or(self.http),
 			tcp: other.tcp.or(self.tcp),
+			tunnel: other.tunnel.or(self.tunnel),
 			request_header_modifier: other
 				.request_header_modifier
 				.or(self.request_header_modifier),
@@ -160,7 +171,9 @@ impl BackendPolicies {
 			} else {
 				other.request_mirror
 			},
+			transformation: other.transformation.or(self.transformation),
 			session_persistence: other.session_persistence.or(self.session_persistence),
+			health: other.health.or(self.health),
 			override_dest: other.override_dest.or(self.override_dest),
 		}
 	}
@@ -170,6 +183,14 @@ impl BackendPolicies {
 			inference.build(client)
 		} else {
 			ext_proc::InferencePoolRouter::default()
+		}
+	}
+
+	pub fn register_cel_expressions(&self, ctx: &mut ContextBuilder) {
+		if let Some(xfm) = &self.transformation {
+			for expr in xfm.expressions() {
+				ctx.register_expression(expr)
+			}
 		}
 	}
 }
@@ -634,6 +655,9 @@ impl Store {
 				BackendPolicy::TCP(p) => {
 					pol.tcp.get_or_insert_with(|| p.clone());
 				},
+				BackendPolicy::Tunnel(p) => {
+					pol.tunnel.get_or_insert_with(|| p.clone());
+				},
 
 				BackendPolicy::RequestHeaderModifier(p) => {
 					pol.request_header_modifier.get_or_insert_with(|| p.clone());
@@ -646,8 +670,14 @@ impl Store {
 				BackendPolicy::RequestRedirect(p) => {
 					pol.request_redirect.get_or_insert_with(|| p.clone());
 				},
+				BackendPolicy::Transformation(p) => {
+					pol.transformation.get_or_insert_with(|| p.clone());
+				},
 				BackendPolicy::SessionPersistence(p) => {
 					pol.session_persistence.get_or_insert_with(|| p.clone());
+				},
+				BackendPolicy::Health(p) => {
+					pol.health.get_or_insert_with(|| p.clone());
 				},
 				BackendPolicy::RequestMirror(p) => {
 					if pol.request_mirror.is_empty() {
@@ -669,6 +699,31 @@ impl Store {
 		pol
 	}
 
+	pub fn all_shutdown_policies(&self) -> Vec<Arc<TracingPolicy>> {
+		self
+			.policies_by_key
+			.iter()
+			.filter_map(|(_, v)| v.policy.as_frontend())
+			.filter_map(|v| match v {
+				FrontendPolicy::Tracing(t) => Some(t.clone()),
+				_ => None,
+			})
+			.collect_vec()
+	}
+	pub fn all_access_log_policies(&self) -> Vec<Arc<crate::types::agent::AccessLogPolicy>> {
+		self
+			.binds
+			.values()
+			.flat_map(|bind| {
+				bind
+					.listeners
+					.iter()
+					.map(|listener| self.listener_frontend_policies(&listener.name))
+			})
+			.filter_map(|fp| fp.access_log_otlp)
+			.unique_by(|p| Arc::as_ptr(p) as usize)
+			.collect_vec()
+	}
 	pub fn frontend_policies(&self, gateway: PolicyTargetRef) -> FrontendPolices {
 		let gw_rules = self.policies_by_target.get(&gateway);
 		let rules = gw_rules
@@ -721,6 +776,10 @@ impl Store {
 
 	pub fn all(&self) -> Vec<Arc<Bind>> {
 		self.binds.values().cloned().collect()
+	}
+
+	pub fn all_policies(&self) -> Vec<Arc<TargetedPolicy>> {
+		self.policies_by_key.values().cloned().collect()
 	}
 
 	pub fn backend(&self, r: &BackendKey) -> Option<Arc<BackendWithPolicies>> {
@@ -887,8 +946,10 @@ impl Store {
 			let mut bind = Arc::unwrap_or_clone(b.clone());
 			// If this is a listener update, copy things over
 			if let Some(old) = bind.listeners.remove(&lis.key) {
-				debug!("listener update, copy old routes over");
-				lis.routes = Arc::unwrap_or_clone(old).routes;
+				debug!("listener update, copy old routes and tcp routes over");
+				let old = Arc::unwrap_or_clone(old);
+				lis.routes = old.routes;
+				lis.tcp_routes = old.tcp_routes;
 			}
 			// Insert any staged routes
 			for (k, v) in self.staged_routes.remove(&lis.key).into_iter().flatten() {
@@ -1045,17 +1106,17 @@ impl Store {
 		Ok(())
 	}
 	fn insert_xds_listener(&mut self, raw: XdsListener) -> anyhow::Result<()> {
-		let (lis, bind_name): (Listener, BindKey) = (&raw).try_into()?;
+		let (lis, bind_name) = Listener::try_from_xds(&raw)?;
 		self.insert_listener(lis, bind_name);
 		Ok(())
 	}
 	fn insert_xds_route(&mut self, raw: XdsRoute) -> anyhow::Result<()> {
-		let (route, listener_name): (Route, ListenerKey) = (&raw).try_into()?;
+		let (route, listener_name) = Route::try_from_xds(&raw)?;
 		self.insert_route(route, listener_name);
 		Ok(())
 	}
 	fn insert_xds_tcp_route(&mut self, raw: XdsTcpRoute) -> anyhow::Result<()> {
-		let (route, listener_name): (TCPRoute, ListenerKey) = (&raw).try_into()?;
+		let (route, listener_name) = TCPRoute::try_from_xds(&raw)?;
 		self.insert_tcp_route(route, listener_name);
 		Ok(())
 	}
@@ -1268,6 +1329,8 @@ mod tests {
 			filter: None,
 			add: Arc::new(OrderedStringMap::default()),
 			remove: Arc::new(FzHashSet::new(vec![remove_item.into()])),
+			otlp: None,
+			access_log_policy: None,
 		})
 	}
 

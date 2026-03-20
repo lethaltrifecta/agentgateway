@@ -1,15 +1,16 @@
 use ::http::{HeaderMap, StatusCode};
 
 use crate::cel::Expression;
+use crate::http::envoy_proto_common;
 use crate::http::ext_proc::GrpcReferenceChannel;
 use crate::http::localratelimit::RateLimitType;
 use crate::http::remoteratelimit::proto::rate_limit_descriptor::Entry;
 use crate::http::remoteratelimit::proto::rate_limit_service_client::RateLimitServiceClient;
 use crate::http::remoteratelimit::proto::{RateLimitDescriptor, RateLimitRequest};
-use crate::http::{HeaderName, HeaderValue, PolicyResponse, Request};
+use crate::http::{PolicyResponse, Request};
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
-use crate::types::agent::SimpleBackendReference;
+use crate::types::agent::{BackendPolicy, SimpleBackendReference};
 use crate::*;
 
 #[cfg(test)]
@@ -19,7 +20,8 @@ mod tests;
 #[allow(warnings)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub mod proto {
-	tonic::include_proto!("envoy.service.ratelimit.v3");
+	pub use protos::envoy::service::common::v3::HeaderValue;
+	pub use protos::envoy::service::ratelimit::v3::*;
 }
 
 /// Defines how the proxy behaves when the remote rate limit service is
@@ -50,15 +52,15 @@ pub struct RemoteRateLimit {
 	pub domain: String,
 	#[serde(flatten)]
 	pub target: Arc<SimpleBackendReference>,
-	pub descriptors: Arc<DescriptorSet>,
-	/// Timeout for the request
-	#[serde(
-		default,
-		skip_serializing_if = "Option::is_none",
-		with = "serde_dur_option"
+	/// Policies to connect to the backend
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[serde(deserialize_with = "crate::types::local::de_from_local_backend_policy")]
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "Option<crate::types::local::SimpleLocalBackendPolicies>")
 	)]
-	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
-	pub timeout: Option<Duration>,
+	pub policies: Vec<BackendPolicy>,
+	pub descriptors: Arc<DescriptorSet>,
 	/// Behavior when the remote rate limit service is unavailable or returns an error.
 	/// Defaults to failClosed, denying requests with a 500 status on service failure.
 	#[serde(default)]
@@ -323,8 +325,8 @@ impl RemoteRateLimit {
 		);
 		let chan = GrpcReferenceChannel {
 			target: self.target.clone(),
+			policies: Arc::new(self.policies.clone()),
 			client,
-			timeout: self.timeout,
 		};
 		let mut client = RateLimitServiceClient::new(chan);
 		let resp = client.should_rate_limit(request).await;
@@ -415,19 +417,6 @@ impl RemoteRateLimit {
 
 fn process_headers(hm: &mut HeaderMap, headers: Vec<proto::HeaderValue>) {
 	for h in headers {
-		let Ok(hn) = HeaderName::from_bytes(h.key.as_bytes()) else {
-			continue;
-		};
-		let hv = if !h.value.is_empty() {
-			HeaderValue::from_bytes(h.value.as_bytes())
-		} else if !h.raw_value.is_empty() {
-			HeaderValue::from_bytes(&h.raw_value)
-		} else {
-			continue;
-		};
-		let Ok(hv) = hv else {
-			continue;
-		};
-		hm.insert(hn, hv);
+		let _ = envoy_proto_common::apply_header_value(hm, &h);
 	}
 }

@@ -43,7 +43,6 @@ async fn setup() -> (MockServer, Handler) {
 	let pi = Arc::new(ProxyInputs {
 		cfg: Arc::new(config),
 		stores: stores.clone(),
-		tracer: None,
 		metrics: Arc::new(crate::metrics::Metrics::new(
 			metrics::sub_registry(&mut Registry::default()),
 			Default::default(),
@@ -1065,6 +1064,7 @@ async fn test_openapi_from_url() {
 		})],
 		stateful_mode: McpStatefulMode::Stateful,
 		prefix_mode: None,
+		failure_mode: None,
 	});
 
 	// Convert to runtime backends

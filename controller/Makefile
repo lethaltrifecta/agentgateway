@@ -117,7 +117,6 @@ mod-download:  ## Download the dependencies
 .PHONY: mod-tidy-nested
 mod-tidy-nested:  ## Tidy go mod files in nested modules
 	@echo "Tidying tools..." && cd ../tools && go mod tidy
-	@echo "Tidying test/e2e/defaults/extproc..." && cd test/e2e/defaults/extproc && go mod tidy
 
 .PHONY: mod-tidy
 mod-tidy: mod-download mod-tidy-nested ## Tidy the go mod file
@@ -175,7 +174,7 @@ test: ## Run all tests with ginkgo, or only run the test package at {TEST_PKG} i
 # will still have e2e tests run by Github Actions once they publish a pull
 # request.
 .PHONY: e2e-test
-e2e-test: extproc-server-docker kind-load-extproc-server
+e2e-test: testbox-docker kind-load-testbox
 e2e-test: go-test
 e2e-test: TEST_TAG = e2e
 e2e-test: GO_TEST_ARGS = $(E2E_GO_TEST_ARGS)
@@ -427,53 +426,30 @@ agentgateway-controller-docker-local: agentgateway-controller $(CONTROLLER_OUTPU
 		-t localhost:5000/$(AGENTGATEWAY_IMAGE_REPO):$(TAG)
 
 #----------------------------------------------------------------------------------
-# dummy idp (used in e2e tests)
+# testbox (used in e2e tests)
 #----------------------------------------------------------------------------------
 
-DUMMY_IDP_DIR=hack/dummy-idp
-DUMMY_IDP_OUTPUT_DIR=$(OUTPUT_DIR)/$(DUMMY_IDP_DIR)
-export DUMMY_IDP_IMAGE_REPO ?= dummy-idp
-DUMMY_IDP_VERSION=0.0.1
+TESTBOX_DIR=hack/testbox
+TESTBOX_OUTPUT_DIR=$(OUTPUT_DIR)/$(TESTBOX_DIR)
+export TESTBOX_IMAGE_REPO ?= testbox
+TESTBOX_VERSION=0.0.1
 
-.PHONY: dummy-idp
-dummy-idp:
-	$(GO_BUILD_FLAGS) GOOS=linux go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(DUMMY_IDP_OUTPUT_DIR)/dummy-idp-linux-$(GOARCH) ./hack/dummy-idp...
+.PHONY: testbox
+testbox:
+	$(GO_BUILD_FLAGS) GOOS=linux go build -ldflags='$(LDFLAGS)' -gcflags='$(GCFLAGS)' -o $(TESTBOX_OUTPUT_DIR)/testbox-linux-$(GOARCH) ./hack/testbox...
 
-$(DUMMY_IDP_OUTPUT_DIR)/Dockerfile.dummy-idp: ./hack/dummy-idp/Dockerfile
+$(TESTBOX_OUTPUT_DIR)/Dockerfile.testbox: ./hack/testbox/Dockerfile
 	cp $< $@
 
-.PHONY: dummy-idp-docker
-dummy-idp-docker: dummy-idp $(DUMMY_IDP_OUTPUT_DIR)/Dockerfile.dummy-idp
-	$(BUILDX_BUILD) --load $(PLATFORM) $(DUMMY_IDP_OUTPUT_DIR) -f $(DUMMY_IDP_OUTPUT_DIR)/Dockerfile.dummy-idp \
+.PHONY: testbox-docker
+testbox-docker: testbox $(TESTBOX_OUTPUT_DIR)/Dockerfile.testbox
+	$(BUILDX_BUILD) --load $(PLATFORM) $(TESTBOX_OUTPUT_DIR) -f $(TESTBOX_OUTPUT_DIR)/Dockerfile.testbox \
 		--build-arg GOARCH=$(GOARCH) \
-		--build-arg BASE_IMAGE=$(ALPINE_BASE_IMAGE) \
-		-t $(IMAGE_REGISTRY)/$(DUMMY_IDP_IMAGE_REPO):$(DUMMY_IDP_VERSION)
+		-t $(IMAGE_REGISTRY)/$(TESTBOX_IMAGE_REPO):$(TESTBOX_VERSION)
 
-.PHONY: kind-load-dummy-idp
-kind-load-dummy-idp:
-	kind load docker-image $(IMAGE_REGISTRY)/$(DUMMY_IDP_IMAGE_REPO):$(DUMMY_IDP_VERSION) --name $(CLUSTER_NAME)
-
-#----------------------------------------------------------------------------------
-# extproc-server (used in e2e tests)
-#----------------------------------------------------------------------------------
-
-EXTPROC_SERVER_DIR=test/e2e/defaults/extproc
-EXTPROC_SERVER_OUTPUT_DIR=$(OUTPUT_DIR)/$(EXTPROC_SERVER_DIR)
-export EXTPROC_SERVER_IMAGE_REPO ?= extproc-server
-EXTPROC_SERVER_VERSION=0.0.1
-
-$(EXTPROC_SERVER_OUTPUT_DIR)/.docker-stamp-$(EXTPROC_SERVER_VERSION)-$(GOARCH): $(shell find $(EXTPROC_SERVER_DIR) -name '*.go') $(EXTPROC_SERVER_DIR)/Dockerfile
-	$(BUILDX_BUILD) --load $(PLATFORM) $(EXTPROC_SERVER_DIR) -f $(EXTPROC_SERVER_DIR)/Dockerfile \
-		-t $(IMAGE_REGISTRY)/$(EXTPROC_SERVER_IMAGE_REPO):$(EXTPROC_SERVER_VERSION)
-	@mkdir -p $(dir $@)
-	@touch $@
-
-.PHONY: extproc-server-docker
-extproc-server-docker: $(EXTPROC_SERVER_OUTPUT_DIR)/.docker-stamp-$(EXTPROC_SERVER_VERSION)-$(GOARCH)
-
-.PHONY: kind-load-extproc-server
-kind-load-extproc-server:
-	kind load docker-image $(IMAGE_REGISTRY)/$(EXTPROC_SERVER_IMAGE_REPO):$(EXTPROC_SERVER_VERSION) --name $(CLUSTER_NAME)
+.PHONY: kind-load-testbox
+kind-load-testbox:
+	kind load docker-image $(IMAGE_REGISTRY)/$(TESTBOX_IMAGE_REPO):$(TESTBOX_VERSION) --name $(CLUSTER_NAME)
 
 #----------------------------------------------------------------------------------
 # Helm
@@ -561,7 +537,7 @@ kind-create: ## Create a KinD cluster
 	kind get clusters | grep $(CLUSTER_NAME) || kind create cluster --name $(CLUSTER_NAME) --image kindest/node:$(CLUSTER_NODE_VERSION)
 
 CONFORMANCE_CHANNEL ?= experimental
-CONFORMANCE_VERSION ?= v1.4.1
+CONFORMANCE_VERSION ?= $(shell go list -m -f '{{.Version}}' sigs.k8s.io/gateway-api)
 .PHONY: gw-api-crds
 gw-api-crds: ## Install the Gateway API CRDs. HACK: Use SSA to avoid the issue with the CRD annotations being too long.
 ifeq ($(shell echo $(CONFORMANCE_VERSION) | grep -q '^v[0-9]' && echo yes),yes)
@@ -575,10 +551,7 @@ endif
 endif
 
 # The version of the k8s gateway api inference extension CRDs to install.
-# Managed by `make bump-gie`.
-GIE_CRD_VERSION ?= v1.3.0
-# When we are back on a release version instead of `main`, we can do this
-#GIE_CRD_VERSION ?= $(shell go list -m -f '{{.Version}}' sigs.k8s.io/gateway-api-inference-extension)
+GIE_CRD_VERSION ?= $(shell go list -m -f '{{.Version}}' sigs.k8s.io/gateway-api-inference-extension)
 
 .PHONY: gie-crds
 gie-crds: ## Install the Gateway API Inference Extension CRDs
@@ -588,9 +561,11 @@ else
 	kubectl apply --kustomize "https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=$(GIE_CRD_VERSION)"
 endif
 
-.PHONY: kind-metallb
+.PHONY: metallb
 metallb: ## Install the MetalLB load balancer
-	./hack/kind/setup-metalllb-on-kind.sh
+	kubectl apply -f ./test/setup/metallb.yaml
+	kubectl rollout status -n metallb-system deployment/controller --timeout=120s
+	kubectl rollout status -n metallb-system daemonset/speaker --timeout=120s
 
 .PHONY: deploy-agentgateway
 deploy-agentgateway: package-agentgateway-charts deploy-agentgateway-crd-chart deploy-agentgateway-chart ## Deploy the agentgateway chart and CRDs
@@ -601,7 +576,7 @@ setup-base: kind-create gw-api-crds gie-crds metallb ## Setup the base infrastru
 # Creates a functional kind cluster, builds and loads all images, and packages charts
 # Does NOT deploy anything to the cluster
 .PHONY: setup
-setup: setup-base kind-build-and-load package-agentgateway-charts dummy-idp-docker kind-load-dummy-idp  ## Setup the complete infrastructure (base setup plus images and charts)
+setup: setup-base kind-build-and-load package-agentgateway-charts  ## Setup base infra, build/load images, and package charts (without deployment)
 
 .PHONY: run
 run: setup deploy-agentgateway ## Set up complete development environment
@@ -641,11 +616,11 @@ kind-reload-%: kind-build-and-load-% kind-set-image-% ; ## Use to build specifie
 
 .PHONY: kind-build-and-load ## Use to build all images and load them into kind
 kind-build-and-load: kind-build-and-load-agentgateway-controller
-kind-build-and-load: kind-build-and-load-dummy-idp
+kind-build-and-load: kind-build-and-load-testbox
 
 .PHONY: kind-load ## Use to load all images into kind
 kind-load: kind-load-agentgateway-controller
-kind-load: kind-load-dummy-idp
+kind-load: kind-load-testbox
 
 #----------------------------------------------------------------------------------
 # Targets for running Agent Gateway conformance tests

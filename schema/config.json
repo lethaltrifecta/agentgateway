@@ -67,6 +67,17 @@
             "null"
           ]
         },
+        "dns": {
+          "description": "DNS resolver settings.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawDnsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "localXdsPath": {
           "description": "Local XDS path. If not specified, the current configuration file will be used.",
           "type": [
@@ -243,11 +254,65 @@
       },
       "additionalProperties": false
     },
+    "RawDnsConfig": {
+      "type": "object",
+      "properties": {
+        "lookupFamily": {
+          "description": "Controls which IP address families the DNS resolver will query for\nupstream connections.\nAccepted values: All, Auto, V4Preferred, V4Only, V6Only.\nDefaults to Auto (IPv4-only when enableIpv6 is false, both when true).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DnsLookupFamily"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "edns0": {
+          "description": "Whether to enable EDNS0 (Extension Mechanisms for DNS) in the resolver.\nWhen `None`, the system-provided resolver setting is preserved.\nCan also be set via the `DNS_EDNS0` environment variable.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DnsLookupFamily": {
+      "description": "Controls which IP address families the DNS resolver will query for\nupstream (backend) connections.\n\n Maps to hickory_resolver's `LookupIpStrategy` under the hood.\n\nCan be set via the `DNS_LOOKUP_FAMILY` environment variable or the\n`dns.lookupFamily` field in the config file.\n\nSee: <https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#enum-config-cluster-v3-cluster-dnslookupfamily>",
+      "oneOf": [
+        {
+          "description": "Query for both A and AAAA records in parallel and use all results.",
+          "type": "string",
+          "const": "All"
+        },
+        {
+          "description": "Automatically choose based on the `enable_ipv6` setting. When IPv6 is\nenabled this behaves like `V4Preferred`; otherwise `V4Only`.",
+          "type": "string",
+          "const": "Auto"
+        },
+        {
+          "description": "Query for both A and AAAA, but prefer IPv4 addresses when both are\navailable.",
+          "type": "string",
+          "const": "V4Preferred"
+        },
+        {
+          "description": "Only query for A (IPv4) records.",
+          "type": "string",
+          "const": "V4Only"
+        },
+        {
+          "description": "Only query for AAAA (IPv6) records.",
+          "type": "string",
+          "const": "V6Only"
+        }
+      ]
+    },
     "RawSession": {
       "type": "object",
       "properties": {
         "key": {
-          "description": "The signing key to be used. If not set, sessions will not be encrypted.\nFor example, generated via `openssl rand -hex 32`.",
+          "description": "The AES-256-GCM session protection key to be used for session tokens.\nIf not set, sessions will not be encrypted.\nFor example, generated via `openssl rand -hex 32`.",
           "type": "string"
         }
       },
@@ -793,7 +858,10 @@
           }
         },
         "path": {
-          "$ref": "#/$defs/PathMatch"
+          "$ref": "#/$defs/PathMatch",
+          "default": {
+            "pathPrefix": "/"
+          }
         },
         "method": {
           "type": "string"
@@ -805,10 +873,7 @@
           }
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "path"
-      ]
+      "additionalProperties": false
     },
     "HeaderMatch": {
       "type": "object",
@@ -884,19 +949,7 @@
           "type": "object",
           "properties": {
             "regex": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "integer",
-                  "format": "uint",
-                  "minimum": 0
-                }
-              ],
-              "minItems": 2,
-              "maxItems": 2
+              "type": "string"
             }
           },
           "required": [
@@ -1106,6 +1159,18 @@
               "type": "null"
             }
           ]
+        },
+        "backendTunnel": {
+          "description": "Tunnel to the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tunnel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "backendAuth": {
           "description": "Authenticate to the backend.",
@@ -2044,15 +2109,19 @@
           ]
         },
         "policies": {
-          "$ref": "#/$defs/LocalBackendPolicies"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "policies"
-      ]
+      "additionalProperties": false
     },
-    "LocalBackendPolicies": {
+    "SimpleLocalBackendPolicies": {
       "type": "object",
       "properties": {
         "requestHeaderModifier": {
@@ -2091,35 +2160,11 @@
           ],
           "default": null
         },
-        "mcpAuthorization": {
-          "description": "Authorization policies for MCP access.",
+        "transformations": {
+          "description": "Modify requests and responses sent to and from the backend.",
           "anyOf": [
             {
-              "$ref": "#/$defs/McpAuthorization"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "a2a": {
-          "description": "Mark this traffic as A2A to enable A2A processing and telemetry.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/A2aPolicy"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "ai": {
-          "description": "Mark this as LLM traffic to enable LLM processing.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Policy"
+              "$ref": "#/$defs/LocalTransformationConfig"
             },
             {
               "type": "null"
@@ -2173,6 +2218,97 @@
             }
           ],
           "default": null
+        },
+        "health": {
+          "description": "Health policy for backend outlier detection; evicts on unhealthy responses based on CEL condition and configurable duration.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalHealthPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backendTunnel": {
+          "description": "Specify a tunnel to use when connecting to the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tunnel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "LocalTransformationConfig": {
+      "type": "object",
+      "properties": {
+        "request": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalTransform"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "response": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalTransform"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "LocalTransform": {
+      "type": "object",
+      "properties": {
+        "add": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "set": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "remove": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "body": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
         }
       },
       "additionalProperties": false
@@ -2600,6 +2736,77 @@
         "nanos"
       ]
     },
+    "LocalHealthPolicy": {
+      "description": "Local/config health policy with CEL as string; converted to Policy by compiling the expression.\nMirrors the proto `Health` message structure.",
+      "type": "object",
+      "properties": {
+        "unhealthyExpression": {
+          "description": "CEL expression; `true` means unhealthy (evict). E.g. `response.code >= 500`.\nWhen unset, any 5xx or connection failure is treated as unhealthy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "eviction": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalEviction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "LocalEviction": {
+      "description": "Local/config eviction sub-policy with duration as string; mirrors `Eviction`.",
+      "type": "object",
+      "properties": {
+        "duration": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "restoreHealth": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "consecutiveFailures": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "healthThreshold": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Tunnel": {
+      "type": "object",
+      "properties": {
+        "proxy": {
+          "description": "Reference to the proxy address",
+          "$ref": "#/$defs/SimpleLocalBackend"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "proxy"
+      ]
+    },
     "BedrockGuardrails": {
       "description": "Configuration for AWS Bedrock Guardrails integration.",
       "type": "object",
@@ -2620,7 +2827,7 @@
           "description": "Backend policies for AWS authentication (optional, defaults to implicit AWS auth)",
           "anyOf": [
             {
-              "$ref": "#/$defs/LocalBackendPolicies"
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
             },
             {
               "type": "null"
@@ -2658,7 +2865,7 @@
           "description": "Backend policies for GCP authentication (optional, defaults to implicit GCP auth)",
           "anyOf": [
             {
-              "$ref": "#/$defs/LocalBackendPolicies"
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
             },
             {
               "type": "null"
@@ -2820,6 +3027,11 @@
           "const": "passthrough"
         },
         {
+          "description": "Send the request to the upstream LLM provider as-is but attempt to extract information from it\nand apply a subset of policies (rate limit and telemetry; no guardrails).",
+          "type": "string",
+          "const": "detect"
+        },
+        {
           "description": "OpenAI /responses",
           "type": "string",
           "const": "responses"
@@ -2882,15 +3094,19 @@
         "domain": {
           "type": "string"
         },
+        "policies": {
+          "description": "Policies to connect to the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "descriptors": {
           "$ref": "#/$defs/DescriptorSet"
-        },
-        "timeout": {
-          "description": "Timeout for the request",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "failureMode": {
           "description": "Behavior when the remote rate limit service is unavailable or returns an error.\nDefaults to failClosed, denying requests with a 500 status on service failure.",
@@ -3228,6 +3444,17 @@
     "ExtAuthz": {
       "type": "object",
       "properties": {
+        "policies": {
+          "description": "Policies to connect to the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "protocol": {
           "description": "The ext_authz protocol to use. Unless you need to integrate with an HTTP-only server, gRPC is recommended.",
           "$ref": "#/$defs/Protocol2",
@@ -3256,13 +3483,6 @@
             {
               "type": "null"
             }
-          ]
-        },
-        "timeout": {
-          "description": "Timeout for the authorization request (default: 200ms)",
-          "type": [
-            "string",
-            "null"
           ]
         }
       },
@@ -3480,6 +3700,17 @@
     "ExtProc": {
       "type": "object",
       "properties": {
+        "policies": {
+          "description": "Policies to connect to the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "failureMode": {
           "description": "Behavior when the ext_proc service is unavailable or returns an error",
           "$ref": "#/$defs/FailureMode3",
@@ -3588,66 +3819,6 @@
         "failClosed",
         "failOpen"
       ]
-    },
-    "LocalTransformationConfig": {
-      "type": "object",
-      "properties": {
-        "request": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LocalTransform"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "response": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LocalTransform"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "LocalTransform": {
-      "type": "object",
-      "properties": {
-        "add": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "set": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "remove": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": []
-        },
-        "body": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "additionalProperties": false
     },
     "Csrf": {
       "type": "object",
@@ -3770,6 +3941,17 @@
         {
           "type": "object",
           "properties": {
+            "backend": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "backend"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "host": {
               "type": "string"
             }
@@ -3811,6 +3993,17 @@
           "required": [
             "ai"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "aws": {
+              "$ref": "#/$defs/LocalAwsBackend"
+            }
+          },
+          "required": [
+            "aws"
+          ]
         }
       ]
     },
@@ -3835,6 +4028,17 @@
               "type": "null"
             }
           ]
+        },
+        "failureMode": {
+          "description": "Behavior when one or more MCP targets fail to initialize or fail during fanout.\nDefaults to `failClosed`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureMode4"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -3851,7 +4055,7 @@
         "policies": {
           "anyOf": [
             {
-              "$ref": "#/$defs/LocalBackendPolicies"
+              "$ref": "#/$defs/MCPLocalBackendPolicies"
             },
             {
               "type": "null"
@@ -4007,6 +4211,143 @@
         }
       ]
     },
+    "MCPLocalBackendPolicies": {
+      "type": "object",
+      "properties": {
+        "requestHeaderModifier": {
+          "description": "Headers to be modified in the request.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderModifier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "responseHeaderModifier": {
+          "description": "Headers to be modified in the response.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderModifier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "requestRedirect": {
+          "description": "Directly respond to the request with a redirect.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestRedirect"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "transformations": {
+          "description": "Modify requests and responses sent to and from the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalTransformationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backendTLS": {
+          "description": "Send TLS to the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalBackendTLS"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "backendAuth": {
+          "description": "Authenticate to the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendAuth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "http": {
+          "description": "Specify HTTP settings for the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HTTP"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tcp": {
+          "description": "Specify TCP settings for the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TCP"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "health": {
+          "description": "Health policy for backend outlier detection; evicts on unhealthy responses based on CEL condition and configurable duration.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalHealthPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backendTunnel": {
+          "description": "Specify a tunnel to use when connecting to the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tunnel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "mcpAuthorization": {
+          "description": "Authorization policies for MCP access.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpAuthorization"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
     "McpStatefulMode": {
       "type": "string",
       "enum": [
@@ -4019,6 +4360,20 @@
       "enum": [
         "always",
         "conditional"
+      ]
+    },
+    "FailureMode4": {
+      "oneOf": [
+        {
+          "description": "Fail the entire session if any target fails to initialize or any\nupstream fails during a fanout. This is the default and matches\ncurrent behavior.",
+          "type": "string",
+          "const": "failClosed"
+        },
+        {
+          "description": "Skip failed targets/upstreams and continue serving from healthy ones.\nIf ALL targets fail, still return an error.",
+          "type": "string",
+          "const": "failOpen"
+        }
       ]
     },
     "LocalAIBackend": {
@@ -4274,6 +4629,167 @@
         "host"
       ]
     },
+    "LocalBackendPolicies": {
+      "type": "object",
+      "properties": {
+        "requestHeaderModifier": {
+          "description": "Headers to be modified in the request.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderModifier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "responseHeaderModifier": {
+          "description": "Headers to be modified in the response.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderModifier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "requestRedirect": {
+          "description": "Directly respond to the request with a redirect.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestRedirect"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "transformations": {
+          "description": "Modify requests and responses sent to and from the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalTransformationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backendTLS": {
+          "description": "Send TLS to the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalBackendTLS"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "backendAuth": {
+          "description": "Authenticate to the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendAuth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "http": {
+          "description": "Specify HTTP settings for the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HTTP"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tcp": {
+          "description": "Specify TCP settings for the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TCP"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "health": {
+          "description": "Health policy for backend outlier detection; evicts on unhealthy responses based on CEL condition and configurable duration.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalHealthPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backendTunnel": {
+          "description": "Specify a tunnel to use when connecting to the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tunnel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "mcpAuthorization": {
+          "description": "Authorization policies for MCP access.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpAuthorization"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "a2a": {
+          "description": "Mark this traffic as A2A to enable A2A processing and telemetry.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/A2aPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "ai": {
+          "description": "Mark this as LLM traffic to enable LLM processing.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Policy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
     "LocalAIProviders": {
       "type": "object",
       "properties": {
@@ -4287,6 +4803,41 @@
       "additionalProperties": false,
       "required": [
         "providers"
+      ]
+    },
+    "LocalAwsBackend": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "agentCore": {
+              "$ref": "#/$defs/LocalAgentCoreBackend"
+            }
+          },
+          "required": [
+            "agentCore"
+          ]
+        }
+      ]
+    },
+    "LocalAgentCoreBackend": {
+      "type": "object",
+      "properties": {
+        "agentRuntimeArn": {
+          "type": "string"
+        },
+        "qualifier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agentRuntimeArn"
       ]
     },
     "LocalTCPRoute": {
@@ -4451,6 +5002,18 @@
               "type": "null"
             }
           ]
+        },
+        "backendTunnel": {
+          "description": "Tunnel to the backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tunnel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -4763,14 +5326,126 @@
           "items": {
             "type": "string"
           }
+        },
+        "otlp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OtlpLoggingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
+    },
+    "OtlpLoggingConfig": {
+      "type": "object",
+      "properties": {
+        "policies": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "protocol": {
+          "$ref": "#/$defs/TracingProtocol",
+          "default": "grpc"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "invalid"
+          ]
+        },
+        {
+          "description": "Service reference. Service must be defined in the top level services list.",
+          "type": "object",
+          "properties": {
+            "service": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "$ref": "#/$defs/NamespacedHostname"
+                },
+                "port": {
+                  "type": "integer",
+                  "format": "uint16",
+                  "minimum": 0,
+                  "maximum": 65535
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "port"
+              ]
+            }
+          },
+          "required": [
+            "service"
+          ]
+        },
+        {
+          "description": "Hostname or IP address",
+          "type": "object",
+          "properties": {
+            "host": {
+              "description": "Hostname or IP address",
+              "type": "string"
+            }
+          },
+          "required": [
+            "host"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "backend": {
+              "description": "Explicit backend reference. Backend must be defined in the top level backends list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "backend"
+          ]
+        }
+      ]
+    },
+    "TracingProtocol": {
+      "type": "string",
+      "enum": [
+        "grpc",
+        "http"
+      ]
     },
     "TracingConfig": {
       "description": "Configuration for dynamic tracing policy",
       "type": "object",
       "properties": {
+        "policies": {
+          "description": "Policies to connect to the backend",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimpleLocalBackendPolicies"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "attributes": {
           "description": "Span attributes to add, keyed by attribute name.",
           "$ref": "#/$defs/OrderedStringMap_Expression",
@@ -4819,7 +5494,7 @@
         },
         "protocol": {
           "$ref": "#/$defs/TracingProtocol",
-          "default": "http"
+          "default": "grpc"
         }
       },
       "unevaluatedProperties": false,
@@ -4890,13 +5565,6 @@
       "additionalProperties": {
         "$ref": "#/$defs/Expression"
       }
-    },
-    "TracingProtocol": {
-      "type": "string",
-      "enum": [
-        "http",
-        "grpc"
-      ]
     },
     "LocalPolicy": {
       "type": "object",
@@ -5226,6 +5894,53 @@
           ],
           "default": null
         },
+        "responseHeaders": {
+          "description": "responseHeaders modifies headers in responses from the LLM provider.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HeaderModifier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backendTLS": {
+          "description": "backendTLS configures TLS when connecting to the LLM provider.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalBackendTLS"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "health": {
+          "description": "health configures outlier detection for this model backend.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalHealthPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "backendTunnel": {
+          "description": "backendTunnel configures tunneling when connecting to the LLM provider.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tunnel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "guardrails": {
           "description": "guardrails to apply to the request or response",
           "anyOf": [
@@ -5264,9 +5979,13 @@
         },
         "apiKey": {
           "description": "An API key to attach to the request.\nIf unset this will be automatically detected from the environment.",
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretFromFile"
+            },
+            {
+              "type": "null"
+            }
           ],
           "default": null
         },
@@ -5301,9 +6020,33 @@
             "string",
             "null"
           ]
+        },
+        "hostOverride": {
+          "description": "Override the upstream host for this provider.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "pathOverride": {
+          "description": "Override the upstream path for this provider.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "tokenize": {
+          "description": "Whether to tokenize the request before forwarding it upstream.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
+    },
+    "SecretFromFile": {
+      "$ref": "#/$defs/FileOrInline"
     },
     "LocalModelAIProvider": {
       "type": "string",
@@ -5440,6 +6183,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/McpPrefixMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failureMode": {
+          "description": "Behavior when one or more MCP targets fail to initialize or fail during fanout.\nDefaults to `failClosed`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureMode4"
             },
             {
               "type": "null"

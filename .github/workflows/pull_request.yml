@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   CI: true
   RUST_VERSION: "1.93.1"
-  GO_VERSION: "1.25.7"
+  GO_VERSION: "1.26.1"
 
 jobs:
   #### Proxy jobs ####
@@ -124,6 +124,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v6
+    - name: Check Runner Info
+      run: |
+        cat /sys/fs/cgroup/cpu.stat || true
+        cat /proc/pressure/cpu || true
+        lscpu || true
+        openssl speed -seconds 1  -bytes 256 sha256 || rtue
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
       with:
@@ -193,6 +199,12 @@ jobs:
     - name: Conformance
       run: |
         make -C controller all-conformance
+    - name: Debug Info
+      if: ${{ failure() }}
+      run: |
+        kubectl describe deployment -n agentgateway-system
+        kubectl get pods -n agentgateway-system
+        kubectl logs -n agentgateway-system -l app.kubernetes.io/name=agentgateway
     - name: Upload cargo timings
       uses: actions/upload-artifact@v6
       with:

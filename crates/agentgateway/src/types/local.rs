@@ -4,15 +4,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::agentcore;
 use crate::client::Client;
 use crate::http::auth::BackendAuth;
 use crate::http::backendtls::LocalBackendTLS;
 use crate::http::filters::HeaderModifier;
-use crate::http::transformation_cel::LocalTransformationConfig;
-use crate::http::{HeaderName, HeaderOrPseudo, filters, retry, timeout};
+use crate::http::transformation_cel::{LocalTransformationConfig, Transformation};
+use crate::http::{
+	HeaderName, HeaderOrPseudo, filters, health, retry, timeout, transformation_cel,
+};
 use crate::llm::policy::PromptGuard;
 use crate::llm::{AIBackend, AIProvider, LocalModelAIProvider, NamedAIProvider};
 use crate::llm::{anthropic, openai};
+use crate::mcp::FailureMode;
 use crate::mcp::McpAuthorization;
 use crate::store::LocalWorkload;
 use crate::types::agent::{
@@ -56,6 +60,179 @@ impl NormalizedLocalConfig {
 		let t = convert(client, gateway_name, config, local_config).await?;
 		Ok(t)
 	}
+}
+
+pub fn migrate_deprecated_local_config(s: &str) -> anyhow::Result<String> {
+	let cfg: serde_json::Value = serdes::yamlviajson::from_str(s)?;
+	let cfg = migrate_deprecated_frontend_policies(cfg)?;
+	serdes::yamlviajson::to_string(&cfg)
+}
+
+fn migrate_deprecated_frontend_policies(
+	mut cfg: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+	let Some(root) = cfg.as_object_mut() else {
+		return Ok(cfg);
+	};
+
+	let Some(config) = root.get("config").and_then(serde_json::Value::as_object) else {
+		return Ok(cfg);
+	};
+
+	let deprecated_logging = config.get("logging").cloned();
+	let deprecated_tracing = config.get("tracing").cloned();
+	if deprecated_logging.is_none() && deprecated_tracing.is_none() {
+		return Ok(cfg);
+	}
+
+	let mut deprecated_config = serde_json::Map::new();
+	if let Some(logging) = deprecated_logging {
+		deprecated_config.insert("logging".to_string(), logging);
+	}
+	if let Some(tracing) = deprecated_tracing {
+		deprecated_config.insert("tracing".to_string(), tracing);
+	}
+	let mut deprecated_root = serde_json::Map::new();
+	deprecated_root.insert(
+		"config".to_string(),
+		serde_json::Value::Object(deprecated_config),
+	);
+	let deprecated_cfg_yaml =
+		serdes::yamlviajson::to_string(&serde_json::Value::Object(deprecated_root))?;
+	let deprecated_cfg = crate::config::parse_config(deprecated_cfg_yaml, None)?;
+
+	let mut frontend_policies: LocalFrontendPolicies = serde_json::from_value(
+		root
+			.get("frontendPolicies")
+			.cloned()
+			.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+	)?;
+	merge_deprecated_frontend_policies(&deprecated_cfg, &mut frontend_policies)?;
+
+	let has_deprecated_log = has_deprecated_frontend_log_fields(&deprecated_cfg.logging);
+	let has_deprecated_tracing = deprecated_cfg.tracing.is_some();
+
+	let frontend_policies_map = root
+		.entry("frontendPolicies")
+		.or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+	let Some(frontend_policies_map) = frontend_policies_map.as_object_mut() else {
+		anyhow::bail!("frontendPolicies must be an object");
+	};
+	if has_deprecated_log {
+		let Some(access_log) = frontend_policies.access_log else {
+			anyhow::bail!("internal error: migrated accessLog was not generated");
+		};
+		frontend_policies_map.insert("accessLog".to_string(), serde_json::to_value(access_log)?);
+		frontend_policies_map.remove("logging");
+	}
+	if has_deprecated_tracing && let Some(tracing) = frontend_policies.tracing {
+		frontend_policies_map.insert("tracing".to_string(), serde_json::to_value(tracing)?);
+	}
+
+	let Some(config) = root
+		.get_mut("config")
+		.and_then(serde_json::Value::as_object_mut)
+	else {
+		return Ok(cfg);
+	};
+	if has_deprecated_log {
+		match config.get_mut("logging") {
+			Some(serde_json::Value::Object(logging)) => {
+				logging.remove("filter");
+				logging.remove("fields");
+				if logging.is_empty() {
+					config.remove("logging");
+				}
+			},
+			Some(_) => {
+				config.remove("logging");
+			},
+			None => {},
+		}
+	}
+	if has_deprecated_tracing {
+		config.remove("tracing");
+	}
+	Ok(cfg)
+}
+
+fn has_deprecated_frontend_log_fields(log: &crate::telemetry::log::Config) -> bool {
+	!log.fields.add.is_empty() || !log.fields.remove.is_empty() || log.filter.is_some()
+}
+
+fn merge_deprecated_frontend_policies(
+	deprecated: &crate::Config,
+	frontend_policies: &mut LocalFrontendPolicies,
+) -> anyhow::Result<()> {
+	let log = &deprecated.logging;
+	let has_deprecated_log = has_deprecated_frontend_log_fields(log);
+	if has_deprecated_log {
+		if frontend_policies.access_log.is_some() {
+			anyhow::bail!(
+				"cannot use deprecated config.logging together with frontendPolicies.accessLog"
+			);
+		}
+		frontend_policies.access_log = Some(frontend::LoggingPolicy {
+			filter: log.filter.clone(),
+			add: log.fields.add.clone(),
+			remove: log.fields.remove.clone(),
+			otlp: None,
+			access_log_policy: None,
+		});
+	}
+	if let Some(tracing) = deprecated.tracing.clone() {
+		if frontend_policies.tracing.is_some() {
+			anyhow::bail!("cannot use deprecated config.tracing together with frontendPolicies.tracing");
+		}
+		let trc::DeprecatedConfig {
+			endpoint,
+			headers,
+			protocol,
+			fields,
+			random_sampling,
+			client_sampling,
+			path,
+		} = tracing;
+
+		let policies = if !headers.is_empty() {
+			let backend_xfm = transformation_cel::LocalTransformationConfig {
+				request: Some(transformation_cel::LocalTransform {
+					set: headers
+						.into_iter()
+						.map(|(k, v)| (strng::new(k), strng::new(v)))
+						.collect(),
+					..Default::default()
+				}),
+				response: None,
+			};
+			let backend_xfm = Transformation::try_from_local_config(backend_xfm, true)?;
+			vec![BackendPolicy::Transformation(backend_xfm)]
+		} else {
+			Vec::new()
+		};
+		if let Some(ep) = endpoint {
+			// Strip the scheme (http:// or https://) from the endpoint URL to get host:port
+			let host_port = ep
+				.strip_prefix("http://")
+				.or_else(|| ep.strip_prefix("https://"))
+				.unwrap_or(&ep);
+			frontend_policies.tracing = Some(TracingConfig {
+				provider_backend: SimpleBackendReference::InlineBackend(Target::try_from(host_port)?),
+				policies,
+				attributes: Arc::unwrap_or_clone(fields.add),
+				resources: Default::default(), // Not supported in the old config
+				remove: Arc::unwrap_or_clone(fields.remove).into_iter().collect(),
+				random_sampling,
+				client_sampling,
+				path,
+				protocol: match protocol {
+					Protocol::Grpc => crate::types::agent::TracingProtocol::Grpc,
+					Protocol::Http => crate::types::agent::TracingProtocol::Http,
+				},
+			});
+		}
+	}
+	Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -145,6 +322,18 @@ pub struct LocalLLMModels {
 	/// requestHeaders modifies headers in requests to the LLM provider.
 	#[serde(default)]
 	request_headers: Option<filters::HeaderModifier>,
+	/// responseHeaders modifies headers in responses from the LLM provider.
+	#[serde(default)]
+	response_headers: Option<filters::HeaderModifier>,
+	/// backendTLS configures TLS when connecting to the LLM provider.
+	#[serde(rename = "backendTLS", default)]
+	backend_tls: Option<http::backendtls::LocalBackendTLS>,
+	/// health configures outlier detection for this model backend.
+	#[serde(default)]
+	health: Option<health::LocalHealthPolicy>,
+	/// backendTunnel configures tunneling when connecting to the LLM provider.
+	#[serde(default)]
+	backend_tunnel: Option<backend::Tunnel>,
 	/// guardrails to apply to the request or response
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	guardrails: Option<PromptGuard>,
@@ -160,6 +349,16 @@ pub struct LLMRouteMatch {
 	pub headers: Vec<HeaderMatch>,
 }
 
+#[apply(schema!)]
+pub struct SecretFromFile(
+	#[cfg_attr(feature = "schema", schemars(with = "FileOrInline"))]
+	#[serde(
+		serialize_with = "ser_redact",
+		deserialize_with = "deser_key_from_file"
+	)]
+	SecretString,
+);
+
 #[apply(schema_de!)]
 #[derive(Default)]
 pub struct LocalLLMParams {
@@ -170,7 +369,7 @@ pub struct LocalLLMParams {
 	/// An API key to attach to the request.
 	/// If unset this will be automatically detected from the environment.
 	#[serde(default)]
-	api_key: Option<String>,
+	api_key: Option<SecretFromFile>,
 	// For Bedorkc: The AWS region to use
 	aws_region: Option<Strng>,
 	// For Vertex: The Google region to use
@@ -181,6 +380,15 @@ pub struct LocalLLMParams {
 	azure_host: Option<Strng>,
 	/// For Azure: the API version to use
 	azure_api_version: Option<Strng>,
+	/// Override the upstream host for this provider.
+	#[serde(default)]
+	host_override: Option<Target>,
+	/// Override the upstream path for this provider.
+	#[serde(default)]
+	path_override: Option<Strng>,
+	/// Whether to tokenize the request before forwarding it upstream.
+	#[serde(default)]
+	tokenize: bool,
 }
 
 #[apply(schema_de!)]
@@ -268,7 +476,7 @@ pub struct LocalRouteName {
 }
 
 #[apply(schema_de!)]
-struct LocalRoute {
+pub struct LocalRoute {
 	#[serde(flatten)]
 	name: LocalRouteName,
 	/// Can be a wildcard
@@ -298,10 +506,29 @@ fn default_weight() -> usize {
 
 #[apply(schema_de!)]
 pub struct FullLocalBackend {
-	name: BackendKey,
-	host: Target,
+	pub name: BackendKey,
+	pub host: Target,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	policies: Option<LocalBackendPolicies>,
+	pub policies: Option<LocalBackendPolicies>,
+}
+
+#[apply(schema_de!)]
+pub struct LocalAwsBackend {
+	#[serde(flatten)]
+	pub service: LocalAwsService,
+}
+
+#[apply(schema_de!)]
+pub enum LocalAwsService {
+	#[serde(rename = "agentCore")]
+	AgentCore(LocalAgentCoreBackend),
+}
+
+#[apply(schema_de!)]
+pub struct LocalAgentCoreBackend {
+	pub agent_runtime_arn: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub qualifier: Option<String>,
 }
 
 #[apply(schema_de!)]
@@ -312,6 +539,7 @@ pub enum LocalBackend {
 		name: NamespacedHostname,
 		port: u16,
 	},
+	Backend(BackendKey),
 	// Rest are inlined
 	#[serde(rename = "host")]
 	Opaque(Target), // Hostname or IP
@@ -320,6 +548,8 @@ pub enum LocalBackend {
 	MCP(LocalMcpBackend),
 	#[serde(rename = "ai")]
 	AI(LocalAIBackend),
+	#[serde(rename = "aws")]
+	Aws(LocalAwsBackend),
 	Invalid,
 }
 
@@ -416,12 +646,18 @@ impl LocalAIBackend {
 }
 
 impl LocalBackend {
-	fn make_backend(
+	fn make_mcp_backend(
 		b: Backend,
-		policies: Option<LocalBackendPolicies>,
+		policies: Option<MCPLocalBackendPolicies>,
 		tls: bool,
 	) -> Result<BackendWithPolicies, anyhow::Error> {
 		let mut inline_policies = policies
+			.map(|p| LocalBackendPolicies {
+				simple: p.simple,
+				mcp_authorization: p.mcp_authorization,
+				a2a: None,
+				ai: None,
+			})
 			.map(LocalBackendPolicies::translate)
 			.transpose()?
 			.unwrap_or_default();
@@ -443,6 +679,7 @@ impl LocalBackend {
 	) -> anyhow::Result<Vec<BackendWithPolicies>> {
 		Ok(match self {
 			LocalBackend::Service { .. } => vec![], // These stay as references
+			LocalBackend::Backend(_) => vec![],     // These stay as references
 			LocalBackend::Opaque(tgt) => vec![Backend::Opaque(name, tgt.clone()).into()],
 			LocalBackend::Dynamic { .. } => vec![Backend::Dynamic(name, ()).into()],
 			LocalBackend::MCP(tgt) => {
@@ -455,7 +692,7 @@ impl LocalBackend {
 							let (backend, path, tls) = backend.process()?;
 							let (bref, be) = mcp_to_simple_backend_and_ref(local_name(name.clone()), backend);
 							if let Some(b) = be {
-								backends.push(Self::make_backend(b, t.policies.clone(), tls)?);
+								backends.push(Self::make_mcp_backend(b, t.policies.clone(), tls)?);
 							}
 							McpTargetSpec::Sse(SseTargetSpec {
 								backend: bref,
@@ -466,7 +703,7 @@ impl LocalBackend {
 							let (backend, path, tls) = backend.process()?;
 							let (bref, be) = mcp_to_simple_backend_and_ref(local_name(name.clone()), backend);
 							if let Some(b) = be {
-								backends.push(Self::make_backend(b, t.policies.clone(), tls)?);
+								backends.push(Self::make_mcp_backend(b, t.policies.clone(), tls)?);
 							}
 							McpTargetSpec::Mcp(StreamableHTTPTargetSpec {
 								backend: bref,
@@ -478,7 +715,7 @@ impl LocalBackend {
 							let (backend, _, tls) = backend.process()?;
 							let (bref, be) = mcp_to_simple_backend_and_ref(local_name(name.clone()), backend);
 							if let Some(b) = be {
-								backends.push(Self::make_backend(b, t.policies.clone(), tls)?);
+								backends.push(Self::make_mcp_backend(b, t.policies.clone(), tls)?);
 							}
 							let openapi_schema = schema.load_openapi_schema(client.clone()).await?;
 							McpTargetSpec::OpenAPI(OpenAPITarget {
@@ -504,6 +741,7 @@ impl LocalBackend {
 						McpPrefixMode::Always => true,
 						McpPrefixMode::Conditional => false,
 					}),
+					failure_mode: tgt.failure_mode.unwrap_or_default(),
 				};
 				backends.push(Backend::MCP(name, m).into());
 				backends
@@ -511,6 +749,18 @@ impl LocalBackend {
 			LocalBackend::AI(tgt) => {
 				let be = tgt.clone().translate()?;
 				vec![Backend::AI(name, be).into()]
+			},
+			LocalBackend::Aws(aws_backend) => {
+				let config = match &aws_backend.service {
+					LocalAwsService::AgentCore(ac) => {
+						let agentcore_config =
+							agentcore::AgentCoreConfig::new(ac.agent_runtime_arn.clone(), ac.qualifier.clone())?;
+						crate::aws::AwsBackendConfig {
+							service: crate::aws::AwsService::AgentCore(agentcore_config),
+						}
+					},
+				};
+				vec![Backend::Aws(name, config).into()]
 			},
 			LocalBackend::Invalid => vec![Backend::Invalid.into()],
 		})
@@ -558,6 +808,10 @@ pub struct LocalMcpBackend {
 	pub stateful_mode: McpStatefulMode,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub prefix_mode: Option<McpPrefixMode>,
+	/// Behavior when one or more MCP targets fail to initialize or fail during fanout.
+	/// Defaults to `failClosed`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub failure_mode: Option<FailureMode>,
 }
 
 #[apply(schema_de!)]
@@ -566,7 +820,7 @@ pub struct LocalMcpTarget {
 	#[serde(flatten)]
 	pub spec: LocalMcpTargetSpec,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub policies: Option<LocalBackendPolicies>,
+	pub policies: Option<MCPLocalBackendPolicies>,
 }
 
 #[apply(schema_de!)]
@@ -792,7 +1046,7 @@ impl From<LocalGatewayPolicy> for FilterOrPolicy {
 
 #[apply(schema_de!)]
 #[derive(Default)]
-pub struct LocalBackendPolicies {
+pub struct SimpleLocalBackendPolicies {
 	// Filters. Keep in sync with RouteFilter
 	/// Headers to be modified in the request.
 	#[serde(default)]
@@ -806,15 +1060,15 @@ pub struct LocalBackendPolicies {
 	#[serde(default)]
 	pub request_redirect: Option<filters::RequestRedirect>,
 
-	/// Authorization policies for MCP access.
+	/// Modify requests and responses sent to and from the backend.
 	#[serde(default)]
-	pub mcp_authorization: Option<McpAuthorization>,
-	/// Mark this traffic as A2A to enable A2A processing and telemetry.
-	#[serde(default)]
-	pub a2a: Option<A2aPolicy>,
-	/// Mark this as LLM traffic to enable LLM processing.
-	#[serde(default)]
-	pub ai: Option<llm::Policy>,
+	#[serde(deserialize_with = "de_transform")]
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "Option<http::transformation_cel::LocalTransformationConfig>")
+	)]
+	pub transformations: Option<crate::http::transformation_cel::Transformation>,
+
 	/// Send TLS to the backend.
 	#[serde(rename = "backendTLS", default)]
 	pub backend_tls: Option<http::backendtls::LocalBackendTLS>,
@@ -828,25 +1082,69 @@ pub struct LocalBackendPolicies {
 	/// Specify TCP settings for the backend
 	#[serde(default)]
 	pub tcp: Option<backend::TCP>,
+
+	/// Health policy for backend outlier detection; evicts on unhealthy responses based on CEL condition and configurable duration.
+	#[serde(default)]
+	pub health: Option<health::LocalHealthPolicy>,
+
+	/// Specify a tunnel to use when connecting to the backend
+	#[serde(default)]
+	pub backend_tunnel: Option<backend::Tunnel>,
+}
+
+#[apply(schema_de!)]
+#[derive(Default)]
+pub struct MCPLocalBackendPolicies {
+	#[serde(flatten)]
+	simple: SimpleLocalBackendPolicies,
+	/// Authorization policies for MCP access.
+	#[serde(default)]
+	pub mcp_authorization: Option<McpAuthorization>,
+}
+
+#[apply(schema_de!)]
+#[derive(Default)]
+pub struct LocalBackendPolicies {
+	#[serde(flatten)]
+	simple: SimpleLocalBackendPolicies,
+
+	/// Authorization policies for MCP access.
+	#[serde(default)]
+	pub mcp_authorization: Option<McpAuthorization>,
+	/// Mark this traffic as A2A to enable A2A processing and telemetry.
+	#[serde(default)]
+	pub a2a: Option<A2aPolicy>,
+	/// Mark this as LLM traffic to enable LLM processing.
+	#[serde(default)]
+	pub ai: Option<llm::Policy>,
 }
 
 impl LocalBackendPolicies {
 	pub fn translate(self) -> anyhow::Result<Vec<BackendPolicy>> {
 		let LocalBackendPolicies {
-			request_header_modifier,
-			response_header_modifier,
-			request_redirect,
+			simple:
+				SimpleLocalBackendPolicies {
+					request_header_modifier,
+					response_header_modifier,
+					request_redirect,
+					transformations,
+					backend_tls,
+					backend_auth,
+					http,
+					tcp,
+					health,
+					backend_tunnel,
+				},
 			mcp_authorization,
 			a2a,
 			ai,
-			backend_tls,
-			backend_auth,
-			http,
-			tcp,
 		} = self;
 		let mut pols = vec![];
 		if let Some(p) = tcp {
 			pols.push(BackendPolicy::TCP(p));
+		}
+		if let Some(p) = backend_tunnel {
+			pols.push(BackendPolicy::Tunnel(p));
 		}
 		if let Some(p) = http {
 			pols.push(BackendPolicy::HTTP(p));
@@ -859,6 +1157,9 @@ impl LocalBackendPolicies {
 		}
 		if let Some(p) = request_redirect {
 			pols.push(BackendPolicy::RequestRedirect(p));
+		}
+		if let Some(p) = transformations {
+			pols.push(BackendPolicy::Transformation(p));
 		}
 		if let Some(p) = mcp_authorization {
 			pols.push(BackendPolicy::McpAuthorization(p))
@@ -876,6 +1177,11 @@ impl LocalBackendPolicies {
 			p.compile_model_alias_patterns();
 			pols.push(BackendPolicy::AI(Arc::new(p)))
 		}
+		if let Some(p) = health {
+			pols.push(BackendPolicy::Health(p.try_into().map_err(
+				|e: crate::cel::Error| anyhow::anyhow!("health.unhealthyExpression: {}", e),
+			)?));
+		}
 		Ok(pols)
 	}
 }
@@ -886,14 +1192,23 @@ pub struct LocalTCPBackendPolicies {
 	/// Send TLS to the backend.
 	#[serde(rename = "backendTLS", default)]
 	pub backend_tls: Option<http::backendtls::LocalBackendTLS>,
+	/// Tunnel to the backend.
+	#[serde(default)]
+	pub backend_tunnel: Option<backend::Tunnel>,
 }
 
 impl LocalTCPBackendPolicies {
 	pub fn translate(self) -> anyhow::Result<Vec<BackendPolicy>> {
-		let LocalTCPBackendPolicies { backend_tls } = self;
+		let LocalTCPBackendPolicies {
+			backend_tls,
+			backend_tunnel,
+		} = self;
 		let mut pols = vec![];
 		if let Some(p) = backend_tls {
 			pols.push(BackendPolicy::BackendTLS(p.try_into()?))
+		}
+		if let Some(p) = backend_tunnel {
+			pols.push(BackendPolicy::Tunnel(p))
 		}
 		Ok(pols)
 	}
@@ -912,7 +1227,7 @@ struct LocalFrontendPolicies {
 	#[serde(default)]
 	pub tcp: Option<frontend::TCP>,
 	/// Settings for request access logs.
-	#[serde(default)]
+	#[serde(default, alias = "logging")]
 	pub access_log: Option<frontend::LoggingPolicy>,
 	#[serde(default)]
 	pub tracing: Option<TracingConfig>,
@@ -920,7 +1235,7 @@ struct LocalFrontendPolicies {
 
 #[apply(schema_de!)]
 #[derive(Default)]
-struct FilterOrPolicy {
+pub struct FilterOrPolicy {
 	// Filters. Keep in sync with RouteFilter
 	/// Headers to be modified in the request.
 	#[serde(default)]
@@ -969,6 +1284,9 @@ struct FilterOrPolicy {
 	/// Send TLS to the backend.
 	#[serde(rename = "backendTLS", default)]
 	backend_tls: Option<http::backendtls::LocalBackendTLS>,
+	/// Tunnel to the backend.
+	#[serde(rename = "backendTunnel", default)]
+	backend_tunnel: Option<backend::Tunnel>,
 	/// Authenticate to the backend.
 	#[serde(default)]
 	backend_auth: Option<BackendAuth>,
@@ -1030,7 +1348,7 @@ async fn convert(
 ) -> anyhow::Result<NormalizedLocalConfig> {
 	let LocalConfig {
 		config: _,
-		frontend_policies,
+		mut frontend_policies,
 		binds,
 		policies,
 		workloads,
@@ -1039,6 +1357,7 @@ async fn convert(
 		llm,
 		mcp,
 	} = i;
+	merge_deprecated_frontend_policies(config, &mut frontend_policies)?;
 	let mut all_policies = vec![];
 	let mut all_backends = vec![];
 	let mut all_binds = vec![];
@@ -1169,16 +1488,43 @@ async fn convert_llm_config(
 	llm_config: LocalLLMConfig,
 ) -> anyhow::Result<(Bind, Vec<TargetedPolicy>, Vec<BackendWithPolicies>)> {
 	const DEFAULT_LLM_PORT: u16 = 4000;
-	let port = llm_config.port.unwrap_or(DEFAULT_LLM_PORT);
+	let LocalLLMConfig {
+		port,
+		models,
+		policies,
+	} = llm_config;
+	let port = port.unwrap_or(DEFAULT_LLM_PORT);
 
 	let mut all_policies = vec![];
 	let mut all_backends = vec![];
 	let mut routes = RouteSet::default();
+	let (listener_gateway_policies, listener_route_policies) = if let Some(pol) = policies {
+		let LocalLLMPolicy {
+			gateway,
+			authorization,
+		} = pol;
+		let authorization_policies = split_policies(
+			client.clone(),
+			FilterOrPolicy {
+				authorization,
+				..Default::default()
+			},
+		)
+		.await?;
+		let gateway_policies = split_policies(client.clone(), gateway.into()).await?;
+		(
+			gateway_policies.route_policies,
+			authorization_policies.route_policies,
+		)
+	} else {
+		(vec![], vec![])
+	};
 
 	// Create transformation policy to set x-gateway-model-name header from request body
 	let transformation = http::transformation_cel::Transformation::try_from_local_config(
 		LocalTransformationConfig {
 			request: Some(http::transformation_cel::LocalTransform {
+				metadata: Vec::new(),
 				set: vec![
 					(
 						strng::new("x-gateway-model-name"),
@@ -1214,8 +1560,7 @@ json(request.body).model
 
 	// Create model list route
 	let model_list_body = serde_json::json!({
-		"data": llm_config
-			.models
+		"data": models
 			.iter()
 			.map(|m| serde_json::json!({
 				"id": m.name,
@@ -1252,17 +1597,25 @@ json(request.body).model
 			},
 		],
 		backends: vec![],
-		inline_policies: vec![TrafficPolicy::DirectResponse(filters::DirectResponse {
-			body: Bytes::copy_from_slice(model_list_body.as_bytes()),
-			status: ::http::StatusCode::OK,
-		})],
+		inline_policies: vec![
+			TrafficPolicy::ResponseHeaderModifier(crate::http::filters::HeaderModifier {
+				set: vec![(strng::new("Content-Type"), strng::new("application/json"))],
+				add: vec![],
+				remove: vec![],
+			}),
+			TrafficPolicy::DirectResponse(filters::DirectResponse {
+				body: Bytes::copy_from_slice(model_list_body.as_bytes()),
+				status: ::http::StatusCode::OK,
+			}),
+		],
 	};
 	routes.insert(model_list_route);
 
 	// Create routes and backends for each model
-	for (idx, model_config) in llm_config.models.iter().enumerate() {
+	for (idx, model_config) in models.iter().enumerate() {
 		let model_name = strng::new(&model_config.name);
-		let backend_key = strng::format!("llm:{}", model_config.name);
+		// Index is needed because the same name can be used with different match criteria
+		let backend_key = strng::format!("llm:model:{}:{idx}", model_config.name);
 		let p = model_config.params.clone();
 		let model = p.model;
 
@@ -1295,7 +1648,7 @@ json(request.body).model
 		// Create backend auth policy
 		let mut pols = vec![];
 		if let Some(key) = p.api_key.as_ref() {
-			let backend_auth = BackendAuth::Key(SecretString::new(key.clone().into_boxed_str()));
+			let backend_auth = BackendAuth::Key(key.0.clone());
 			pols.push(BackendPolicy::BackendAuth(backend_auth));
 		}
 
@@ -1303,9 +1656,9 @@ json(request.body).model
 		let named_provider = NamedAIProvider {
 			name: model_name.clone(),
 			provider,
-			host_override: None,
-			path_override: None,
-			tokenize: false,
+			host_override: p.host_override,
+			path_override: p.path_override,
+			tokenize: p.tokenize,
 			inline_policies: pols,
 		};
 
@@ -1317,6 +1670,12 @@ json(request.body).model
 		};
 
 		let mut pols = vec![];
+		if let Some(p) = model_config.backend_tls.clone() {
+			pols.push(BackendPolicy::BackendTLS(p.try_into()?));
+		}
+		if let Some(p) = model_config.backend_tunnel.clone() {
+			pols.push(BackendPolicy::Tunnel(p));
+		}
 		if let Some(mut rh) = model_config.request_headers.clone() {
 			rh.remove.push(strng::literal!("x-gateway-model-name"));
 			pols.push(BackendPolicy::RequestHeaderModifier(rh));
@@ -1326,6 +1685,14 @@ json(request.body).model
 				add: vec![],
 				set: vec![],
 			}));
+		}
+		if let Some(rh) = model_config.response_headers.clone() {
+			pols.push(BackendPolicy::ResponseHeaderModifier(rh));
+		}
+		if let Some(p) = model_config.health.clone() {
+			pols.push(BackendPolicy::Health(p.try_into().map_err(
+				|e: crate::cel::Error| anyhow::anyhow!("health.unhealthyExpression: {}", e),
+			)?));
 		}
 		pols.push(BackendPolicy::AI(Arc::new(llm::Policy {
 			defaults: model_config.defaults.clone(),
@@ -1346,7 +1713,11 @@ json(request.body).model
 
 		// Create route for this model
 		// Index is needed because the same name can be used with different match criteria
-		let route_key = strng::format!("llm:model:{}:{idx}", model_config.name);
+		// Important: index is before model, to ensure we rank ties by order of first-in-list
+		// This ensures if I have '*' and 'foo/*', I can prefer `foo/*` by making it first.
+		// TODO: should we automatically make more explicit prefixes higher ranked?
+		// 999999 routes ought to be enough for anyone.
+		let route_key = strng::format!("llm:model:{idx:06}:{}", model_config.name);
 		let user_matches = if model_config.matches.is_empty() {
 			vec![RouteMatch {
 				path: PathMatch::PathPrefix(strng::new("/")),
@@ -1411,6 +1782,10 @@ json(request.body).model
 						crate::llm::RouteType::Responses,
 					),
 					(
+						strng::new("/v1/responses/compact"),
+						crate::llm::RouteType::Detect,
+					),
+					(
 						strng::new("/v1/embeddings"),
 						crate::llm::RouteType::Embeddings,
 					),
@@ -1441,19 +1816,9 @@ json(request.body).model
 		tcp_routes: Default::default(),
 	};
 
-	if let Some(pol) = llm_config.policies {
-		let route_pols = split_policies(
-			client.clone(),
-			FilterOrPolicy {
-				authorization: pol.authorization.clone(),
-				..Default::default()
-			},
-		)
-		.await?;
-		let pols = split_policies(client.clone(), pol.gateway.into()).await?;
-
-		let pc = pols.route_policies.len();
-		for (idx, pol) in pols.route_policies.into_iter().enumerate() {
+	if !listener_gateway_policies.is_empty() || !listener_route_policies.is_empty() {
+		let pc = listener_gateway_policies.len();
+		for (idx, pol) in listener_gateway_policies.into_iter().enumerate() {
 			let key = strng::format!("listener/{idx}");
 			all_policies.push(TargetedPolicy {
 				key: key.clone(),
@@ -1462,7 +1827,7 @@ json(request.body).model
 				policy: (pol, PolicyPhase::Gateway).into(),
 			})
 		}
-		for (idx, pol) in route_pols.route_policies.into_iter().enumerate() {
+		for (idx, pol) in listener_route_policies.into_iter().enumerate() {
 			let key = strng::format!("listener/{}", pc + idx);
 			all_policies.push(TargetedPolicy {
 				key: key.clone(),
@@ -1679,8 +2044,7 @@ async fn convert_listener(
 
 	let mut rs = RouteSet::default();
 	for (idx, l) in routes.into_iter().flatten().enumerate() {
-		let (route, policies, backends) = convert_route(client.clone(), l, idx, key.clone()).await?;
-		all_policies.extend_from_slice(&policies);
+		let (route, backends) = convert_route(client.clone(), l, idx, key.clone()).await?;
 		all_backends.extend_from_slice(&backends);
 		rs.insert(route)
 	}
@@ -1724,12 +2088,12 @@ async fn convert_listener(
 	Ok((l, all_policies, all_backends))
 }
 
-async fn convert_route(
+pub async fn convert_route(
 	client: client::Client,
 	lr: LocalRoute,
 	idx: usize,
 	listener_key: ListenerKey,
-) -> anyhow::Result<(Route, Vec<TargetedPolicy>, Vec<BackendWithPolicies>)> {
+) -> anyhow::Result<(Route, Vec<BackendWithPolicies>)> {
 	let LocalRoute {
 		name,
 		hostnames,
@@ -1758,6 +2122,7 @@ async fn convert_route(
 				name: name.clone(),
 				port: *port,
 			},
+			LocalBackend::Backend(n) => BackendReference::Backend(n.clone()),
 			LocalBackend::Invalid => BackendReference::Invalid,
 			LocalBackend::Dynamic {} => BackendReference::Backend("dynamic".into()),
 			_ => BackendReference::Backend(strng::format!("/{}", backend_key)),
@@ -1796,13 +2161,13 @@ async fn convert_route(
 		backends: backend_refs,
 		inline_policies: resolved.route_policies,
 	};
-	Ok((route, vec![], external_backends))
+	Ok((route, external_backends))
 }
 
 #[derive(Default)]
-struct ResolvedPolicies {
-	backend_policies: Vec<BackendPolicy>,
-	route_policies: Vec<TrafficPolicy>,
+pub struct ResolvedPolicies {
+	pub backend_policies: Vec<BackendPolicy>,
+	pub route_policies: Vec<TrafficPolicy>,
 }
 
 async fn split_frontend_policies(
@@ -1836,7 +2201,8 @@ async fn split_frontend_policies(
 	if let Some(p) = tcp {
 		add(FrontendPolicy::TCP(p), "tcp");
 	}
-	if let Some(p) = access_log {
+	if let Some(mut p) = access_log {
+		p.init_access_log_policy();
 		add(FrontendPolicy::AccessLog(p), "accessLog");
 	}
 	if let Some(tracing_config) = tracing {
@@ -1857,7 +2223,10 @@ async fn split_frontend_policies(
 	}
 	Ok(pols)
 }
-async fn split_policies(client: Client, pol: FilterOrPolicy) -> Result<ResolvedPolicies, Error> {
+pub async fn split_policies(
+	client: Client,
+	pol: FilterOrPolicy,
+) -> Result<ResolvedPolicies, Error> {
 	let mut resolved = ResolvedPolicies::default();
 	let ResolvedPolicies {
 		backend_policies,
@@ -1876,6 +2245,7 @@ async fn split_policies(client: Client, pol: FilterOrPolicy) -> Result<ResolvedP
 		a2a,
 		ai,
 		backend_tls,
+		backend_tunnel,
 		backend_auth,
 		authorization,
 		local_rate_limit,
@@ -1929,6 +2299,9 @@ async fn split_policies(client: Client, pol: FilterOrPolicy) -> Result<ResolvedP
 	}
 	if let Some(p) = backend_tls {
 		backend_policies.push(BackendPolicy::BackendTLS(p.try_into()?))
+	}
+	if let Some(p) = backend_tunnel {
+		backend_policies.push(BackendPolicy::Tunnel(p))
 	}
 	if let Some(p) = backend_auth {
 		backend_policies.push(BackendPolicy::BackendAuth(p))
@@ -2080,10 +2453,26 @@ impl TryInto<ServerTLSConfig> for LocalTLSServerConfig {
 			self.min_tls_version.map(Into::into),
 			self.max_tls_version.map(Into::into),
 			self.cipher_suites,
+			false,
 		)
 	}
 }
 
-fn local_name(name: Strng) -> ResourceName {
+pub fn local_name(name: Strng) -> ResourceName {
 	ResourceName::new(name, "".into())
+}
+
+pub fn de_from_local_backend_policy<'de: 'a, 'a, D>(
+	deserializer: D,
+) -> Result<Vec<BackendPolicy>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let s = SimpleLocalBackendPolicies::deserialize(deserializer)?;
+	LocalBackendPolicies {
+		simple: s,
+		..Default::default()
+	}
+	.translate()
+	.map_err(serde::de::Error::custom)
 }
