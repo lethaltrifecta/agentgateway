@@ -347,6 +347,7 @@ impl Relay {
 		r: JsonRpcRequest<ClientRequest>,
 		ctx: IncomingRequestContext,
 		service_name: &str,
+		mcp_log: Option<AsyncLog<MCPInfo>>,
 	) -> Result<Response, UpstreamError> {
 		let id = r.id.clone();
 		let Ok(us) = self.upstreams.get(service_name) else {
@@ -356,7 +357,7 @@ impl Relay {
 		};
 		let stream = us.generic_stream(r, &ctx).await?;
 
-		messages_to_response(id, stream)
+		messages_to_response(id, stream, mcp_log)
 	}
 	// For some requests, we don't have a sane mapping of incoming requests to a specific
 	// downstream service when multiplexing. Only forward when we have only one backend.
@@ -364,11 +365,12 @@ impl Relay {
 		&self,
 		r: JsonRpcRequest<ClientRequest>,
 		ctx: IncomingRequestContext,
+		mcp_log: Option<AsyncLog<MCPInfo>>,
 	) -> Result<Response, UpstreamError> {
 		let Some(service_name) = &self.upstreams.default_target_name else {
 			return Err(UpstreamError::InvalidMethod(r.request.method().to_string()));
 		};
-		self.send_single(r, ctx, service_name).await
+		self.send_single(r, ctx, service_name, mcp_log).await
 	}
 	pub async fn send_fanout_deletion(
 		&self,
@@ -413,11 +415,11 @@ impl Relay {
 			// FailClosed: unreachable — InitializeRequest would have failed with NoBackends.
 			// FailOpen: keep the SSE connection open so legacy SSE clients do not immediately
 			// reconnect in a tight loop after all upstream GET streams disappear.
-			return messages_to_response(RequestId::Number(0), Messages::pending());
+			return messages_to_response(RequestId::Number(0), Messages::pending(), None);
 		}
 
 		let ms = mergestream::MergeStream::new_without_merge(streams, self.upstreams.failure_mode);
-		messages_to_response(RequestId::Number(0), ms)
+		messages_to_response(RequestId::Number(0), ms, None)
 	}
 	pub async fn send_fanout(
 		&self,
@@ -452,7 +454,7 @@ impl Relay {
 		}
 
 		let ms = mergestream::MergeStream::new(streams, id.clone(), merge, self.upstreams.failure_mode);
-		messages_to_response(id, ms)
+		messages_to_response(id, ms, None)
 	}
 	pub async fn send_notification(
 		&self,
@@ -541,12 +543,19 @@ pub fn setup_request_log(
 fn messages_to_response(
 	id: RequestId,
 	stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,
+	mcp_log: Option<AsyncLog<MCPInfo>>,
 ) -> Result<Response, UpstreamError> {
 	use futures_util::StreamExt;
 	use rmcp::model::ServerJsonRpcMessage;
 	let stream = stream.map(move |rpc| {
 		let r = match rpc {
-			Ok(rpc) => rpc,
+			Ok(rpc) => {
+				// Capture terminal response/error payload for observability
+				if let Some(ref log) = mcp_log {
+					capture_terminal_message(&rpc, log);
+				}
+				rpc
+			},
 			Err(e) => {
 				ServerJsonRpcMessage::error(ErrorData::internal_error(e.to_string(), None), id.clone())
 			},
@@ -558,6 +567,25 @@ fn messages_to_response(
 		}
 	});
 	Ok(mcp::session::sse_stream_response(stream, None))
+}
+
+/// Inspect a ServerJsonRpcMessage and, if it is a terminal Response or Error,
+/// store the serialized payload into the MCPInfo async log.
+fn capture_terminal_message(msg: &ServerJsonRpcMessage, log: &AsyncLog<MCPInfo>) {
+	use rmcp::model::JsonRpcMessage;
+	match msg {
+		JsonRpcMessage::Response(resp) => {
+			if let Ok(v) = serde_json::to_value(&resp.result) {
+				log.non_atomic_mutate(|l| l.call_result = Some(v));
+			}
+		},
+		JsonRpcMessage::Error(err) => {
+			let e = err.error.clone();
+			log.non_atomic_mutate(|l| l.call_error = Some(e));
+		},
+		// Notifications and Requests are not terminal — skip
+		_ => {},
+	}
 }
 
 fn accepted_response() -> Response {

@@ -891,6 +891,39 @@ impl Drop for DropOnLog {
 			return;
 		}
 
+		// Serialize MCP tool payload at export boundary with truncation.
+		let truncate_json = |s: String| -> (String, bool) {
+			if s.len() > mcp::MAX_PAYLOAD_SIZE {
+				let end = s.floor_char_boundary(mcp::MAX_PAYLOAD_SIZE);
+				(format!("{}...(truncated)", &s[..end]), true)
+			} else {
+				(s, false)
+			}
+		};
+		let mut mcp_payload_truncated = false;
+		let mcp_call_arguments: Option<String> = mcp.as_ref().and_then(|m| {
+			m.call_arguments.as_ref().and_then(|a| {
+				serde_json::to_string(a).ok().map(|s| {
+					let (s, t) = truncate_json(s);
+					mcp_payload_truncated |= t;
+					s
+				})
+			})
+		});
+		let mcp_call_result: Option<String> = mcp.as_ref().and_then(|m| {
+			m.call_result.as_ref().and_then(|r| {
+				serde_json::to_string(r).ok().map(|s| {
+					let (s, t) = truncate_json(s);
+					mcp_payload_truncated |= t;
+					s
+				})
+			})
+		});
+		let mcp_call_error: Option<String> = mcp
+			.as_ref()
+			.and_then(|m| m.call_error.as_ref())
+			.and_then(|e| serde_json::to_string(e).ok());
+
 		let dur = format!("{}ms", duration.as_millis());
 		let grpc = log.grpc_status.load();
 
@@ -985,6 +1018,23 @@ impl Drop for DropOnLog {
 					.as_ref()
 					.and_then(|m| m.session_id.as_ref())
 					.map(display),
+			),
+			(
+				"gen_ai.tool.call.arguments",
+				mcp_call_arguments.as_ref().map(display),
+			),
+			(
+				"gen_ai.tool.call.result",
+				mcp_call_result.as_ref().map(display),
+			),
+			("mcp.tool.call.error", mcp_call_error.as_ref().map(display)),
+			(
+				"mcp.payload.truncated",
+				if mcp_payload_truncated {
+					Some(true.into())
+				} else {
+					None
+				},
 			),
 			(
 				"inferencepool.selected_endpoint",

@@ -301,6 +301,7 @@ impl Session {
 							l.resource_name = Some(tool.to_string());
 							l.target_name = Some(service_name.to_string());
 							l.resource = Some(MCPOperation::Tool);
+							l.call_arguments = ctr.params.arguments.clone();
 						});
 						if !self.relay.policies.validate(
 							&rbac::ResourceType::Tool(rbac::ResourceId::new(
@@ -317,7 +318,10 @@ impl Session {
 
 						let tn = tool.to_string();
 						ctr.params.name = tn.into();
-						self.relay.send_single(r, ctx, service_name).await
+						self
+							.relay
+							.send_single(r, ctx, service_name, Some(log.clone()))
+							.await
 					},
 					ClientRequest::GetPromptRequest(gpr) => {
 						let name = gpr.params.name.clone();
@@ -341,7 +345,7 @@ impl Session {
 							});
 						}
 						gpr.params.name = prompt.to_string();
-						self.relay.send_single(r, ctx, service_name).await
+						self.relay.send_single(r, ctx, service_name, None).await
 					},
 					ClientRequest::ReadResourceRequest(rrr) => {
 						if let Some(service_name) = self.relay.default_target_name() {
@@ -364,7 +368,10 @@ impl Session {
 									resource_name: uri.to_string(),
 								});
 							}
-							self.relay.send_single_without_multiplexing(r, ctx).await
+							self
+								.relay
+								.send_single_without_multiplexing(r, ctx, None)
+								.await
 						} else {
 							// TODO(https://github.com/agentgateway/agentgateway/issues/404)
 							// Find a mapping of URL
@@ -387,7 +394,10 @@ impl Session {
 					ClientRequest::CompleteRequest(_) => {
 						// For now, we don't have a sane mapping of incoming requests to a specific
 						// downstream service when multiplexing. Only forward when we have only one backend.
-						self.relay.send_single_without_multiplexing(r, ctx).await
+						self
+							.relay
+							.send_single_without_multiplexing(r, ctx, None)
+							.await
 					},
 				}
 			},

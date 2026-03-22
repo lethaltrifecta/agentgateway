@@ -1554,3 +1554,193 @@ async fn test_runtime_fanout_fail_open_all_fail() {
 		res.err()
 	);
 }
+
+/// Real proxy-level integration test: tools/call through the actual proxy with tracing enabled,
+/// asserting the exported span contains MCP payload attributes.
+#[tokio::test]
+async fn tools_call_payload_captured_in_exported_span() {
+	use std::future::ready;
+	use std::sync::Arc;
+
+	use opentelemetry_sdk::trace::{SimpleSpanProcessor, SpanData, SpanExporter};
+
+	use crate::cel;
+	use crate::telemetry::log::{LoggingFields, OrderedStringMap};
+	use crate::telemetry::trc;
+	use crate::types::agent::{
+		FrontendPolicy, ListenerTarget, PolicyTarget, PolicyType, SimpleBackendReference,
+		TargetedPolicy, TracingConfig, TracingPolicy, TracingProtocol,
+	};
+
+	// 1. Build a RecordingSpanExporter to capture spans in-memory
+	#[derive(Clone, Debug, Default)]
+	struct RecordingSpanExporter {
+		spans: Arc<std::sync::Mutex<Vec<SpanData>>>,
+	}
+
+	impl RecordingSpanExporter {
+		fn finished_spans(&self) -> Vec<SpanData> {
+			self.spans.lock().unwrap().clone()
+		}
+	}
+
+	impl SpanExporter for RecordingSpanExporter {
+		fn export(
+			&self,
+			batch: Vec<SpanData>,
+		) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+			self.spans.lock().unwrap().extend(batch);
+			ready(Ok(()))
+		}
+	}
+
+	let exporter = RecordingSpanExporter::default();
+	let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+		.with_span_processor(SimpleSpanProcessor::new(exporter.clone()))
+		.build();
+	let tracer = {
+		use opentelemetry::trace::TracerProvider;
+		provider.tracer("test-proxy-tracer")
+	};
+	let test_tracer = Arc::new(trc::Tracer {
+		tracer: Arc::new(tracer),
+		provider: provider.clone(),
+		fields: Arc::new(LoggingFields::default()),
+	});
+
+	// 2. Build a TracingPolicy with always-sample and the pre-populated tracer
+	let always_true = Arc::new(cel::Expression::new_strict("true").unwrap());
+	let tracing_policy = Arc::new(TracingPolicy {
+		config: TracingConfig {
+			provider_backend: SimpleBackendReference::Invalid, // won't be used; tracer is pre-built
+			policies: vec![],
+			attributes: OrderedStringMap::default(),
+			resources: OrderedStringMap::default(),
+			remove: vec![],
+			random_sampling: Some(always_true),
+			client_sampling: None,
+			path: "/v1/traces".to_string(),
+			protocol: TracingProtocol::Http,
+		},
+		fields: Arc::new(LoggingFields::default()),
+		tracer: {
+			let cell = once_cell::sync::OnceCell::new();
+			cell.set(test_tracer).ok();
+			cell
+		},
+	});
+
+	// 3. Set up the proxy with the tracing policy injected at gateway level
+	let mock = mock_streamable_http_server(true).await;
+	let t = setup_proxy_test("{}")
+		.unwrap()
+		.with_mcp_backend(mock.addr, true, false)
+		.with_bind(simple_bind(basic_route(mock.addr)));
+
+	// Insert the tracing policy targeted at the default gateway
+	{
+		// Target the gateway level — test binds use ListenerName::default()
+		// which has empty gateway_name and gateway_namespace.
+		let targeted = TargetedPolicy {
+			key: strng::new("test-tracing-policy"),
+			name: None,
+			target: PolicyTarget::Gateway(ListenerTarget {
+				gateway_name: strng::new(""),
+				gateway_namespace: strng::new(""),
+				listener_name: None,
+			}),
+			policy: PolicyType::Frontend(FrontendPolicy::Tracing(tracing_policy)),
+		};
+		t.pi.stores.binds.write().insert_policy(targeted);
+	}
+
+	let io = t.serve_real_listener(BIND_KEY).await;
+
+	// 4. Make a real tools/call through the proxy
+	let client = mcp_streamable_client(io).await;
+	let result = client
+		.call_tool(rmcp::model::CallToolRequestParams {
+			name: "echo".into(),
+			arguments: serde_json::json!({"message": "proxy-trace-test"})
+				.as_object()
+				.cloned(),
+			meta: None,
+			task: None,
+		})
+		.await;
+
+	assert!(result.is_ok(), "tool call failed: {:?}", result.err());
+	let ctr = result.unwrap();
+	assert_eq!(
+		&ctr.content[0].raw.as_text().unwrap().text,
+		r#"{"message":"proxy-trace-test"}"#
+	);
+
+	// 5. Drop the MCP client to ensure the response body is fully consumed and DropOnLog fires
+	drop(client);
+
+	// Give a small window for the async drop/flush to complete
+	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+	// Force flush the provider
+	let _ = provider.force_flush();
+
+	// 6. Assert that exported spans contain the MCP payload attributes
+	let spans = exporter.finished_spans();
+	assert!(
+		!spans.is_empty(),
+		"no spans were exported — tracing policy may not have been applied"
+	);
+
+	let find_attr = |span: &SpanData, key: &str| -> Option<String> {
+		span
+			.attributes
+			.iter()
+			.find(|kv| kv.key.as_str() == key)
+			.map(|kv| kv.value.to_string())
+	};
+
+	// Find the span that has MCP tool attributes
+	let mcp_span = spans.iter().find(|s| {
+		s.attributes
+			.iter()
+			.any(|kv| kv.key.as_str() == "gen_ai.tool.name")
+	});
+
+	assert!(
+		mcp_span.is_some(),
+		"no span with gen_ai.tool.name found in exported spans. Span names: {:?}",
+		spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+	);
+	let span = mcp_span.unwrap();
+
+	// Verify tool name and target
+	assert_eq!(
+		find_attr(span, "gen_ai.tool.name"),
+		Some("echo".to_string()),
+		"gen_ai.tool.name should be 'echo'"
+	);
+
+	// Verify the NEW payload capture attributes
+	let args = find_attr(span, "gen_ai.tool.call.arguments");
+	assert!(
+		args.is_some(),
+		"gen_ai.tool.call.arguments missing from exported span. Attributes: {:?}",
+		span.attributes
+	);
+	assert!(
+		args.unwrap().contains("proxy-trace-test"),
+		"arguments should contain 'proxy-trace-test'"
+	);
+
+	let result_attr = find_attr(span, "gen_ai.tool.call.result");
+	assert!(
+		result_attr.is_some(),
+		"gen_ai.tool.call.result missing from exported span. Attributes: {:?}",
+		span.attributes
+	);
+	assert!(
+		result_attr.unwrap().contains("proxy-trace-test"),
+		"result should contain the echoed 'proxy-trace-test'"
+	);
+}

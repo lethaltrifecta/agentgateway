@@ -1,5 +1,6 @@
 mod auth;
-mod handler;
+#[cfg_attr(test, allow(unused))]
+pub(crate) mod handler;
 mod mergestream;
 mod rbac;
 mod router;
@@ -19,6 +20,7 @@ use crate::proxy::ProxyError;
 use axum_core::BoxError;
 use prometheus_client::encoding::{EncodeLabelValue, LabelValueEncoder};
 pub use rbac::{McpAuthorization, McpAuthorizationSet, ResourceId, ResourceType};
+use rmcp::ErrorData;
 use rmcp::model::RequestId;
 pub use router::App;
 use thiserror::Error;
@@ -136,6 +138,9 @@ impl Display for MCPOperation {
 	}
 }
 
+/// Maximum serialized payload size (bytes) when emitting MCP tool call attributes to OTel spans.
+pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024; // 64 KiB
+
 #[derive(Debug, Default, Clone)]
 pub struct MCPInfo {
 	pub method_name: Option<String>,
@@ -144,4 +149,10 @@ pub struct MCPInfo {
 	pub target_name: Option<String>,
 	pub resource: Option<MCPOperation>,
 	pub session_id: Option<String>,
+	/// Raw tool call arguments, captured from the request.
+	pub call_arguments: Option<serde_json::Map<String, serde_json::Value>>,
+	/// Tool call result, captured from the upstream response.
+	pub call_result: Option<serde_json::Value>,
+	/// Tool call error, captured from the upstream response.
+	pub call_error: Option<ErrorData>,
 }
