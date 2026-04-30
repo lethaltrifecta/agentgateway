@@ -1,7 +1,6 @@
 package oidc
 
 import (
-	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -11,22 +10,16 @@ import (
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 )
 
-var (
-	errResolverNotInitialized = errors.New("remote http resolver hasn't been initialized")
-)
+// defaultResolver implements Resolver for direct issuer discovery URLs.
+type defaultResolver struct{}
 
-// defaultResolver implements Resolver using the shared remotehttp.Resolver.
-type defaultResolver struct {
-	endpointResolver remotehttp.Resolver
+// NewResolver constructs a Resolver for direct OIDC issuer discovery URLs.
+func NewResolver() Resolver {
+	return defaultResolver{}
 }
 
-// NewResolver constructs a Resolver backed by the given remotehttp.Resolver.
-func NewResolver(endpointResolver remotehttp.Resolver) Resolver {
-	return &defaultResolver{endpointResolver: endpointResolver}
-}
-
-func (r *defaultResolver) ResolveOwner(krtctx krt.HandlerContext, owner RemoteOidcOwner) (*ResolvedOidcRequest, error) {
-	endpoint, err := resolveOidcEndpoint(krtctx, r.endpointResolver, owner)
+func (r defaultResolver) ResolveOwner(krtctx krt.HandlerContext, owner RemoteOidcOwner) (*ResolvedOidcRequest, error) {
+	endpoint, err := resolveOidcEndpoint(krtctx, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -42,13 +35,8 @@ func (r *defaultResolver) ResolveOwner(krtctx krt.HandlerContext, owner RemoteOi
 // resolveOidcEndpoint resolves the OIDC discovery URL for the given owner.
 func resolveOidcEndpoint(
 	_ krt.HandlerContext,
-	resolver remotehttp.Resolver,
 	owner RemoteOidcOwner,
 ) (*remotehttp.ResolvedTarget, error) {
-	if resolver == nil {
-		return nil, errResolverNotInitialized
-	}
-
 	issuerURL := owner.Config.IssuerURL
 	discoveryURL, err := oidcDiscoveryURL(issuerURL)
 	if err != nil {

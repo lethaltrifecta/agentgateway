@@ -39,7 +39,7 @@ func OidcStoreConfigMapLabel(storePrefix string) map[string]string {
 	return map[string]string{oidcStoreComponentLabel: storePrefix}
 }
 
-// PersistedEntry is the parsed persisted OIDC artifact view for a single
+// PersistedEntry is the parsed persisted OIDC provider view for a single
 // ConfigMap. It preserves the backing ConfigMap identity so callers can reason
 // about canonical and legacy artifacts for the same request key.
 type PersistedEntry struct {
@@ -65,22 +65,23 @@ func (e PersistedEntry) RequestKey() (remotehttp.FetchKey, bool) {
 	return e.Provider.RequestKey, true
 }
 
-// PersistedEntries is the KRT-backed collection of persisted OIDC providers
-// loaded from ConfigMaps in the deployment namespace.
+// PersistedEntries is the artifact-specific KRT view over OIDC provider
+// ConfigMaps. Remote fetch/cache scheduling stays shared through
+// remoteartifact; ConfigMap serialization remains explicit to OIDC.
 type PersistedEntries struct {
 	storePrefix  string
 	entries      krt.Collection[PersistedEntry]
 	byRequestKey krt.Index[remotehttp.FetchKey, PersistedEntry]
 }
 
-// providerCache provides canonical lookup semantics over the shared persisted
-// OIDC collection. Inline OIDC resolution only trusts the canonical ConfigMap name.
+// providerCache provides canonical lookup semantics over the persisted OIDC
+// collection. Inline OIDC resolution only trusts the canonical ConfigMap name.
 type providerCache struct {
 	persisted *PersistedEntries
 }
 
-// persistedProviderReader provides hydration semantics over the shared
-// persisted OIDC collection. Startup loading may fall back to legacy/non-canonical
+// persistedProviderReader provides hydration semantics over the persisted OIDC
+// collection. Startup loading may fall back to legacy/non-canonical
 // artifacts while migration cleanup converges persisted state.
 type persistedProviderReader struct {
 	persisted *PersistedEntries
@@ -331,13 +332,15 @@ func normalizePersistedProvider(storePrefix, configMapName string, provider Disc
 		return provider
 	}
 
-	// Re-derive the request key from the issuer discovery URL and verify the
-	// ConfigMap name matches to detect and fix stale/migrated request keys.
+	// Re-derive the request key from the issuer discovery URL. Accept either the
+	// new canonical name or the previously stored key's canonical name so old
+	// ConfigMaps can converge after request-key derivation changes.
 	requestKeyFromURL, err := requestKeyForDirectIssuer(provider.IssuerURL)
 	if err != nil {
 		return provider
 	}
-	if OidcConfigMapName(storePrefix, requestKeyFromURL) == configMapName {
+	if OidcConfigMapName(storePrefix, requestKeyFromURL) == configMapName ||
+		OidcConfigMapName(storePrefix, provider.RequestKey) == configMapName {
 		provider.RequestKey = requestKeyFromURL
 	}
 

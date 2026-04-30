@@ -1,6 +1,8 @@
 package oidc
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 	"time"
@@ -66,4 +68,27 @@ func TestDiscoveredProviderJSONRoundTrip(t *testing.T) {
 			assert.Equal(t, tc.provider.FetchedAt, got.FetchedAt)
 		})
 	}
+}
+
+func TestOidcRequestKeyIsDomainSeparated(t *testing.T) {
+	target := remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}
+	expectedIssuer := "https://issuer.example"
+
+	key := oidcRequestKey(target, expectedIssuer)
+
+	assert.NotEqual(t, target.Key(), key)
+	assert.NotEqual(t, oldOidcRequestKeyForTest(target, expectedIssuer), key)
+}
+
+func oldOidcRequestKeyForTest(target remotehttp.FetchTarget, expectedIssuer string) remotehttp.FetchKey {
+	hash := sha256.New()
+	writeHashPart := func(value string) {
+		_, _ = hash.Write([]byte(value))
+		_, _ = hash.Write([]byte{0})
+	}
+
+	writeHashPart(target.Key().String())
+	writeHashPart(expectedIssuer)
+
+	return remotehttp.FetchKey(hex.EncodeToString(hash.Sum(nil)))
 }

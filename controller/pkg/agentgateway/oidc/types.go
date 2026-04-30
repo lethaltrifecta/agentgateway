@@ -1,7 +1,6 @@
-// Package oidc implements a controller-side OIDC discovery + JWKS pre-fetch
-// mechanism that mirrors the controller/pkg/agentgateway/jwks package.
-// The controller performs OpenID Connect discovery and JWKS pre-fetch so the
-// dataplane never calls .well-known/openid-configuration or jwks_uri directly.
+// Package oidc derives controller-side OIDC discovery requests from
+// AgentgatewayPolicy and adapts resolved provider artifacts into xDS.
+// The remote fetch/store lifecycle is shared with JWKS through remoteartifact.
 package oidc
 
 import (
@@ -15,7 +14,10 @@ import (
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 )
 
-const requestMetadataExpectedIssuer = "expectedIssuer"
+const (
+	requestMetadataExpectedIssuer = "expectedIssuer"
+	oidcRequestKeyDomain          = "oidc-discovery"
+)
 
 // DiscoveredProvider holds the result of a successful OIDC discovery fetch.
 // It includes both the discovery document metadata and the pre-fetched JWKS
@@ -136,6 +138,7 @@ func oidcRequestKey(target remotehttp.FetchTarget, expectedIssuer string) remote
 		_, _ = hash.Write([]byte{0})
 	}
 
+	writeHashPart(oidcRequestKeyDomain)
 	writeHashPart(target.Key().String())
 	writeHashPart(expectedIssuer)
 

@@ -11,7 +11,7 @@ import (
 
 func TestPlanConfigMapSyncKeepsCanonicalConfigMap(t *testing.T) {
 	provider := DiscoveredProvider{
-		RequestKey:            remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key(),
+		RequestKey:            testOidcRequestKey("https://issuer.example/.well-known/openid-configuration"),
 		IssuerURL:             "https://issuer.example",
 		AuthorizationEndpoint: "https://issuer.example/auth",
 		TokenEndpoint:         "https://issuer.example/token",
@@ -34,7 +34,7 @@ func TestPlanConfigMapSyncKeepsCanonicalConfigMap(t *testing.T) {
 
 func TestPlanConfigMapSyncDeletesInactiveConfigMap(t *testing.T) {
 	provider := DiscoveredProvider{
-		RequestKey:            remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key(),
+		RequestKey:            testOidcRequestKey("https://issuer.example/.well-known/openid-configuration"),
 		IssuerURL:             "https://issuer.example",
 		AuthorizationEndpoint: "https://issuer.example/auth",
 		TokenEndpoint:         "https://issuer.example/token",
@@ -54,7 +54,7 @@ func TestPlanConfigMapSyncDeletesInactiveConfigMap(t *testing.T) {
 }
 
 func TestPlanConfigMapSyncNoopsWhenConfigMapIsAlreadyGone(t *testing.T) {
-	requestKey := remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key()
+	requestKey := testOidcRequestKey("https://issuer.example/.well-known/openid-configuration")
 
 	plan := planConfigMapSync(requestKey, nil, DefaultStorePrefix, func(remotehttp.FetchKey) (DiscoveredProvider, bool) {
 		return DiscoveredProvider{}, false
@@ -67,7 +67,7 @@ func TestPlanConfigMapSyncNoopsWhenConfigMapIsAlreadyGone(t *testing.T) {
 
 func TestPlanConfigMapSyncDeletesNonCanonicalConfigMapsForActiveRequest(t *testing.T) {
 	provider := DiscoveredProvider{
-		RequestKey:            remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key(),
+		RequestKey:            testOidcRequestKey("https://issuer.example/.well-known/openid-configuration"),
 		IssuerURL:             "https://issuer.example",
 		AuthorizationEndpoint: "https://issuer.example/auth",
 		TokenEndpoint:         "https://issuer.example/token",
@@ -100,7 +100,7 @@ func TestPlanConfigMapSyncDeletesNonCanonicalConfigMapsForActiveRequest(t *testi
 
 func TestPlanConfigMapSyncMigratesLegacyOnlyEntriesToCanonicalName(t *testing.T) {
 	provider := DiscoveredProvider{
-		RequestKey:            remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key(),
+		RequestKey:            testOidcRequestKey("https://issuer.example/.well-known/openid-configuration"),
 		IssuerURL:             "https://issuer.example",
 		AuthorizationEndpoint: "https://issuer.example/auth",
 		TokenEndpoint:         "https://issuer.example/token",
@@ -133,7 +133,7 @@ func TestPlanConfigMapSyncMigratesLegacyOnlyEntriesToCanonicalName(t *testing.T)
 
 func TestPlanConfigMapSyncDeletesAllEntriesForInactiveRequest(t *testing.T) {
 	provider := DiscoveredProvider{
-		RequestKey:            remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key(),
+		RequestKey:            testOidcRequestKey("https://issuer.example/.well-known/openid-configuration"),
 		IssuerURL:             "https://issuer.example",
 		AuthorizationEndpoint: "https://issuer.example/auth",
 		TokenEndpoint:         "https://issuer.example/token",

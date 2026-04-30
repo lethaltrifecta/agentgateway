@@ -245,6 +245,62 @@ func TestIssuerMismatchReturnsError(t *testing.T) {
 	assert.WithinDuration(t, time.Now().Add(200*time.Millisecond), retry.At, 2*time.Second)
 }
 
+func TestValidateDiscoveryDocumentRequiresAbsoluteHTTPSEndpoints(t *testing.T) {
+	validDoc := discoveryDocument{
+		Issuer:                "https://issuer.example",
+		AuthorizationEndpoint: "https://issuer.example/auth",
+		TokenEndpoint:         "https://issuer.example/token",
+		JwksURI:               "https://issuer.example/jwks",
+	}
+
+	tests := []struct {
+		name      string
+		field     string
+		value     string
+		wantError bool
+	}{
+		{name: "authorization endpoint empty", field: "authorization_endpoint", value: "", wantError: true},
+		{name: "authorization endpoint relative", field: "authorization_endpoint", value: "/auth", wantError: true},
+		{name: "authorization endpoint malformed", field: "authorization_endpoint", value: "://bad", wantError: true},
+		{name: "authorization endpoint http", field: "authorization_endpoint", value: "http://issuer.example/auth", wantError: true},
+		{name: "authorization endpoint missing host", field: "authorization_endpoint", value: "https:///auth", wantError: true},
+		{name: "authorization endpoint https", field: "authorization_endpoint", value: "https://issuer.example/auth"},
+		{name: "token endpoint empty", field: "token_endpoint", value: "", wantError: true},
+		{name: "token endpoint relative", field: "token_endpoint", value: "/token", wantError: true},
+		{name: "token endpoint malformed", field: "token_endpoint", value: "://bad", wantError: true},
+		{name: "token endpoint http", field: "token_endpoint", value: "http://issuer.example/token", wantError: true},
+		{name: "token endpoint missing host", field: "token_endpoint", value: "https:///token", wantError: true},
+		{name: "token endpoint https", field: "token_endpoint", value: "https://issuer.example/token"},
+		{name: "jwks uri empty", field: "jwks_uri", value: "", wantError: true},
+		{name: "jwks uri relative", field: "jwks_uri", value: "/jwks", wantError: true},
+		{name: "jwks uri malformed", field: "jwks_uri", value: "://bad", wantError: true},
+		{name: "jwks uri http", field: "jwks_uri", value: "http://issuer.example/jwks", wantError: true},
+		{name: "jwks uri missing host", field: "jwks_uri", value: "https:///jwks", wantError: true},
+		{name: "jwks uri https", field: "jwks_uri", value: "https://issuer.example/jwks"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := validDoc
+			switch tt.field {
+			case "authorization_endpoint":
+				doc.AuthorizationEndpoint = tt.value
+			case "token_endpoint":
+				doc.TokenEndpoint = tt.value
+			case "jwks_uri":
+				doc.JwksURI = tt.value
+			}
+
+			err := validateDiscoveryDocument(doc, "https://issuer.example")
+			if tt.wantError {
+				assert.ErrorContains(t, err, tt.field)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
 func TestNetworkFailureTriggersRetry(t *testing.T) {
 	ctx := t.Context()
 
@@ -270,6 +326,79 @@ func TestNetworkFailureTriggersRetry(t *testing.T) {
 
 	retry := awaitOidcRetryAttempt(t, f, source.RequestKey, 1)
 	assert.WithinDuration(t, time.Now().Add(200*time.Millisecond), retry.At, 2*time.Second)
+}
+
+func TestDiscoveryRefreshFailureKeepsLastKnownGoodProvider(t *testing.T) {
+	f := NewFetcher(NewCache())
+	source := testOidcSource("https://issuer.example/.well-known/openid-configuration")
+	existing := staleProviderForSource(source)
+	f.cache.putProvider(existing)
+	require.NoError(t, f.AddOrUpdateProvider(source))
+	f.defaultClient = stubOidcClient{
+		t:            t,
+		discoveryErr: fmt.Errorf("discovery unavailable"),
+	}
+
+	f.maybeFetchOidc(t.Context())
+
+	got, ok := f.cache.GetProvider(source.RequestKey)
+	require.True(t, ok)
+	assert.Equal(t, existing, got)
+	retry := awaitOidcRetryAttempt(t, f, source.RequestKey, 1)
+	assert.WithinDuration(t, time.Now().Add(200*time.Millisecond), retry.At, 2*time.Second)
+}
+
+func TestJwksRefreshFailureKeepsLastKnownGoodProvider(t *testing.T) {
+	f := NewFetcher(NewCache())
+	source := testOidcSource("https://issuer.example/.well-known/openid-configuration")
+	existing := staleProviderForSource(source)
+	f.cache.putProvider(existing)
+	require.NoError(t, f.AddOrUpdateProvider(source))
+	f.defaultClient = stubOidcClient{
+		t: t,
+		discovery: discoveryDocument{
+			Issuer:                source.ExpectedIssuer,
+			AuthorizationEndpoint: "https://issuer.example/new-auth",
+			TokenEndpoint:         "https://issuer.example/new-token",
+			JwksURI:               "https://issuer.example/new-jwks",
+		},
+		jwksErr: fmt.Errorf("jwks unavailable"),
+	}
+
+	f.maybeFetchOidc(t.Context())
+
+	got, ok := f.cache.GetProvider(source.RequestKey)
+	require.True(t, ok)
+	assert.Equal(t, existing, got)
+	retry := awaitOidcRetryAttempt(t, f, source.RequestKey, 1)
+	assert.WithinDuration(t, time.Now().Add(200*time.Millisecond), retry.At, 2*time.Second)
+}
+
+func TestJwksRefreshFailureDoesNotCommitDiscoveryOnlyProvider(t *testing.T) {
+	f := NewFetcher(NewCache())
+	source := testOidcSource("https://issuer.example/.well-known/openid-configuration")
+	existing := staleProviderForSource(source)
+	f.cache.putProvider(existing)
+	require.NoError(t, f.AddOrUpdateProvider(source))
+	f.defaultClient = stubOidcClient{
+		t: t,
+		discovery: discoveryDocument{
+			Issuer:                source.ExpectedIssuer,
+			AuthorizationEndpoint: "https://issuer.example/partial-auth",
+			TokenEndpoint:         "https://issuer.example/partial-token",
+			JwksURI:               "https://issuer.example/partial-jwks",
+		},
+		jwksErr: fmt.Errorf("jwks unavailable"),
+	}
+
+	f.maybeFetchOidc(t.Context())
+
+	got, ok := f.cache.GetProvider(source.RequestKey)
+	require.True(t, ok)
+	assert.Equal(t, existing.AuthorizationEndpoint, got.AuthorizationEndpoint)
+	assert.Equal(t, existing.TokenEndpoint, got.TokenEndpoint)
+	assert.Equal(t, existing.JwksURI, got.JwksURI)
+	assert.Equal(t, existing.JwksJSON, got.JwksJSON)
 }
 
 // Per #1618: an in-flight fetch that completes after RemoveOidc must not
@@ -425,15 +554,29 @@ func seedOidcCacheForTest(cache *OidcCache, requestKey remotehttp.FetchKey) {
 	})
 }
 
+func staleProviderForSource(source OidcSource) DiscoveredProvider {
+	return DiscoveredProvider{
+		RequestKey:            source.RequestKey,
+		IssuerURL:             source.ExpectedIssuer,
+		AuthorizationEndpoint: source.ExpectedIssuer + "/auth",
+		TokenEndpoint:         source.ExpectedIssuer + "/token",
+		JwksURI:               source.ExpectedIssuer + "/jwks",
+		JwksJSON:              sampleJWKS,
+		FetchedAt:             time.Now().Add(-2 * source.TTL).UTC(),
+	}
+}
+
 // stubOidcClient is a test double for OidcHttpClient.
 type stubOidcClient struct {
-	t           *testing.T
-	issuer      string
-	discovery   discoveryDocument
-	jwksPayload string
-	err         error
-	started     chan<- struct{}
-	release     <-chan struct{}
+	t            *testing.T
+	issuer       string
+	discovery    discoveryDocument
+	jwksPayload  string
+	err          error
+	discoveryErr error
+	jwksErr      error
+	started      chan<- struct{}
+	release      <-chan struct{}
 }
 
 func (s stubOidcClient) FetchDiscovery(_ context.Context, _ remotehttp.FetchTarget) (discoveryDocument, error) {
@@ -446,12 +589,18 @@ func (s stubOidcClient) FetchDiscovery(_ context.Context, _ remotehttp.FetchTarg
 	if s.err != nil {
 		return discoveryDocument{}, s.err
 	}
+	if s.discoveryErr != nil {
+		return discoveryDocument{}, s.discoveryErr
+	}
 	return s.discovery, nil
 }
 
 func (s stubOidcClient) FetchJwks(_ context.Context, _ string) (string, error) {
 	if s.err != nil {
 		return "", s.err
+	}
+	if s.jwksErr != nil {
+		return "", s.jwksErr
 	}
 	return s.jwksPayload, nil
 }

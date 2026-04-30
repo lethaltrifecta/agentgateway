@@ -4,17 +4,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"istio.io/istio/pkg/kube/krt"
 
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
-	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 )
 
 func TestResolveOidcEndpointBuildsDirectURL(t *testing.T) {
-	target, err := resolveOidcEndpoint(nil, remotehttpResolverFunc(func(input remotehttp.ResolveInput) (*remotehttp.ResolvedTarget, error) {
-		t.Fatalf("unexpected backend resolver call: %#v", input)
-		return nil, nil
-	}), RemoteOidcOwner{
+	target, err := resolveOidcEndpoint(nil, RemoteOidcOwner{
 		ID:               OidcOwnerID{Namespace: "default", Name: "policy-a", Path: "spec.traffic.oidc"},
 		DefaultNamespace: "default",
 		Config: agentgateway.OIDC{
@@ -84,10 +79,7 @@ func TestOidcDiscoveryURLRejectsInvalidIssuer(t *testing.T) {
 // slash must round-trip through ResolveOwner unchanged for IdPs that issue
 // trailing-slash issuers.
 func TestResolveOwnerPreservesTrailingSlashInExpectedIssuer(t *testing.T) {
-	resolver := NewResolver(remotehttpResolverFunc(func(input remotehttp.ResolveInput) (*remotehttp.ResolvedTarget, error) {
-		t.Fatalf("unexpected backend resolver call: %#v", input)
-		return nil, nil
-	}))
+	resolver := NewResolver()
 
 	resolved, err := resolver.ResolveOwner(nil, RemoteOidcOwner{
 		ID:               OidcOwnerID{Namespace: "default", Name: "policy-a", Path: "spec.traffic.oidc"},
@@ -98,10 +90,4 @@ func TestResolveOwnerPreservesTrailingSlashInExpectedIssuer(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "https://issuer.example/", resolved.ExpectedIssuer)
 	assert.Equal(t, "https://issuer.example/.well-known/openid-configuration", resolved.Target.Target.URL)
-}
-
-type remotehttpResolverFunc func(input remotehttp.ResolveInput) (*remotehttp.ResolvedTarget, error)
-
-func (f remotehttpResolverFunc) Resolve(_ krt.HandlerContext, input remotehttp.ResolveInput) (*remotehttp.ResolvedTarget, error) {
-	return f(input)
 }

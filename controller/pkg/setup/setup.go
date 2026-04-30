@@ -242,7 +242,7 @@ func (s *setup) Start(ctx context.Context) error {
 	if persistedOIDC == nil {
 		persistedOIDC = oidcpkg.NewPersistedEntries(s.APIClient, krtOpts, oidcpkg.DefaultStorePrefix, namespaces.GetPodNamespace())
 	}
-	oidcLookup := oidcpkg.NewLookup(persistedOIDC, oidcpkg.NewResolver(resolver))
+	oidcLookup := oidcpkg.NewLookup(persistedOIDC, oidcpkg.NewResolver())
 
 	for _, mgrCfgFunc := range s.ExtraManagerConfig {
 		err := mgrCfgFunc(mgr)
@@ -274,7 +274,7 @@ func (s *setup) Start(ctx context.Context) error {
 
 	// build oidc store if it doesn't exist
 	if !runnablesRegistry.Contains(oidcpkg.RunnableName) {
-		if err := buildOIDCStore(ctx, mgr, s.APIClient, agwCollections, persistedOIDC, resolver); err != nil {
+		if err := buildOIDCStore(ctx, mgr, s.APIClient, agwCollections, persistedOIDC); err != nil {
 			return fmt.Errorf("error creating oidc store %w", err)
 		}
 	}
@@ -386,12 +386,10 @@ func buildOIDCStore(
 	apiClient apiclient.Client,
 	agwCollections *agwplugins.AgwCollections,
 	persistedOIDC *oidcpkg.PersistedEntries,
-	resolver remotehttp.Resolver,
 ) error {
 	oidcCollections := oidcpkg.NewCollections(oidcpkg.CollectionInputs{
 		AgentgatewayPolicies: agwCollections.AgentgatewayPolicies,
-		Backends:             agwCollections.Backends,
-		Resolver:             oidcpkg.NewResolver(resolver),
+		Resolver:             oidcpkg.NewResolver(),
 		KrtOpts:              agwCollections.KrtOpts,
 	})
 

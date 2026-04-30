@@ -19,24 +19,13 @@ func TestResolveOwnerUsesDirectIssuerURL(t *testing.T) {
 	owner, ok := oidc.PolicyOIDCLookupOwner(policy.Namespace, policy.Name, policy.Spec.Traffic.OIDC)
 	require.True(t, ok)
 
-	resolved, err := oidc.NewResolver(ctx.Resolver).ResolveOwner(ctx.Krt, owner)
+	resolved, err := oidc.NewResolver().ResolveOwner(ctx.Krt, owner)
 	require.NoError(t, err)
 	require.NotNil(t, resolved)
 	require.Equal(t, "https://issuer.example/.well-known/openid-configuration", resolved.Target.Target.URL)
 	require.Equal(t, resolved.Target.Target.Key(), resolved.Target.Key)
 	require.Nil(t, resolved.Target.TLSConfig)
 	require.Nil(t, resolved.Target.ProxyTLSConfig)
-}
-
-func TestResolveOwnerErrorsWhenResolverIsNotInitialized(t *testing.T) {
-	policy := gatewayOIDCPolicy()
-	ctx := testutils.BuildMockPolicyContext(t, []any{policy})
-	owner, ok := oidc.PolicyOIDCLookupOwner(policy.Namespace, policy.Name, policy.Spec.Traffic.OIDC)
-	require.True(t, ok)
-
-	resolved, err := oidc.NewResolver(nil).ResolveOwner(ctx.Krt, owner)
-	require.EqualError(t, err, "remote http resolver hasn't been initialized")
-	require.Nil(t, resolved)
 }
 
 func gatewayOIDCPolicy() *agentgateway.AgentgatewayPolicy {

@@ -169,18 +169,25 @@ func validateDiscoveryDocument(doc discoveryDocument, expectedIssuer string) err
 	if doc.Issuer != expectedIssuer {
 		return fmt.Errorf("issuer mismatch: discovery document reports %q but expected %q", doc.Issuer, expectedIssuer)
 	}
-	if doc.AuthorizationEndpoint == "" {
-		return fmt.Errorf("discovery document missing authorization_endpoint")
+	if err := validateAbsoluteHTTPSURL(doc.AuthorizationEndpoint, "authorization_endpoint"); err != nil {
+		return err
 	}
-	if doc.TokenEndpoint == "" {
-		return fmt.Errorf("discovery document missing token_endpoint")
+	if err := validateAbsoluteHTTPSURL(doc.TokenEndpoint, "token_endpoint"); err != nil {
+		return err
 	}
-	if doc.JwksURI == "" {
-		return fmt.Errorf("discovery document missing jwks_uri")
+	if err := validateAbsoluteHTTPSURL(doc.JwksURI, "jwks_uri"); err != nil {
+		return err
 	}
-	jwksURL, err := url.Parse(doc.JwksURI)
-	if err != nil || !jwksURL.IsAbs() || jwksURL.Scheme != "https" || jwksURL.Host == "" {
-		return fmt.Errorf("discovery document jwks_uri must be an absolute HTTPS URL")
+	return nil
+}
+
+func validateAbsoluteHTTPSURL(raw, field string) error {
+	if raw == "" {
+		return fmt.Errorf("discovery document missing %s", field)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("discovery document %s must be an absolute HTTPS URL", field)
 	}
 	return nil
 }

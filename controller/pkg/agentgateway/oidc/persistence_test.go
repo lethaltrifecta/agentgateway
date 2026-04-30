@@ -29,7 +29,7 @@ func TestProviderFromConfigMapRejectsMalformedPayload(t *testing.T) {
 
 func TestSetAndReadConfigMapRoundTrip(t *testing.T) {
 	original := DiscoveredProvider{
-		RequestKey:            remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key(),
+		RequestKey:            testOidcRequestKey("https://issuer.example/.well-known/openid-configuration"),
 		IssuerURL:             "https://issuer.example",
 		AuthorizationEndpoint: "https://issuer.example/auth",
 		TokenEndpoint:         "https://issuer.example/token",
@@ -48,7 +48,7 @@ func TestSetAndReadConfigMapRoundTrip(t *testing.T) {
 }
 
 func TestPersistedEntriesLoadPrefersNewestProviderAcrossDuplicates(t *testing.T) {
-	requestKey := remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key()
+	requestKey := testOidcRequestKey("https://issuer.example/.well-known/openid-configuration")
 	canonical := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      OidcConfigMapName(DefaultStorePrefix, requestKey),
@@ -100,7 +100,7 @@ func TestPersistedEntriesLoadPrefersNewestProviderAcrossDuplicates(t *testing.T)
 }
 
 func TestLoadPersistedProvidersPrefersCanonicalEntryWhenFetchedAtTies(t *testing.T) {
-	requestKey := remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key()
+	requestKey := testOidcRequestKey("https://issuer.example/.well-known/openid-configuration")
 	canonicalName := OidcConfigMapName(DefaultStorePrefix, requestKey)
 
 	canonical := &corev1.ConfigMap{
@@ -153,7 +153,7 @@ func TestLoadPersistedProvidersPrefersCanonicalEntryWhenFetchedAtTies(t *testing
 }
 
 func TestLoadPersistedProvidersUsesDeterministicNameTieBreakForNonCanonicalDuplicates(t *testing.T) {
-	requestKey := remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key()
+	requestKey := testOidcRequestKey("https://issuer.example/.well-known/openid-configuration")
 
 	earlierByName := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -240,6 +240,44 @@ func TestPersistedEntriesNormalizeStoredRequestKeyFromIssuerURL(t *testing.T) {
 	assert.Equal(t, currentRequestKey, provider.RequestKey)
 }
 
+func TestPersistedEntriesNormalizesOldCanonicalConfigMapNameFromIssuerURL(t *testing.T) {
+	issuerURL := "https://issuer.example"
+	discoveryURL := "https://issuer.example/.well-known/openid-configuration"
+	target := remotehttp.FetchTarget{URL: discoveryURL}
+	oldRequestKey := oldOidcRequestKeyForTest(target, issuerURL)
+	currentRequestKey := testOidcRequestKey(discoveryURL)
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      OidcConfigMapName(DefaultStorePrefix, oldRequestKey),
+			Namespace: "agentgateway-system",
+			Labels:    OidcStoreConfigMapLabel(DefaultStorePrefix),
+		},
+	}
+	assert.NoError(t, SetProviderInConfigMap(cm, DiscoveredProvider{
+		RequestKey:            oldRequestKey,
+		IssuerURL:             issuerURL,
+		AuthorizationEndpoint: issuerURL + "/auth",
+		TokenEndpoint:         issuerURL + "/token",
+		JwksURI:               issuerURL + "/jwks",
+		JwksJSON:              `{"keys":[]}`,
+	}))
+
+	persisted := NewPersistedEntriesFromCollection(
+		krt.NewStaticCollection[*corev1.ConfigMap](alwaysSynced{}, []*corev1.ConfigMap{cm}),
+		DefaultStorePrefix,
+		"agentgateway-system",
+	)
+	reader := newPersistedProviderReader(persisted)
+
+	providers, err := reader.LoadPersistedProviders(context.Background())
+
+	assert.NoError(t, err)
+	if assert.Len(t, providers, 1) {
+		assert.Equal(t, currentRequestKey, providers[0].RequestKey)
+	}
+}
+
 func TestRequestKeyFromConfigMapReturnsErrorForMalformedPayload(t *testing.T) {
 	cm := &corev1.ConfigMap{
 		Data: map[string]string{
@@ -256,7 +294,7 @@ func TestSetProviderInConfigMapOmitsVersionField(t *testing.T) {
 	cm := &corev1.ConfigMap{}
 
 	err := SetProviderInConfigMap(cm, DiscoveredProvider{
-		RequestKey: remotehttp.FetchTarget{URL: "https://issuer.example/.well-known/openid-configuration"}.Key(),
+		RequestKey: testOidcRequestKey("https://issuer.example/.well-known/openid-configuration"),
 		IssuerURL:  "https://issuer.example",
 	})
 
