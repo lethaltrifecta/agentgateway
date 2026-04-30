@@ -7,7 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/agentgateway"
 	"github.com/agentgateway/agentgateway/controller/api/v1alpha1/shared"
@@ -45,9 +44,6 @@ func TestOwnersFromPolicyExtractsOIDCOwner(t *testing.T) {
 	policy.Name = "example"
 	policy.Spec.TargetRefs = make([]shared.LocalPolicyTargetReferenceWithSectionName, 1)
 
-	backend := gwv1.BackendObjectReference{
-		Name: "my-backend",
-	}
 	secretRef := corev1.LocalObjectReference{Name: "my-secret"}
 	scopes := []string{"openid", "profile"}
 	policy.Spec.Traffic = &agentgateway.Traffic{
@@ -57,7 +53,6 @@ func TestOwnersFromPolicyExtractsOIDCOwner(t *testing.T) {
 			ClientSecret: &secretRef,
 			RedirectURI:  "https://app.example/callback",
 			Scopes:       scopes,
-			Backend:      &backend,
 			RefreshInterval: &metav1.Duration{
 				Duration: 30 * time.Minute,
 			},
@@ -95,8 +90,6 @@ func TestTTLForOIDCUsesConfiguredRefreshInterval(t *testing.T) {
 
 func TestRemoteOidcOwnerEquality(t *testing.T) {
 	secret := corev1.LocalObjectReference{Name: "secret"}
-	backendName := gwv1.ObjectName("oidc-backend")
-	backendKind := gwv1.Kind("Service")
 	refreshInterval := &metav1.Duration{Duration: 15 * time.Minute}
 	tokenAuthMethod := "ClientSecretPost"
 
@@ -109,7 +102,6 @@ func TestRemoteOidcOwnerEquality(t *testing.T) {
 			ClientSecret:            &secret,
 			RedirectURI:             "https://app/callback",
 			Scopes:                  []string{"openid", "profile"},
-			Backend:                 &gwv1.BackendObjectReference{Name: backendName, Kind: &backendKind},
 			RefreshInterval:         refreshInterval,
 			TokenEndpointAuthMethod: &tokenAuthMethod,
 		},
@@ -129,12 +121,6 @@ func TestRemoteOidcOwnerEquality(t *testing.T) {
 	t.Run("different issuer not equal", func(t *testing.T) {
 		other := base
 		other.Config.IssuerURL = "https://other.example"
-		assert.False(t, base.Equals(other))
-	})
-
-	t.Run("different backend not equal", func(t *testing.T) {
-		other := base
-		other.Config.Backend = &gwv1.BackendObjectReference{Name: "other-backend", Kind: &backendKind}
 		assert.False(t, base.Equals(other))
 	})
 

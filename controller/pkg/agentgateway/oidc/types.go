@@ -11,8 +11,11 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remoteartifact"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 )
+
+const requestMetadataExpectedIssuer = "expectedIssuer"
 
 // DiscoveredProvider holds the result of a successful OIDC discovery fetch.
 // It includes both the discovery document metadata and the pre-fetched JWKS
@@ -65,6 +68,19 @@ func (s OidcSource) Equals(other OidcSource) bool {
 		s.TTL == other.TTL
 }
 
+func (s OidcSource) Request() remoteartifact.Request {
+	return remoteartifact.Request{
+		RequestKey:     s.RequestKey,
+		Target:         s.Target,
+		TLSConfig:      s.TLSConfig,
+		ProxyTLSConfig: s.ProxyTLSConfig,
+		TTL:            s.TTL,
+		Metadata: map[string]string{
+			requestMetadataExpectedIssuer: s.ExpectedIssuer,
+		},
+	}
+}
+
 // SharedOidcRequest is the canonical OIDC discovery request produced by KRT
 // for a shared fetch key. It is the unit the runtime Fetcher and persistence
 // layer watch.
@@ -99,6 +115,17 @@ func (r SharedOidcRequest) OidcSource() OidcSource {
 		TLSConfig:      r.TLSConfig,
 		ProxyTLSConfig: r.ProxyTLSConfig,
 		TTL:            r.TTL,
+	}
+}
+
+func oidcSourceFromRequest(request remoteartifact.Request) OidcSource {
+	return OidcSource{
+		RequestKey:     request.RequestKey,
+		ExpectedIssuer: request.Metadata[requestMetadataExpectedIssuer],
+		Target:         request.Target,
+		TLSConfig:      request.TLSConfig,
+		ProxyTLSConfig: request.ProxyTLSConfig,
+		TTL:            request.TTL,
 	}
 }
 

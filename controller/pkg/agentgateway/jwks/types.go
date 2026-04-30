@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remoteartifact"
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 )
 
@@ -39,6 +40,16 @@ func (s JwksSource) Equals(other JwksSource) bool {
 		s.TTL == other.TTL
 }
 
+func (s JwksSource) Request() remoteartifact.Request {
+	return remoteartifact.Request{
+		RequestKey:     s.RequestKey,
+		Target:         s.Target,
+		TLSConfig:      s.TLSConfig,
+		ProxyTLSConfig: s.ProxyTLSConfig,
+		TTL:            s.TTL,
+	}
+}
+
 // SharedJwksRequest is the canonical JWKS request produced by KRT for a shared
 // fetch key. It is the unit the runtime Fetcher and persistence layer watch.
 type SharedJwksRequest struct {
@@ -69,5 +80,15 @@ func (r SharedJwksRequest) JwksSource() JwksSource {
 		TLSConfig:      r.TLSConfig,
 		ProxyTLSConfig: r.ProxyTLSConfig,
 		TTL:            r.TTL,
+	}
+}
+
+func jwksSourceFromRequest(request remoteartifact.Request) JwksSource {
+	return JwksSource{
+		RequestKey:     request.RequestKey,
+		Target:         request.Target,
+		TLSConfig:      request.TLSConfig,
+		ProxyTLSConfig: request.ProxyTLSConfig,
+		TTL:            request.TTL,
 	}
 }

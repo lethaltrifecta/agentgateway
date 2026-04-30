@@ -711,9 +711,5 @@ spec:
         - openid
         - profile
         - email
-      backend:
-        name: idp-backend
-        kind: Service
-        port: 443
       refreshInterval: 2h
       tokenEndpointAuthMethod: ClientSecretBasic

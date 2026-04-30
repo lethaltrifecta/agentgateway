@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"istio.io/istio/pkg/kube/krt"
-	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/agentgateway/agentgateway/controller/pkg/agentgateway/remotehttp"
 )
@@ -41,10 +40,8 @@ func (r *defaultResolver) ResolveOwner(krtctx krt.HandlerContext, owner RemoteOi
 }
 
 // resolveOidcEndpoint resolves the OIDC discovery URL for the given owner.
-// If the owner has a Backend reference, use it; otherwise build a direct URL
-// from the IssuerURL.
 func resolveOidcEndpoint(
-	krtctx krt.HandlerContext,
+	_ krt.HandlerContext,
 	resolver remotehttp.Resolver,
 	owner RemoteOidcOwner,
 ) (*remotehttp.ResolvedTarget, error) {
@@ -53,22 +50,6 @@ func resolveOidcEndpoint(
 	}
 
 	issuerURL := owner.Config.IssuerURL
-	discoveryPath, err := oidcDiscoveryPath(issuerURL)
-	if err != nil {
-		return nil, err
-	}
-
-	if owner.Config.Backend != nil {
-		// Route discovery through the specified backend.
-		return resolver.Resolve(krtctx, remotehttp.ResolveInput{
-			ParentName:       owner.ID.Name,
-			DefaultNamespace: owner.DefaultNamespace,
-			BackendRef:       backendRef(owner.Config.Backend),
-			Path:             discoveryPath,
-		})
-	}
-
-	// Direct fetch: build the discovery URL from the issuer.
 	discoveryURL, err := oidcDiscoveryURL(issuerURL)
 	if err != nil {
 		return nil, err
@@ -87,6 +68,9 @@ func oidcDiscoveryURL(issuerURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid issuer URL %q: %w", issuerURL, err)
 	}
+	if u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("issuer URL must be absolute HTTPS without query or fragment")
+	}
 	base := *u
 	discoveryPath, err := oidcDiscoveryPath(issuerURL)
 	if err != nil {
@@ -101,6 +85,9 @@ func oidcDiscoveryPath(issuerURL string) (string, error) {
 	u, err := url.Parse(issuerURL)
 	if err != nil {
 		return "", fmt.Errorf("invalid issuer URL %q: %w", issuerURL, err)
+	}
+	if u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("issuer URL must be absolute HTTPS without query or fragment")
 	}
 	return strings.TrimPrefix(strings.TrimRight(u.Path, "/")+"/.well-known/openid-configuration", "/"), nil
 }
@@ -117,12 +104,4 @@ func requestKeyForDirectIssuer(issuerURL string) (remotehttp.FetchKey, error) {
 	}
 	target := remotehttp.FetchTarget{URL: discoveryURL}
 	return oidcRequestKey(target, issuerURL), nil
-}
-
-// backendRef converts a gateway BackendObjectReference to the remotehttp type.
-func backendRef(b *gwv1.BackendObjectReference) gwv1.BackendObjectReference {
-	if b == nil {
-		return gwv1.BackendObjectReference{}
-	}
-	return *b
 }

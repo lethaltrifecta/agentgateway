@@ -84,7 +84,7 @@ func processOIDCPolicy(
 		ClientId:              oidcCfg.ClientID,
 		ClientSecret:          clientSecret,
 		RedirectUri:           oidcCfg.RedirectURI,
-		Scopes:                oidcCfg.Scopes,
+		Scopes:                normalizedOIDCScopes(oidcCfg.Scopes),
 	}
 
 	oidcPolicy := &api.Policy{
@@ -103,6 +103,23 @@ func processOIDCPolicy(
 		"agentgateway_policy", oidcPolicy.Name)
 
 	return oidcPolicy, nil
+}
+
+func normalizedOIDCScopes(scopes []string) []string {
+	normalized := make([]string, 0, len(scopes)+1)
+	seen := make(map[string]struct{}, len(scopes)+1)
+
+	normalized = append(normalized, "openid")
+	seen["openid"] = struct{}{}
+
+	for _, scope := range scopes {
+		if _, ok := seen[scope]; ok {
+			continue
+		}
+		seen[scope] = struct{}{}
+		normalized = append(normalized, scope)
+	}
+	return normalized
 }
 
 // resolveOIDCClientSecret reads the `clientSecret` data key from the Kubernetes

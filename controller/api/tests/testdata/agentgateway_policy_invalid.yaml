@@ -532,7 +532,7 @@ spec:
       clientID: my-client
       redirectURI: https://app.example.com/callback
 ---
-_err: "traffic.oidc and traffic.jwtAuthentication are mutually exclusive"
+_err: "oidc and jwtAuthentication are mutually exclusive"
 apiVersion: agentgateway.dev/v1alpha1
 kind: AgentgatewayPolicy
 metadata:
@@ -585,3 +585,56 @@ spec:
       clientID: my-client
       redirectURI: https://app.example.com/callback
       refreshInterval: 1ms
+---
+_err: "tokenEndpointAuthMethod None must not be paired with a clientSecret"
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: traffic-oidc-none-with-secret
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: dummy
+  traffic:
+    oidc:
+      issuerURL: https://idp.example.com
+      clientID: my-client
+      clientSecret:
+        name: oidc-client-secret
+      redirectURI: https://app.example.com/callback
+      tokenEndpointAuthMethod: None
+---
+_err: "tokenEndpointAuthMethod ClientSecretBasic or ClientSecretPost requires a clientSecret"
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: traffic-oidc-basic-without-secret
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: dummy
+  traffic:
+    oidc:
+      issuerURL: https://idp.example.com
+      clientID: my-client
+      redirectURI: https://app.example.com/callback
+      tokenEndpointAuthMethod: ClientSecretBasic
+---
+_err: "tokenEndpointAuthMethod ClientSecretBasic or ClientSecretPost requires a clientSecret"
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: traffic-oidc-post-without-secret
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: dummy
+  traffic:
+    oidc:
+      issuerURL: https://idp.example.com
+      clientID: my-client
+      redirectURI: https://app.example.com/callback
+      tokenEndpointAuthMethod: ClientSecretPost

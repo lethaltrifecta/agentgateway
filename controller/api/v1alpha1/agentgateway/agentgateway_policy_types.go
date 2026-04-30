@@ -59,7 +59,6 @@ type AgentgatewayPolicyList struct {
 // +kubebuilder:validation:XValidation:rule="has(self.traffic) && has(self.targetSelectors) ? self.targetSelectors.all(t, t.kind in ['Gateway', 'HTTPRoute', 'GRPCRoute', 'ListenerSet']) : true",message="the 'traffic' field can only target a Gateway, ListenerSet, GRPCRoute, or HTTPRoute"
 // +kubebuilder:validation:XValidation:rule="has(self.targetRefs) && has(self.traffic) && has(self.traffic.phase) && self.traffic.phase == 'PreRouting' ? self.targetRefs.all(t, t.kind in ['Gateway', 'ListenerSet']) : true",message="the 'traffic.phase=PreRouting' field can only target a Gateway or ListenerSet"
 // +kubebuilder:validation:XValidation:rule="has(self.targetSelectors) && has(self.traffic) && has(self.traffic.phase) && self.traffic.phase == 'PreRouting' ? self.targetSelectors.all(t, t.kind in ['Gateway', 'ListenerSet']) : true",message="the 'traffic.phase=PreRouting' field can only target a Gateway or ListenerSet"
-// +kubebuilder:validation:XValidation:rule="has(self.traffic) && has(self.traffic.oidc) ? !has(self.traffic.jwtAuthentication) : true",message="traffic.oidc and traffic.jwtAuthentication are mutually exclusive"
 // +kubebuilder:validation:XValidation:rule="has(self.traffic) && has(self.traffic.oidc) && has(self.targetRefs) ? self.targetRefs.all(t, t.kind in ['Gateway', 'ListenerSet', 'HTTPRoute', 'GRPCRoute']) : true",message="traffic.oidc may only target a Gateway, ListenerSet, or Route"
 // +kubebuilder:validation:XValidation:rule="has(self.traffic) && has(self.traffic.oidc) && has(self.targetSelectors) ? self.targetSelectors.all(t, t.kind in ['Gateway', 'ListenerSet', 'HTTPRoute', 'GRPCRoute']) : true",message="traffic.oidc may only target a Gateway, ListenerSet, or Route"
 type AgentgatewayPolicySpec struct {
@@ -591,6 +590,7 @@ const (
 )
 
 // +kubebuilder:validation:IfThenOnlyFields:if="has(self.phase) && self.phase == 'PreRouting'",fields=phase;transformation;extProc;extAuth;jwtAuthentication;basicAuthentication;apiKeyAuthentication;oidc,message="phase PreRouting only supports extAuth, transformation, extProc, jwtAuthentication, basicAuthentication, apiKeyAuthentication, and oidc"
+// +kubebuilder:validation:XValidation:rule="has(self.oidc) ? !has(self.jwtAuthentication) : true",message="oidc and jwtAuthentication are mutually exclusive"
 type Traffic struct {
 	// The phase to apply the traffic policy to. If the phase is `PreRouting`,
 	// the `targetRef` must be a `Gateway` or a `Listener`. `PreRouting` is
@@ -722,9 +722,12 @@ type DirectResponse struct {
 // The gateway fetches the IdP discovery document, validates identity tokens,
 // and manages the OIDC redirect flow on behalf of upstream services.
 // +kubebuilder:validation:XValidation:rule="has(self.tokenEndpointAuthMethod) && self.tokenEndpointAuthMethod == 'None' ? !has(self.clientSecret) : true",message="tokenEndpointAuthMethod None must not be paired with a clientSecret"
+// +kubebuilder:validation:XValidation:rule="has(self.tokenEndpointAuthMethod) && self.tokenEndpointAuthMethod in ['ClientSecretBasic', 'ClientSecretPost'] ? has(self.clientSecret) : true",message="tokenEndpointAuthMethod ClientSecretBasic or ClientSecretPost requires a clientSecret"
 type OIDC struct {
-	// IssuerURL is the OIDC issuer URL; the controller fetches <IssuerURL>/.well-known/openid-configuration.
-	// +kubebuilder:validation:Pattern=`^https?://.+`
+	// IssuerURL is the OIDC issuer URL. It must be an absolute HTTPS URL with
+	// no query or fragment. The configured value is preserved exactly for
+	// discovery-document issuer matching, including any trailing slash.
+	// +kubebuilder:validation:Pattern=`^https://[^/?#]+(/[^?#]*)?$`
 	// +required
 	IssuerURL string `json:"issuerURL"`
 
@@ -744,14 +747,11 @@ type OIDC struct {
 	// +required
 	RedirectURI string `json:"redirectURI"`
 
-	// Scopes to request from the IdP. Defaults to ["openid"].
+	// Scopes to request from the IdP. The `openid` scope is always included.
 	// +optional
-	// +kubebuilder:default={"openid"}
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=256
 	Scopes []string `json:"scopes,omitempty"`
-
-	// Backend optionally identifies the backend used to reach the IdP. When unset, direct egress is used.
-	// +optional
-	Backend *gwv1.BackendObjectReference `json:"backend,omitempty"`
 
 	// RefreshInterval controls how often the controller re-fetches the discovery document and JWKS.
 	// +optional

@@ -2717,7 +2717,7 @@ pub(crate) async fn split_policies(
 		};
 		let Some(oidc_cookie_encoder) = oidc_cookie_encoder else {
 			return Err(Error::msg(
-				"OIDC_COOKIE_SECRET is required when oidc is configured",
+				"SESSION_KEY is required when oidc is configured",
 			));
 		};
 		Some(TrafficPolicy::Oidc(

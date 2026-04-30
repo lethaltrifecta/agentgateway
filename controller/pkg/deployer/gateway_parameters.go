@@ -48,7 +48,6 @@ var (
 )
 
 const sessionKeyChecksumAnnotation = "checksum/session-key"
-const oidcCookieSecretChecksumAnnotation = "checksum/oidc-cookie-secret" //nolint:gosec // annotation key, not a credential
 
 func NewGatewayParameters(cli apiclient.Client, inputs *Inputs) *GatewayParameters {
 	gp := &GatewayParameters{
@@ -73,13 +72,6 @@ func (gp *GatewayParameters) WithHelmValuesGeneratorOverride(generator HelmValue
 func (gp *GatewayParameters) WithSessionKeyGenerator(generator func() (string, error)) *GatewayParameters {
 	if gp.agwHelmValuesGenerator != nil && generator != nil {
 		gp.agwHelmValuesGenerator.sessionKeyGen = generator
-	}
-	return gp
-}
-
-func (gp *GatewayParameters) WithOIDCCookieSecretGenerator(generator func() (string, error)) *GatewayParameters {
-	if gp.agwHelmValuesGenerator != nil && generator != nil {
-		gp.agwHelmValuesGenerator.oidcCookieGen = generator
 	}
 	return gp
 }
@@ -188,20 +180,6 @@ func (gp *GatewayParameters) PostProcessObjects(ctx context.Context, obj client.
 				return nil, fmt.Errorf("failed to annotate session key checksum for Gateway %s/%s: %w", gw.GetNamespace(), gw.GetName(), err)
 			}
 			rendered = append(rendered, sessionKeySecret)
-		}
-		if usesManagedOIDCCookieSecretResolvedParameters(resolved) && gp.agwHelmValuesGenerator.gatewayRequiresOIDCCookieSecret(gw) {
-			oidcCookieSecret, err := gp.agwHelmValuesGenerator.buildOIDCCookieSecret(
-				ctx,
-				gw,
-				gatewayOIDCCookieSecretName(gw.Name),
-			)
-			if err != nil {
-				return nil, fmt.Errorf("failed to build oidc cookie secret for Gateway %s/%s: %w", gw.GetNamespace(), gw.GetName(), err)
-			}
-			if err := addSecretChecksumAnnotation(rendered, oidcCookieSecret, oidcCookieSecretChecksumAnnotation, "oidc cookie secret"); err != nil {
-				return nil, fmt.Errorf("failed to annotate oidc cookie secret checksum for Gateway %s/%s: %w", gw.GetNamespace(), gw.GetName(), err)
-			}
-			rendered = append(rendered, oidcCookieSecret)
 		}
 	}
 

@@ -1617,8 +1617,7 @@ fn traffic_policy_from_proto(
 			oidc,
 			oidc_cookie_encoder.ok_or_else(|| {
 				ProtoError::Generic(
-					"received xDS OIDC policy but OIDC_COOKIE_SECRET is not configured on this gateway"
-						.into(),
+					"received xDS OIDC policy but SESSION_KEY is not configured on this gateway".into(),
 				)
 			})?,
 		)?),
@@ -3157,10 +3156,7 @@ mod tests {
 
 		let err = traffic_policy_from_proto(&spec, &mut Diagnostics::default(), None)
 			.expect_err("missing encoder");
-		assert!(
-			err.to_string().contains("OIDC_COOKIE_SECRET"),
-			"unexpected: {err}"
-		);
+		assert!(err.to_string().contains("SESSION_KEY"), "unexpected: {err}");
 	}
 
 	#[test]

@@ -27,7 +27,6 @@ import (
 )
 
 const sessionKeyEnvVar = "SESSION_KEY"
-const oidcCookieSecretEnvVar = "OIDC_COOKIE_SECRET" //nolint:gosec // env var name, not a credential
 
 // AgentgatewayParametersApplier applies AgentgatewayParameters configurations and overlays.
 type AgentgatewayParametersApplier struct {
@@ -155,10 +154,6 @@ func usesManagedSessionKeyEnv(envs []corev1.EnvVar) bool {
 	return !hasEnvVar(envs, sessionKeyEnvVar)
 }
 
-func usesManagedOIDCCookieSecretEnv(envs []corev1.EnvVar) bool {
-	return !hasEnvVar(envs, oidcCookieSecretEnvVar)
-}
-
 // ApplyOverlaysToObjects applies the strategic-merge-patch overlays to rendered k8s objects.
 // This is called after rendering the helm chart.
 // It returns the (potentially modified) slice of objects, as new objects may be added
@@ -177,7 +172,6 @@ type agentgatewayParametersHelmValuesGenerator struct {
 	secretClient   kclient.Client[*corev1.Secret]
 	inputs         *Inputs
 	sessionKeyGen  func() (string, error)
-	oidcCookieGen  func() (string, error)
 }
 
 func newAgentgatewayParametersHelmValuesGenerator(cli apiclient.Client, inputs *Inputs) *agentgatewayParametersHelmValuesGenerator {
@@ -191,7 +185,6 @@ func newAgentgatewayParametersHelmValuesGenerator(cli apiclient.Client, inputs *
 		}),
 		inputs:        inputs,
 		sessionKeyGen: generateAES256Key,
-		oidcCookieGen: generateAES256Key,
 	}
 }
 
@@ -223,7 +216,6 @@ func (g *agentgatewayParametersHelmValuesGenerator) GetValues(ctx context.Contex
 		applier.ApplyToHelmValues(vals)
 	}
 	applyManagedSessionKeyDefaults(vals.Agentgateway, gw.Name)
-	applyManagedOIDCCookieSecretDefaults(vals.Agentgateway, gw.Name, g.gatewayRequiresOIDCCookieSecret(gw))
 
 	if g.inputs.ControlPlane.XdsTLS {
 		if err := injectXdsCACertificate(g.inputs.ControlPlane.XdsTlsCaPath, vals); err != nil {
@@ -323,38 +315,6 @@ func applyManagedSessionKeyDefaults(gtw *AgentgatewayHelmGateway, gatewayName st
 	gtw.SessionKeySecretName = &sessionKeySecretName
 }
 
-func usesManagedOIDCCookieSecretResolvedParameters(resolved *resolvedParameters) bool {
-	if resolved == nil {
-		return true
-	}
-
-	var envs []corev1.EnvVar
-	if resolved.gatewayClassAGWP != nil {
-		envs = mergeEnvVars(envs, resolved.gatewayClassAGWP.Spec.AgentgatewayParametersConfigs.Env)
-	}
-	if resolved.gatewayAGWP != nil {
-		envs = mergeEnvVars(envs, resolved.gatewayAGWP.Spec.AgentgatewayParametersConfigs.Env)
-	}
-	return usesManagedOIDCCookieSecretEnv(envs)
-}
-
-func applyManagedOIDCCookieSecretDefaults(gtw *AgentgatewayHelmGateway, gatewayName string, enabled bool) {
-	if gtw == nil {
-		return
-	}
-	if !enabled {
-		gtw.OIDCCookieSecretName = nil
-		return
-	}
-	if !usesManagedOIDCCookieSecretEnv(gtw.Env) {
-		gtw.OIDCCookieSecretName = nil
-		return
-	}
-
-	oidcCookieSecretName := gatewayOIDCCookieSecretName(gatewayName)
-	gtw.OIDCCookieSecretName = &oidcCookieSecretName
-}
-
 func (g *agentgatewayParametersHelmValuesGenerator) GetCacheSyncHandlers() []cache.InformerSynced {
 	return []cache.InformerSynced{g.agwParamClient.HasSynced, g.gwClassClient.HasSynced, g.secretClient.HasSynced}
 }
@@ -431,10 +391,6 @@ func gatewaySessionKeySecretName(gatewayName string) string {
 	return safeLabelValue(fmt.Sprintf("%s-session-key", safeLabelValue(gatewayName)))
 }
 
-func gatewayOIDCCookieSecretName(gatewayName string) string {
-	return safeLabelValue(fmt.Sprintf("%s-oidc-cookie-secret", safeLabelValue(gatewayName)))
-}
-
 func safeLabelValue(name string) string {
 	if len(name) <= 63 {
 		return name
@@ -474,18 +430,6 @@ func (g *agentgatewayParametersHelmValuesGenerator) buildSessionKeySecret(
 	secretName string,
 ) (*corev1.Secret, error) {
 	key, err := g.resolveManagedAESKey(ctx, gw.Namespace, secretName, "session key secret", g.sessionKeyGen)
-	if err != nil {
-		return nil, err
-	}
-	return g.buildManagedSecret(gw, secretName, key), nil
-}
-
-func (g *agentgatewayParametersHelmValuesGenerator) buildOIDCCookieSecret(
-	ctx context.Context,
-	gw *gwv1.Gateway,
-	secretName string,
-) (*corev1.Secret, error) {
-	key, err := g.resolveManagedAESKey(ctx, gw.Namespace, secretName, "oidc cookie secret", g.oidcCookieGen)
 	if err != nil {
 		return nil, err
 	}
@@ -546,19 +490,6 @@ func (g *agentgatewayParametersHelmValuesGenerator) resolveManagedAESKey(
 		return "", fmt.Errorf("generated invalid %s for %s/%s: %w", secretKind, namespace, secretName, err)
 	}
 	return key, nil
-}
-
-// gatewayRequiresOIDCCookieSecret reports whether the deployer should mint and
-// mount a managed OIDC cookie Secret for `gw`. It reads the krt-derived
-// `GatewaysRequiringOIDC` collection so attachment is resolved authoritatively
-// from `spec.targetRefs` rather than from `policy.status.ancestors`, which the
-// translator writes downstream.
-func (g *agentgatewayParametersHelmValuesGenerator) gatewayRequiresOIDCCookieSecret(gw *gwv1.Gateway) bool {
-	if g == nil || gw == nil || g.inputs == nil || g.inputs.AgwCollections == nil {
-		return false
-	}
-	key := agwplugins.OIDCRequiredGateway{Namespace: gw.Namespace, Name: gw.Name}
-	return g.inputs.AgwCollections.GatewaysRequiringOIDC.GetKey(key.ResourceName()) != nil
 }
 
 func GatewayIRFrom(gw *gwv1.Gateway, controllerNameGuess string) *collections.GatewayForDeployer {

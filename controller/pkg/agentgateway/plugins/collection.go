@@ -32,10 +32,6 @@ type AgwCollections struct {
 	Settings  apisettings.Settings
 
 	GatewaysForDeployer krt.Collection[collections.GatewayForDeployer]
-	// GatewaysRequiringOIDC enumerates Gateways whose Pods need the managed
-	// OIDC cookie Secret because at least one OIDC-bearing AgentgatewayPolicy
-	// is attached, directly or via a child ListenerSet/HTTPRoute/GRPCRoute.
-	GatewaysRequiringOIDC krt.Collection[OIDCRequiredGateway]
 
 	// Core Kubernetes resources
 	Namespaces          krt.Collection[*corev1.Namespace]
@@ -131,15 +127,6 @@ func NewAgwCollections(
 			gateways,
 			collections.GatewaysForDeployerTransformationFunc(gatewayClasses, listenerSets, byParentRefIndex, agwControllerName),
 		),
-		GatewaysRequiringOIDC: buildGatewaysRequiringOIDC(
-			krtOptions,
-			gateways,
-			listenerSets,
-			httpRoutes,
-			grpcRoutes,
-			agentgatewayPolicies,
-			byParentRefIndex,
-		),
 		ControllerName:  agwControllerName,
 		SystemNamespace: systemNamespace,
 		IstioNamespace:  settings.IstioNamespace,
@@ -226,6 +213,5 @@ func (c *AgwCollections) SetupIndexes() {
 }
 
 func (c *AgwCollections) HasSynced() bool {
-	return c.GatewaysForDeployer.HasSynced() &&
-		c.GatewaysRequiringOIDC.HasSynced()
+	return c.GatewaysForDeployer.HasSynced()
 }

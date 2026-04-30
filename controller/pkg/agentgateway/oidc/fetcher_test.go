@@ -31,16 +31,16 @@ func TestAddProviderToFetcher(t *testing.T) {
 	f := NewFetcher(NewCache())
 	assert.NoError(t, f.AddOrUpdateProvider(source))
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	fetch := f.schedule.Peek()
+	fetch := f.nextFetchForTest()
 	assert.NotNil(t, fetch)
 	assert.Equal(t, source.RequestKey, fetch.RequestKey)
-	state, ok := f.requests[source.RequestKey]
+	state, ok := f.lookup(source.RequestKey)
 	assert.True(t, ok)
-	assert.Equal(t, source, state.source)
-	assert.Equal(t, 1, f.schedule.Len())
+	assert.Equal(t, source.RequestKey, state.source.RequestKey)
+	assert.Equal(t, source.ExpectedIssuer, state.source.ExpectedIssuer)
+	assert.Equal(t, source.Target, state.source.Target)
+	assert.Equal(t, source.TTL, state.source.TTL)
+	assert.Equal(t, 1, f.scheduledLenForTest())
 }
 
 func TestRemoveOidcFromFetcher(t *testing.T) {
@@ -52,10 +52,8 @@ func TestRemoveOidcFromFetcher(t *testing.T) {
 
 	f.RemoveOidc(source.RequestKey)
 
-	f.mu.Lock()
-	_, ok := f.requests[source.RequestKey]
-	assert.Equal(t, 0, f.schedule.Len())
-	f.mu.Unlock()
+	_, ok := f.lookup(source.RequestKey)
+	assert.Equal(t, 0, f.scheduledLenForTest())
 	assert.False(t, ok)
 	_, ok = f.cache.GetProvider(source.RequestKey)
 	assert.False(t, ok)
@@ -84,11 +82,8 @@ func TestAddOrUpdateProviderReplacesExistingScheduleEntry(t *testing.T) {
 	assert.NoError(t, f.AddOrUpdateProvider(source))
 	assert.NoError(t, f.AddOrUpdateProvider(source))
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	assert.Equal(t, 1, f.schedule.Len())
-	fetch := f.schedule.Peek()
+	assert.Equal(t, 1, f.scheduledLenForTest())
+	fetch := f.nextFetchForTest()
 	assert.NotNil(t, fetch)
 	assert.Equal(t, source.RequestKey, fetch.RequestKey)
 	assert.Equal(t, uint64(2), fetch.Generation)
@@ -100,19 +95,16 @@ func TestAddOrUpdateProviderUsesFreshCachedFetchedAtToDelayStartupRefresh(t *tes
 	f := NewFetcher(NewCache())
 	source := testOidcSource("https://issuer.example/.well-known/openid-configuration")
 	freshFetchedAt := time.Now().Add(-1 * time.Minute).UTC()
-	f.cache.providers[source.RequestKey] = DiscoveredProvider{
+	f.cache.putProvider(DiscoveredProvider{
 		RequestKey: source.RequestKey,
 		IssuerURL:  "https://issuer.example",
 		JwksJSON:   sampleJWKS,
 		FetchedAt:  freshFetchedAt,
-	}
+	})
 
 	assert.NoError(t, f.AddOrUpdateProvider(source))
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	fetch := f.schedule.Peek()
+	fetch := f.nextFetchForTest()
 	require.NotNil(t, fetch)
 	assert.Equal(t, source.RequestKey, fetch.RequestKey)
 	assert.WithinDuration(t, freshFetchedAt.Add(source.TTL), fetch.At, time.Second)
@@ -121,21 +113,18 @@ func TestAddOrUpdateProviderUsesFreshCachedFetchedAtToDelayStartupRefresh(t *tes
 func TestAddOrUpdateProviderImmediatelyRefreshesStaleEntry(t *testing.T) {
 	f := NewFetcher(NewCache())
 	source := testOidcSource("https://issuer.example/.well-known/openid-configuration")
-	f.cache.providers[source.RequestKey] = DiscoveredProvider{
+	f.cache.putProvider(DiscoveredProvider{
 		RequestKey: source.RequestKey,
 		IssuerURL:  "https://issuer.example",
 		JwksJSON:   sampleJWKS,
 		FetchedAt:  time.Now().Add(-2 * source.TTL).UTC(),
-	}
+	})
 
 	before := time.Now()
 	assert.NoError(t, f.AddOrUpdateProvider(source))
 	after := time.Now()
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	fetch := f.schedule.Peek()
+	fetch := f.nextFetchForTest()
 	require.NotNil(t, fetch)
 	assert.Equal(t, source.RequestKey, fetch.RequestKey)
 	assert.False(t, fetch.At.Before(before))
@@ -207,9 +196,10 @@ func TestOidcDiscoveryValidatesConfiguredIssuerNotFetchURL(t *testing.T) {
 	f.defaultClient = stubOidcClient{
 		t: t,
 		discovery: discoveryDocument{
-			Issuer:        "https://issuer.example/realms/master",
-			JwksURI:       "https://issuer.example/realms/master/jwks",
-			TokenEndpoint: "https://issuer.example/realms/master/token",
+			Issuer:                "https://issuer.example/realms/master",
+			AuthorizationEndpoint: "https://issuer.example/realms/master/auth",
+			JwksURI:               "https://issuer.example/realms/master/jwks",
+			TokenEndpoint:         "https://issuer.example/realms/master/token",
 		},
 		jwksPayload: sampleJWKS,
 	}
@@ -296,9 +286,10 @@ func TestFetcherDiscardedFetchDoesNotRepopulateRemovedProvider(t *testing.T) {
 	f.defaultClient = stubOidcClient{
 		t: t,
 		discovery: discoveryDocument{
-			Issuer:        "https://issuer.example",
-			JwksURI:       "https://issuer.example/jwks",
-			TokenEndpoint: "https://issuer.example/token",
+			Issuer:                "https://issuer.example",
+			AuthorizationEndpoint: "https://issuer.example/auth",
+			JwksURI:               "https://issuer.example/jwks",
+			TokenEndpoint:         "https://issuer.example/token",
 		},
 		jwksPayload: sampleJWKS,
 		started:     started,
@@ -346,9 +337,10 @@ func TestTLSConfigHonoredForDiscovery(t *testing.T) {
 	var discoveryServer *httptest.Server
 	discoveryServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		doc := discoveryDocument{
-			Issuer:        issuer,
-			JwksURI:       discoveryServer.URL + "/jwks",
-			TokenEndpoint: discoveryServer.URL + "/token",
+			Issuer:                issuer,
+			AuthorizationEndpoint: discoveryServer.URL + "/auth",
+			JwksURI:               discoveryServer.URL + "/jwks",
+			TokenEndpoint:         discoveryServer.URL + "/token",
 		}
 		json.NewEncoder(w).Encode(doc) //nolint:errcheck
 	}))
@@ -495,10 +487,7 @@ func awaitOidcRetry(t *testing.T, f *Fetcher) fetchAt {
 
 	var retry fetchAt
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-
-		scheduled := f.schedule.Peek()
+		scheduled := f.nextFetchForTest()
 		if !assert.NotNil(c, scheduled) {
 			return
 		}
@@ -522,10 +511,7 @@ func awaitOidcRetryAttempt(t *testing.T, f *Fetcher, requestKey remotehttp.Fetch
 }
 
 func awaitOidcRetryNoWait(f *Fetcher) fetchAt {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	scheduled := f.schedule.Peek()
+	scheduled := f.nextFetchForTest()
 	if scheduled == nil {
 		return fetchAt{}
 	}

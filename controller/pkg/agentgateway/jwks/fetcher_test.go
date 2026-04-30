@@ -32,16 +32,15 @@ func TestAddKeysetToFetcher(t *testing.T) {
 	f := NewFetcher(NewCache())
 	assert.NoError(t, f.AddOrUpdateKeyset(expected))
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	fetch := f.schedule.Peek()
+	fetch := f.nextFetchForTest()
 	assert.NotNil(t, fetch)
 	assert.Equal(t, expected.RequestKey, fetch.RequestKey)
-	state, ok := f.requests[expected.RequestKey]
+	state, ok := f.lookup(expected.RequestKey)
 	assert.True(t, ok)
-	assert.Equal(t, expected, state.source)
-	assert.Equal(t, 1, f.schedule.Len())
+	assert.Equal(t, expected.RequestKey, state.source.RequestKey)
+	assert.Equal(t, expected.Target, state.source.Target)
+	assert.Equal(t, expected.TTL, state.source.TTL)
+	assert.Equal(t, 1, f.scheduledLenForTest())
 }
 
 func TestRemoveKeysetFromFetcher(t *testing.T) {
@@ -53,10 +52,8 @@ func TestRemoveKeysetFromFetcher(t *testing.T) {
 
 	f.RemoveKeyset(source.RequestKey)
 
-	f.mu.Lock()
-	_, ok := f.requests[source.RequestKey]
-	assert.Equal(t, 0, f.schedule.Len())
-	f.mu.Unlock()
+	_, ok := f.lookup(source.RequestKey)
+	assert.Equal(t, 0, f.scheduledLenForTest())
 	assert.False(t, ok)
 	_, ok = f.cache.GetJwks(source.RequestKey)
 	assert.False(t, ok)
@@ -91,10 +88,8 @@ func TestRetireKeysetKeepsCacheThenSweptOnSuccessfulFetch(t *testing.T) {
 	// Retire removes from requests/schedule but keeps cache.
 	f.RetireKeyset(oldSource.RequestKey)
 
-	f.mu.Lock()
-	_, inRequests := f.requests[oldSource.RequestKey]
-	schedLen := f.schedule.Len()
-	f.mu.Unlock()
+	_, inRequests := f.lookup(oldSource.RequestKey)
+	schedLen := f.scheduledLenForTest()
 	assert.False(t, inRequests, "retired key should be removed from requests")
 	assert.Equal(t, 0, schedLen, "retired key should be removed from schedule")
 	_, inCache := f.cache.GetJwks(oldSource.RequestKey)
@@ -136,11 +131,8 @@ func TestAddOrUpdateKeysetReplacesExistingScheduleEntry(t *testing.T) {
 	assert.NoError(t, f.AddOrUpdateKeyset(source))
 	assert.NoError(t, f.AddOrUpdateKeyset(source))
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	assert.Equal(t, 1, f.schedule.Len())
-	fetch := f.schedule.Peek()
+	assert.Equal(t, 1, f.scheduledLenForTest())
+	fetch := f.nextFetchForTest()
 	assert.NotNil(t, fetch)
 	assert.Equal(t, source.RequestKey, fetch.RequestKey)
 	assert.Equal(t, uint64(2), fetch.Generation)
@@ -150,19 +142,16 @@ func TestAddOrUpdateKeysetUsesFreshCachedFetchedAtToDelayStartupRefresh(t *testi
 	f := NewFetcher(NewCache())
 	source := testSource()
 	freshFetchedAt := time.Now().Add(-1 * time.Minute).UTC()
-	f.cache.keysets[source.RequestKey] = Keyset{
+	f.cache.putKeyset(Keyset{
 		RequestKey: source.RequestKey,
 		URL:        source.Target.URL,
 		FetchedAt:  freshFetchedAt,
 		JwksJSON:   sampleJWKS,
-	}
+	})
 
 	assert.NoError(t, f.AddOrUpdateKeyset(source))
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	fetch := f.schedule.Peek()
+	fetch := f.nextFetchForTest()
 	require.NotNil(t, fetch)
 	assert.Equal(t, source.RequestKey, fetch.RequestKey)
 	assert.WithinDuration(t, freshFetchedAt.Add(source.TTL), fetch.At, time.Second)
@@ -171,21 +160,18 @@ func TestAddOrUpdateKeysetUsesFreshCachedFetchedAtToDelayStartupRefresh(t *testi
 func TestAddOrUpdateKeysetImmediatelyRefreshesStaleCachedKeyset(t *testing.T) {
 	f := NewFetcher(NewCache())
 	source := testSource()
-	f.cache.keysets[source.RequestKey] = Keyset{
+	f.cache.putKeyset(Keyset{
 		RequestKey: source.RequestKey,
 		URL:        source.Target.URL,
 		FetchedAt:  time.Now().Add(-2 * source.TTL).UTC(),
 		JwksJSON:   sampleJWKS,
-	}
+	})
 
 	before := time.Now()
 	assert.NoError(t, f.AddOrUpdateKeyset(source))
 	after := time.Now()
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	fetch := f.schedule.Peek()
+	fetch := f.nextFetchForTest()
 	require.NotNil(t, fetch)
 	assert.Equal(t, source.RequestKey, fetch.RequestKey)
 	assert.False(t, fetch.At.Before(before))
@@ -548,10 +534,7 @@ func awaitJwksRetry(t *testing.T, f *Fetcher) fetchAt {
 
 	var retry fetchAt
 	assert.EventuallyWithT(t, func(c *assert.CollectT) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-
-		scheduled := f.schedule.Peek()
+		scheduled := f.nextFetchForTest()
 		if !assert.NotNil(c, scheduled) {
 			return
 		}
@@ -575,10 +558,7 @@ func awaitJwksRetryAttempt(t *testing.T, f *Fetcher, requestKey remotehttp.Fetch
 }
 
 func awaitJwksRetryNoWait(f *Fetcher) fetchAt {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	scheduled := f.schedule.Peek()
+	scheduled := f.nextFetchForTest()
 	if scheduled == nil {
 		return fetchAt{}
 	}
